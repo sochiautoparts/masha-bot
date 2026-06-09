@@ -1,435 +1,423 @@
-"""masha-bot entry point — BMW-focused Telegram bot for @bmw_mpower_club.
+"""
+masha-bot entry point — BMW-focused Telegram bot for @bmw_mpower_club.
 
-Based on asya-bot architecture but completely reworked for BMW content.
-Uses Pollinations AI, SQLite, and GitHub Actions for scheduling.
+Based on asya-bot architecture, reworked for BMW content.
+Uses Pollinations AI, SQLite with aiosqlite, and GitHub Actions for scheduling.
+
+Features:
+- aiogram 3.x Telegram Bot framework
+- Pollinations AI as primary provider (dual-key failover)
+- SQLite with aiosqlite for persistence
+- Background tasks: news fetching, channel posting
+- Singleton lock to prevent duplicate instances
+- Two modes: interactive (long polling) and single (one-shot for Actions)
 """
 
-from __future__ import annotations
-
 import asyncio
-import fcntl
 import logging
 import os
+import random
+import signal
 import sys
-import traceback
-from datetime import datetime, timezone
+import time
+import fcntl
 from pathlib import Path
-from typing import Any, Optional
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+from bot.core.config import config, persona
+from bot.database import init_db, cleanup_old_fingerprints, add_chat_message, load_topic_registry
+from bot.partners import partner_manager
+from ai.router import ai_router
+from news import run_news_cycle
+from channel import channel_manager
+
+# ── Logging setup ──────────────────────────────────────────────────────────────
+
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("masha-bot")
+logger = logging.getLogger("masha.main")
 
-# ── Imports ───────────────────────────────────────────────────────────────────
-
-from bot.core.config import get_config, BotConfig
-from bot.core.pipeline import ContentPipeline
-from bot.core.scheduler import Scheduler
-from bot.database import Database
-from bot.publishing.telegram import ChannelManager
-from bot.publishing.formatter import PostFormatter
-from bot.generation.writer import ContentWriter
-from bot.generation.persona import PersonaManager
-from bot.knowledge.characters import CharacterManager
-from bot.partners import PartnerManager
-from bot.analytics.tracker import AnalyticsTracker
-from bot.analytics.reporter import AnalyticsReporter
+# Reduce noisy loggers
+for noisy in ["aiogram.event", "httpx", "httpcore", "aiosqlite"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-# ── Singleton Lock ────────────────────────────────────────────────────────────
+# ── Singleton Lock ─────────────────────────────────────────────────────────────
 
 class SingletonLock:
-    """Ensures only one instance of the bot runs at a time."""
+    """File-based lock to prevent multiple bot instances."""
 
-    LOCK_FILE = "/tmp/masha-bot.lock"
-
-    def __init__(self) -> None:
-        self._lock_file: Any = None
+    def __init__(self, lock_file: str):
+        self.lock_file = lock_file
+        self._lock_fd = None
 
     def acquire(self) -> bool:
         """Try to acquire the lock. Returns True if successful."""
         try:
-            self._lock_file = open(self.LOCK_FILE, "w")
-            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_file.write(str(os.getpid()))
-            self._lock_file.flush()
+            os.makedirs(os.path.dirname(self.lock_file) or ".", exist_ok=True)
+            self._lock_fd = open(self.lock_file, "w")
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fd.write(str(os.getpid()))
+            self._lock_fd.flush()
             return True
         except (IOError, OSError):
-            if self._lock_file:
-                self._lock_file.close()
+            if self._lock_fd:
+                self._lock_fd.close()
+                self._lock_fd = None
             return False
 
     def release(self) -> None:
         """Release the lock."""
-        if self._lock_file:
+        if self._lock_fd:
             try:
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-                self._lock_file.close()
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+                os.unlink(self.lock_file)
             except (IOError, OSError):
                 pass
-            try:
-                os.unlink(self.LOCK_FILE)
-            except OSError:
-                pass
+            self._lock_fd = None
 
 
-# ── Background Tasks ──────────────────────────────────────────────────────────
+# ── Background Tasks ───────────────────────────────────────────────────────────
 
 class BackgroundTasks:
-    """Manages background async tasks."""
+    """Manages background tasks for news and channel posting."""
 
-    def __init__(self) -> None:
-        self._tasks: list[asyncio.Task] = []
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self._running = False
+        self._tasks: list = []
+        self._greeting_sent = False
 
-    def add(self, coro: Any, name: str = "") -> asyncio.Task:
-        """Add a background task."""
-        task = asyncio.create_task(coro, name=name)
-        self._tasks.append(task)
-        return task
+    async def start(self) -> None:
+        """Start all background tasks."""
+        self._running = True
+        self._tasks = [
+            asyncio.create_task(self._morning_greeting(), name="morning_greeting"),
+            asyncio.create_task(self._news_fetcher(), name="news_fetcher"),
+            asyncio.create_task(self._channel_poster(), name="channel_poster"),
+        ]
+        logger.info("Background tasks started")
 
-    async def wait_all(self) -> None:
-        """Wait for all tasks to complete."""
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-
-    def cancel_all(self) -> None:
-        """Cancel all tasks."""
+    async def stop(self) -> None:
+        """Stop all background tasks."""
+        self._running = False
         for task in self._tasks:
-            if not task.done():
-                task.cancel()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._tasks.clear()
+        logger.info("Background tasks stopped")
 
+    async def _morning_greeting(self) -> None:
+        """Send a natural greeting to the owner — like a living person, not a bot.
+        Only sends ONCE per startup. Short and varied. Has a 4-hour cooldown
+        to prevent spam on frequent restarts."""
+        if self._greeting_sent:
+            return
 
-# ── Main Bot Class ────────────────────────────────────────────────────────────
+        await asyncio.sleep(15)  # Wait a bit after startup
+        self._greeting_sent = True
 
-class MashaBot:
-    """Main masha-bot application."""
-
-    def __init__(self) -> None:
-        self.config = get_config()
-        self.db = Database(db_path=self.config.db_path)
-        self.scheduler = Scheduler()
-        self.pipeline: Optional[ContentPipeline] = None
-        self.channel: Optional[ChannelManager] = None
-        self.formatter = PostFormatter()
-        self.writer: Optional[ContentWriter] = None
-        self.persona_manager = PersonaManager()
-        self.character_manager = CharacterManager()
-        self.partners: Optional[PartnerManager] = None
-        self.tracker: Optional[AnalyticsTracker] = None
-        self.reporter: Optional[AnalyticsReporter] = None
-        self.background = BackgroundTasks()
-        self._lock = SingletonLock()
-
-    async def init(self) -> None:
-        """Initialize all components."""
-        # Validate config
-        issues = self.config.validate()
-        if issues:
-            for issue in issues:
-                logger.warning("Config issue: %s", issue)
-
-        # Initialize database
-        await self.db.init()
-
-        # Initialize components that need DB
-        self.pipeline = ContentPipeline(db=self.db)
-        self.channel = ChannelManager(db=self.db)
-        self.writer = ContentWriter()
-        self.partners = PartnerManager(db=self.db)
-        self.tracker = AnalyticsTracker(db=self.db)
-        self.reporter = AnalyticsReporter(db=self.db)
-
-        # Load partner programs
-        await self.partners.load_programs()
-
-        logger.info("masha-bot initialized successfully")
-
-    async def run_cycle(self) -> dict[str, Any]:
-        """Run one content cycle."""
-        if not self.pipeline:
-            return {"status": "error", "message": "Pipeline not initialized"}
-
-        result = await self.pipeline.run_cycle()
-        logger.info("Cycle result: %s", result.get("status", "unknown"))
-
-        # Record persona state
-        if result.get("post_published"):
-            character = result.get("character_mix", "Маша")
-            self.persona_manager.record_post(character)
-
-        return result
-
-    async def run_single_post(self) -> dict[str, Any]:
-        """Run a single post generation and publishing cycle."""
-        logger.info("Starting single post cycle...")
+        # Cooldown: don't send if one was sent recently (within 4 hours)
+        try:
+            cooldown_file = "/tmp/masha_last_greeting"
+            if os.path.exists(cooldown_file):
+                with open(cooldown_file, "r") as f:
+                    last_greeting_time = float(f.read().strip())
+                if time.time() - last_greeting_time < 14400:  # 4 hours
+                    logger.info("Greeting cooldown active — skipping")
+                    return
+        except Exception:
+            pass
 
         try:
-            await self.init()
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            hour = datetime.now(ZoneInfo("Europe/Moscow")).hour
 
-            # Check if we should post
-            posts_today = await self.db.get_posts_today_count()
-            if not self.scheduler.should_post_now(posts_today, self.config.max_posts_per_day):
-                logger.info("Not time to post or daily limit reached")
-                return {"status": "skipped", "reason": "not_time_or_limit"}
+            if 5 <= hour < 12:
+                greetings = [
+                    "Утро! М5 прогрета ☕",
+                    "Доброе утро! S63 рычит ☀️",
+                    "Проснулась, кофе, BMW-новости ☕",
+                    "Утро! ///M-Power! 🏎️",
+                ]
+            elif 12 <= hour < 18:
+                greetings = [
+                    "Привет! 😊",
+                    "День! Свежие BMW-новости 📰",
+                    "Хей! M-division на связи 🔥",
+                    "На связи! Что нового у баварцев? 🏎️",
+                ]
+            elif 18 <= hour < 23:
+                greetings = [
+                    "Вечер! 🌆",
+                    "Привет! M5 остывает после дня 🌆",
+                    "Вечер! BMW-новости смотрю 📰",
+                ]
+            else:
+                greetings = [
+                    "Ночной режим 🌙",
+                    "Не спится? M5 тоже 🌙",
+                    "Совиный режим — Nürburgring по ночам лучше 🌙",
+                ]
 
-            result = await self.run_cycle()
-            return result
+            greeting = random.choice(greetings)
+            if config.OWNER_ID:
+                await self.bot.send_message(config.OWNER_ID, greeting)
+                try:
+                    await add_chat_message(config.OWNER_ID, "assistant", greeting)
+                except Exception as e:
+                    logger.debug(f"Could not save greeting to chat history: {e}")
+                try:
+                    with open("/tmp/masha_last_greeting", "w") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Morning greeting error: {e}")
 
-        except Exception as exc:
-            logger.exception("Single post cycle error: %s", exc)
-            return {"status": "error", "message": str(exc)}
+    async def _news_fetcher(self) -> None:
+        """Periodically fetch news from RSS sources and cleanup old data."""
+        await asyncio.sleep(30)
 
-    async def run_interactive(self) -> None:
-        """Run the bot in interactive mode (long polling)."""
-        logger.info("Starting masha-bot in interactive mode...")
+        cycle_count = 0
+        while self._running:
+            try:
+                count = await run_news_cycle()
+                if count > 0:
+                    logger.info(f"News fetcher: {count} new items")
 
-        try:
-            await self.init()
+                # Cleanup old fingerprints every 12 cycles (~6 hours)
+                cycle_count += 1
+                if cycle_count % 12 == 0:
+                    removed = await cleanup_old_fingerprints(max_age_days=7)
+                    if removed > 0:
+                        logger.info(f"Cleaned up {removed} old post fingerprints")
 
-            # Import telegram bot libraries
-            from telegram import Update
-            from telegram.ext import (
-                Application,
-                CommandHandler,
-                MessageHandler,
-                filters,
-            )
+                # Auto-refresh partner data every 6 hours
+                if cycle_count % 12 == 0:
+                    try:
+                        await partner_manager.maybe_refresh()
+                    except Exception as e:
+                        logger.debug(f"Partner data refresh skipped: {e}")
+            except Exception as e:
+                logger.error(f"News fetcher error: {e}")
 
-            app = Application.builder().token(self.config.bot_token).build()
+            # Wait for next cycle
+            interval = config.NEWS_INTERVAL_MINUTES * 60
+            for _ in range(interval):
+                if not self._running:
+                    break
+                await asyncio.sleep(1)
 
-            # Register handlers
-            app.add_handler(CommandHandler("start", self._cmd_start))
-            app.add_handler(CommandHandler("help", self._cmd_help))
-            app.add_handler(CommandHandler("post", self._cmd_post))
-            app.add_handler(CommandHandler("stats", self._cmd_stats))
-            app.add_handler(CommandHandler("mood", self._cmd_mood))
-            app.add_handler(CommandHandler("theme", self._cmd_theme))
-            app.add_handler(CommandHandler("ask", self._cmd_ask))
-            app.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
-            )
+    async def _channel_poster(self) -> None:
+        """Periodically post to channel — 3 DIFFERENT posts per cycle.
+        
+        Each 30-min cycle publishes 3 different posts:
+        1st post: news or partner content
+        2nd post: a DIFFERENT news item (different topic)
+        3rd post: another DIFFERENT news item (different topic)
+        """
+        await asyncio.sleep(30)
+        
+        logger.info("Channel poster started — will try to post every cycle")
 
-            logger.info("Bot started. Press Ctrl+C to stop.")
-            await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        consecutive_empty_cycles = 0
 
-        except ImportError:
-            logger.error(
-                "python-telegram-bot not installed. "
-                "Install with: pip install python-telegram-bot"
-            )
-        except Exception as exc:
-            logger.exception("Interactive mode error: %s", exc)
+        while self._running:
+            posts_this_cycle = 0
+            logger.info(f"Channel poster: starting new cycle (consecutive_empty={consecutive_empty_cycles})")
+            for post_num in range(3):
+                try:
+                    posted = await channel_manager.run_scheduled_post()
+                    if posted:
+                        posts_this_cycle += 1
+                        logger.info(f"Channel poster: post {post_num + 1}/3 published successfully")
+                        if post_num < 2:
+                            gap = random.randint(60, 120)
+                            logger.info(f"Waiting {gap}s before next post in this cycle")
+                            for _ in range(gap):
+                                if not self._running:
+                                    break
+                                await asyncio.sleep(1)
+                    else:
+                        logger.info(f"Channel poster: post {post_num + 1}/3 returned False")
+                except Exception as e:
+                    logger.error(f"Channel poster error (post {post_num + 1}): {e}", exc_info=True)
+            
+            if posts_this_cycle > 0:
+                logger.info(f"Channel poster cycle complete: {posts_this_cycle} posts published")
+                consecutive_empty_cycles = 0
+            else:
+                consecutive_empty_cycles += 1
+                if consecutive_empty_cycles == 3 and self.bot:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=config.OWNER_ID,
+                            text=f"⚠️ Маша: 3 цикла подряд без постов в канал. Возможна проблема с контентом или дедупликацией. Проверь логи."
+                        )
+                    except Exception:
+                        pass
 
-    # ── Bot command handlers ──────────────────────────────────────────────
-
-    async def _cmd_start(self, update: Any, context: Any) -> None:
-        """Handle /start command."""
-        if not update.effective_user:
-            return
-        user = update.effective_user
-        await self.db.add_user(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-        )
-        await update.message.reply_text(
-            f"Привет! Я Маша, главред @bmw_mpower_club 🏎️\n\n"
-            f"BMW M5 F90 Competition — моя машина, а этот канал — мой дом.\n"
-            f"Пишу про BMW, двигатели, M-division и всё баварское.\n\n"
-            f"Команды:\n"
-            f"/post — сгенерировать пост\n"
-            f"/stats — статистика канала\n"
-            f"/mood — моё настроение\n"
-            f"/theme — тема дня\n"
-            f"/ask <вопрос> — задать вопрос про BMW\n"
-            f"/help — помощь"
-        )
-
-    async def _cmd_help(self, update: Any, context: Any) -> None:
-        """Handle /help command."""
-        await update.message.reply_text(
-            "🔧 Команды masha-bot:\n\n"
-            "/start — приветствие\n"
-            "/post — сгенерировать пост\n"
-            "/stats — статистика\n"
-            "/mood — настроение Маши\n"
-            "/theme — тема дня\n"
-            "/ask <вопрос> — вопрос про BMW\n"
-            "/help — эта справка\n\n"
-            "Канал: @bmw_mpower_club"
-        )
-
-    async def _cmd_post(self, update: Any, context: Any) -> None:
-        """Handle /post command — generate and publish a post."""
-        user_id = update.effective_user.id if update.effective_user else 0
-
-        # Only owner can trigger posts
-        if user_id != self.config.owner_id:
-            await update.message.reply_text("Извини, постить может только владелец бота 😏")
-            return
-
-        await update.message.reply_text("Генерирую пост... 🔧")
-
-        result = await self.run_cycle()
-        status = result.get("status", "unknown")
-
-        if result.get("post_published"):
-            await update.message.reply_text(
-                f"✅ Пост опубликован! (message_id: {result.get('post_id', '?')})"
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Пост не опубликован: {status}"
-            )
-
-    async def _cmd_stats(self, update: Any, context: Any) -> None:
-        """Handle /stats command."""
-        summary = await self.tracker.get_daily_summary() if self.tracker else {}
-        posts_today = summary.get("posts_published", 0)
-        persona = self.persona_manager.get_persona_info()
-
-        await update.message.reply_text(
-            f"📊 Статистика @bmw_mpower_club:\n\n"
-            f"Постов сегодня: {posts_today}\n"
-            f"Настроение Маши: {persona.get('mood', '?')} ({persona.get('mood_description', '')})\n"
-            f"Последний персонаж: {persona.get('last_character', '?')}"
-        )
-
-    async def _cmd_mood(self, update: Any, context: Any) -> None:
-        """Handle /mood command."""
-        persona = self.persona_manager.get_persona_info()
-        mood = persona.get("mood", "energetic")
-        desc = persona.get("mood_description", "")
-
-        await update.message.reply_text(
-            f"🎯 Настроение Маши: {mood}\n"
-            f"{desc}\n\n"
-            f"Мой S63 сегодня {'рычит' if mood == 'passionate' else 'мурлычет' if mood == 'nostalgic' else 'работает'} 💪"
-        )
-
-    async def _cmd_theme(self, update: Any, context: Any) -> None:
-        """Handle /theme command."""
-        theme = self.scheduler.get_current_theme()
-        if theme:
-            await update.message.reply_text(
-                f"📅 Тема дня: {theme.get('emoji', '🚗')} {theme.get('name', '?')}\n"
-                f"{theme.get('description', '')}\n\n"
-                f"Тема: {theme.get('topic', 'не определена')}"
-            )
-        else:
-            await update.message.reply_text("Сегодня нет особой темы — обычный BMW-день 🏎️")
-
-    async def _cmd_ask(self, update: Any, context: Any) -> None:
-        """Handle /ask command — answer BMW questions."""
-        if not context.args:
-            await update.message.reply_text("Задай вопрос: /ask <вопрос про BMW>")
-            return
-
-        question = " ".join(context.args)
-        await update.message.reply_text(f"Думаю над: {question} 🤔")
-
-        try:
-            # Generate answer
-            if self.writer:
-                result = await self.writer.generate(
-                    topic=question,
-                    context="Вопрос подписчика",
-                    content_type="news+reaction",
-                    character_mix="Маша",
-                    mood=self.persona_manager.get_current_mood(),
-                )
-                if result and result.get("text"):
-                    await update.message.reply_text(result["text"][:4096])
-                else:
-                    await update.message.reply_text("Не смогла сформулировать ответ. VANOS барахлит 😅")
-        except Exception as exc:
-            logger.error("Ask command error: %s", exc)
-            await update.message.reply_text("Ошибка при генерации ответа 😔")
-
-    async def _handle_message(self, update: Any, context: Any) -> None:
-        """Handle regular text messages."""
-        if not update.effective_user or not update.message:
-            return
-
-        user = update.effective_user
-        text = update.message.text or ""
-
-        # Save to chat history
-        await self.db.add_chat_message(
-            user_id=user.id,
-            chat_id=update.effective_chat.id if update.effective_chat else 0,
-            role="user",
-            content=text,
-        )
-
-        # Auto-respond to BMW-related messages
-        text_lower = text.lower()
-        bmw_keywords = ["bmw", "бмв", "бавар", "эмка", "///m", "mpower"]
-        if any(kw in text_lower for kw in bmw_keywords):
-            await update.message.reply_text(
-                "Привет! Задай вопрос через /ask или просто спроси про BMW 😎🏎️"
-            )
-
-    async def cleanup(self) -> None:
-        """Clean up resources."""
-        self.background.cancel_all()
-
-        if self.writer:
-            await self.writer.close()
-        if self.channel:
-            await self.channel.close()
-        if self.pipeline and self.pipeline.rss_fetcher:
-            await self.pipeline.rss_fetcher.close()
-        if self.pipeline and self.pipeline.fact_checker:
-            await self.pipeline.fact_checker.close()
-        if self.pipeline and self.pipeline.image_gen:
-            await self.pipeline.image_gen.close()
-
-        await self.db.close()
-        self._lock.release()
-
-        logger.info("masha-bot cleanup complete")
+            # Wait for next cycle
+            interval = config.CHANNEL_POST_INTERVAL_MINUTES * 60
+            for _ in range(interval):
+                if not self._running:
+                    break
+                await asyncio.sleep(1)
 
 
-# ── CLI Entry Point ───────────────────────────────────────────────────────────
+# ── Main Entry Point ──────────────────────────────────────────────────────────
 
-async def main() -> None:
-    """Main entry point."""
-    bot = MashaBot()
+async def main():
+    """Main entry point for Masha Bot."""
+    # Check bot token
+    if not config.BOT_TOKEN:
+        logger.critical("BOT_TOKEN not set! Exiting.")
+        sys.exit(1)
 
     # Acquire singleton lock
-    if not bot._lock.acquire():
-        logger.error("Another instance is already running. Exiting.")
-        sys.exit(1)
+    lock = SingletonLock(config.LOCK_FILE)
+    if not lock.acquire():
+        logger.warning("Another instance is running, exiting.")
+        sys.exit(0)
 
+    # Check mode from environment
+    mode = os.getenv("MASHA_BOT_MODE", "interactive").lower()
+
+    # Create bot
+    bot = Bot(
+        token=config.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    # Delete webhook to ensure polling works
     try:
-        # Check mode from environment
-        mode = os.getenv("MASHA_BOT_MODE", "single").lower()
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted, polling mode ready")
+    except Exception as e:
+        logger.warning(f"Could not delete webhook: {e}")
 
-        if mode == "interactive":
-            await bot.run_interactive()
-        elif mode == "single":
-            result = await bot.run_single_post()
-            logger.info("Single post result: %s", result)
+    # Initialize database
+    await init_db()
+    logger.info("Database initialized")
+
+    # Load topic registry from DB
+    try:
+        from bot.content_engine import _topic_registry
+        loaded_registry = await load_topic_registry()
+        if loaded_registry:
+            import bot.content_engine as ce
+            ce._topic_registry = loaded_registry
+            logger.info(f"Topic registry loaded: {len(loaded_registry)} topics from DB")
         else:
-            logger.warning("Unknown mode: %s, defaulting to single", mode)
-            result = await bot.run_single_post()
+            logger.info("Topic registry empty — first run or all topics expired")
+    except Exception as e:
+        logger.warning(f"Could not load topic registry from DB: {e}")
 
+    # Initialize AI router
+    await ai_router.initialize()
+    logger.info("AI Router initialized")
+
+    # Load partner programs
+    try:
+        partner_count = await partner_manager.load_async()
+        logger.info(f"Partner programs loaded: {partner_count}")
+    except Exception as e:
+        logger.warning(f"Could not load partner programs: {e}")
+
+    # Set bot on channel manager
+    channel_manager.set_bot(bot)
+
+    # Load recently posted titles into semantic dedup
+    try:
+        await channel_manager.load_recent_semantic_data()
+    except Exception as e:
+        logger.warning(f"Could not load semantic dedup data: {e}")
+
+    if mode == "single":
+        # Single-cycle mode for GitHub Actions
+        logger.info("=== Masha Bot Starting (single-cycle mode) ===")
+        try:
+            posted = await channel_manager.run_scheduled_post()
+            logger.info(f"Single cycle result: {'posted' if posted else 'no post'}")
+        except Exception as e:
+            logger.error(f"Single cycle error: {e}")
+        finally:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+            lock.release()
+        return
+
+    # Interactive mode — long polling
+    # Set up dispatcher
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    # Include all handler routers
+    try:
+        from bot.handlers.chat import chat_router
+        from bot.handlers.admin import admin_router
+        from bot.handlers.inline import inline_router
+        dp.include_router(chat_router)
+        dp.include_router(admin_router)
+        dp.include_router(inline_router)
+        logger.info("Handler routers included successfully")
+    except Exception as e:
+        logger.critical(f"Failed to include handler routers: {e}")
+        raise
+
+    # Start background tasks
+    bg_tasks = BackgroundTasks(bot)
+
+    async def on_startup():
+        """Startup callback — start background tasks."""
+        await bg_tasks.start()
+
+    async def on_shutdown():
+        """Shutdown callback — stop background tasks."""
+        await bg_tasks.stop()
+
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    # Run polling
+    logger.info("=== Masha Bot Starting (Pollinations-Only v1.0) ===")
+    try:
+        await dp.start_polling(bot)
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as exc:
-        logger.exception("Fatal error: %s", exc)
-        sys.exit(1)
+        logger.info("Bot stopped by user")
     finally:
-        await bot.cleanup()
+        await bg_tasks.stop()
+        lock.release()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+        logger.info("=== Masha Bot Stopped ===")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        sys.exit(code)
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        sys.exit(1)

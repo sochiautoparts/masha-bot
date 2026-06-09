@@ -1,38 +1,49 @@
-name: masha-bot Schedule
+name: Masha Bot — BMW M-Power Club — Маша + Редакция
 
 on:
   schedule:
-    # Run every 30 minutes
-    - cron: '*/30 * * * *'
-  workflow_dispatch:
-    inputs:
-      force_post:
-        description: 'Force post generation'
-        required: false
-        default: 'false'
+    - cron: '0 */5 * * *'      # Every 5 hours
+  workflow_dispatch:                     # Manual trigger
+
+concurrency:
+  group: masha-bot-single
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  OWNER_ID: ${{ secrets.OWNER_ID }}
+  CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+  CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
+  # Pollinations.ai — DUAL KEY FAILOVER
+  POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+  POLLINATIONS_API_KEY_2: ${{ secrets.POLLINATIONS_API_KEY_2 }}
+  GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+  GH_REPO: sochiautoparts/masha-bot
+  ADMITAD_ADS_FILE: data/admitad_ads.json
+  DB_PATH: masha_bot.db
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: INFO
+  # Schedule settings
+  NEWS_INTERVAL_MINUTES: "30"
+  CHANNEL_POST_INTERVAL_MINUTES: "30"
+  PARTNER_POST_INTERVAL_HOURS: "4"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
-    env:
-      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-      CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-      CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
-      OWNER_ID: ${{ secrets.OWNER_ID }}
-      POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
-      POLLINATIONS_API_KEY_2: ${{ secrets.POLLINATIONS_API_KEY_2 }}
-      GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
-      GH_REPO: ${{ secrets.GH_REPO }}
-      MASHA_BOT_MODE: single
-      LOG_LEVEL: INFO
-      DB_PATH: masha_bot.db
+    timeout-minutes: 330   # 5.5 hours max
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT_TOKEN }}
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -43,41 +54,100 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore database cache
+      - name: Clean Python cache
+        run: |
+          find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          find . -type f -name "*.pyc" -delete 2>/dev/null || true
+          echo "Python cache cleaned"
+
+      - name: Download Admitad partner data
+        run: |
+          echo "=== Downloading admitad partner data ==="
+          mkdir -p data
+          curl -sL "https://raw.githubusercontent.com/creastudioai-beep/pr/main/data/admitad_ads.json" \
+            -o data/admitad_ads.json || echo "Failed to download admitad data, will use cached version"
+          if [ -f data/admitad_ads.json ]; then
+            echo "OK: admitad_ads.json downloaded ($(wc -c < data/admitad_ads.json) bytes)"
+          else
+            echo "WARNING: admitad_ads.json not found"
+          fi
+
+      - name: Restore database from cache
         uses: actions/cache@v4
         with:
           path: masha_bot.db
-          key: masha-bot-db-v1-${{ github.run_id }}
+          key: masha-bot-db-v1
           restore-keys: |
-            masha-bot-db-v1-
+            masha-bot-db-
 
-      - name: Run masha-bot
+      - name: Ensure .gitignore allows database
         run: |
-          python -m bot.main
-        continue-on-error: true
-
-      - name: Commit database changes
-        run: |
-          git config --local user.email "masha-bot@users.noreply.github.com"
-          git config --local user.name "Masha Bot"
-          if [ -f masha_bot.db ]; then
-            git add masha_bot.db || true
-            git diff --staged --quiet || git commit -m "📊 Update database $(date -u '+%Y-%m-%d %H:%M UTC')"
+          # Remove masha_bot.db from .gitignore if present
+          if [ -f .gitignore ]; then
+            sed -i '/masha_bot\.db/d' .gitignore
           fi
-        continue-on-error: true
 
-      - name: Push changes
-        if: success()
+      - name: Run Masha Bot with auto-restart
         run: |
-          git push
-        continue-on-error: true
+          echo "=== Starting Masha Bot v1.0 — Маша + Редакция ==="
+          echo "ALL ROUTES: Pollinations.ai (61 models, dual-key failover)"
+          echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг Конг(попугай)"
+          echo "CONTENT: BMW-focused RSS, Google News RSS, Web Search, AI Discovery"
+          echo "CHANNEL: @bmw_mpower_club"
+          echo "FORMATS: 6 content types — news+reaction, DIY, polls, lore, garage, partner"
+          echo "CHAT: Pollinations -> Static fallback"
+          echo "FUNCTION (posts, VIN, diagnostics): Pollinations -> Static fallback"
+          echo "VISION: Pollinations vision models"
+          echo "STRATEGY: Pollinations-only, dual-key=KEY1+KEY2, circuit-break=5min"
+          echo "SCHEDULE: 30 min intervals, 3 posts/cycle + partner posts"
+          echo "BMW KNOWLEDGE: 3-level base (models, tech, culture)"
+          echo "FACT CHECK: BMW model/engine/HP validation"
+          echo ""
 
-      - name: Self-dispatch next run
-        if: success()
+          MAX_RESTARTS=10
+          RESTART_COUNT=0
+
+          while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
+            echo "=== Bot start attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS ==="
+
+            timeout 18000 python -m bot.main || EXIT_CODE=$?
+            EXIT_CODE=${EXIT_CODE:-0}
+
+            echo "Bot exited with code: $EXIT_CODE"
+
+            # If bot exited normally (0) or was killed by timeout, try restart
+            if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
+              echo "Bot process ended, restarting..."
+              RESTART_COUNT=$((RESTART_COUNT + 1))
+              sleep 5
+            else
+              echo "Bot crashed with error code $EXIT_CODE, restarting..."
+              RESTART_COUNT=$((RESTART_COUNT + 1))
+              sleep 10
+            fi
+          done
+
+          echo "Max restarts reached, workflow will be re-dispatched."
+
+      - name: Save database
+        if: always()
         run: |
+          if [ -f masha_bot.db ]; then
+            git config user.name "Masha Bot"
+            git config user.email "masha-bot@users.noreply.github.com"
+            git add -f masha_bot.db || true
+            git diff --staged --quiet || git commit -m "db: update $(date +%Y-%m-%d_%H:%M)" || true
+            git pull --rebase origin main || true
+            git push || true
+          fi
+
+      - name: Re-dispatch workflow for 24/7 operation
+        if: always()
+        run: |
+          echo "Re-dispatching workflow for continuous operation..."
+          sleep 30
           curl -X POST \
             -H "Authorization: token ${{ secrets.GH_PAT_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ secrets.GH_REPO }}/actions/workflows/bot.yml/dispatches \
-            -d '{"ref":"main"}'
-        continue-on-error: true
+            "https://api.github.com/repos/sochiautoparts/masha-bot/actions/workflows/bot.yml/dispatches" \
+            -d '{"ref":"main"}' || echo "Re-dispatch failed, will retry on next schedule"

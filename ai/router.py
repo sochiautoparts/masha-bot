@@ -1,6 +1,9 @@
-"""AI Router — Pollinations routing for masha-bot.
+"""AI Router — Multi-provider routing for masha-bot.
 
-Routes AI requests to the Pollinations provider with
+Routes AI requests through ProviderManager with automatic failover:
+1. Pollinations (gen API with key → legacy free API)
+2. Cloudflare Workers AI (free, 10k req/day/account)
+
 Masha persona, BMW-focused system prompts, and content generation.
 """
 
@@ -13,7 +16,9 @@ import random
 from typing import Any, Optional
 
 from .providers.base import AIResponse
-from .providers.pollinations_provider import PollinationsProvider
+from .providers.pollinations_provider import PollinationsProvider, CHAT_MODELS, IMAGE_MODELS
+from .providers.cloudflare_provider import CloudflareProvider, CF_TEXT_MODEL
+from .providers.provider_manager import ProviderManager
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +57,20 @@ CHANNEL_PROMPT_SUFFIX = """\n\nВАЖНО: Это пост для канала @
 
 
 class AIRouter:
-    """Routes AI requests for masha-bot content generation."""
+    """Routes AI requests for masha-bot content generation with multi-provider failover."""
 
-    def __init__(self, provider: PollinationsProvider) -> None:
+    def __init__(self, provider: PollinationsProvider, cloudflare: CloudflareProvider | None = None) -> None:
         self.provider = provider
+        self._manager = ProviderManager(
+            pollinations=provider,
+            cloudflare=cloudflare,
+        )
         self._cache: dict[str, AIResponse] = {}
+
+    @property
+    def manager(self) -> ProviderManager:
+        """Access the ProviderManager for direct provider calls."""
+        return self._manager
 
     def _cache_key(self, messages: list[dict[str, str]], model: str | None = None) -> str:
         raw = json.dumps(messages, ensure_ascii=False, sort_keys=True) + (model or "")
@@ -71,14 +85,14 @@ class AIRouter:
         use_cache: bool = True,
         **kwargs: Any,
     ) -> AIResponse:
-        """Send a chat request through Pollinations."""
+        """Send a chat request through ProviderManager (Pollinations → Cloudflare)."""
         key = self._cache_key(messages, model)
         if use_cache and key in self._cache:
             cached = self._cache[key]
             cached.cached = True
             return cached
 
-        response = await self.provider.chat(
+        response = await self._manager.chat(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -104,6 +118,7 @@ class AIRouter:
         character_mix: str | None = None,
         temperature: float = 0.8,
         model: str | None = None,
+        source_text: str = "",  # Accept but merge into context for backward compat
     ) -> AIResponse:
         """Generate a channel post for @bmw_mpower_club."""
         system = MASHA_SYSTEM_PROMPT + CHANNEL_PROMPT_SUFFIX
@@ -111,6 +126,11 @@ class AIRouter:
         character_note = ""
         if character_mix:
             character_note = f"\n\nВ этом посте участвуют: {character_mix}."
+
+        # Merge source_text into context if provided (backward compatibility)
+        full_context = context
+        if source_text:
+            full_context = f"{source_text}\n\n{context}" if context else source_text
 
         type_instructions = {
             "news+reaction": "Напиши новость с реакцией Маши — экспертный комментарий с характером. Начни с фактов, потом добавь мнение.",
@@ -124,7 +144,7 @@ class AIRouter:
         instruction = type_instructions.get(content_type, type_instructions["news+reaction"])
 
         user_msg = f"""Тема: {topic}
-{f"Контекст: {context}" if context else ""}
+{f"Контекст: {full_context}" if full_context else ""}
 Тип контента: {content_type}
 {character_note}
 
@@ -253,7 +273,7 @@ class AIRouter:
         # Generate image for most content types
         if content_type in ("news+reaction", "lore/history", "garage stories", "partner"):
             img_prompt = await self.generate_image_prompt(topic)
-            image_resp = await self.provider.generate_image(
+            image_resp = await self._manager.generate_image(
                 prompt=img_prompt,
                 width=1024,
                 height=768,
@@ -392,9 +412,8 @@ class AIRouter:
     ) -> AIResponse:
         """Analyze an image with BMW-specific expertise using vision-capable models.
 
-        Since Pollinations text API doesn't support multimodal input directly,
-        we use a text-based approach: describe what we know and ask the AI
-        for expert BMW advice based on the user's prompt.
+        Tries Cloudflare Workers AI first (supports vision via image_url),
+        then falls back to Pollinations vision models.
         """
         context_parts = []
         if extra_context:
@@ -402,49 +421,57 @@ class AIRouter:
 
         context_str = "\n\n".join(context_parts) if context_parts else ""
 
-        # Pollinations vision models accept image_url in messages
-        # Try sending with image_url first (data URI)
+        system_content = MASHA_SYSTEM_PROMPT + (
+            "\n\nПользователь отправил фото. Рассмотри изображение максимально внимательно.\n\n"
+            "Если на фото BMW — определи: модель, поколение, год, тип кузова, "
+            "цвет, состояние, двигатель если возможно. Укажи ориентировочную стоимость.\n\n"
+            "Если на фото ЗАПЧАСТЬ — определи: что это за деталь, для какого BMW подходит. "
+            "НЕ пытайся подобрать по артикулу — предложи поискать на партнёрских сайтах.\n\n"
+            "Если на фото ДОКУМЕНТ на авто (ПТС, СТС) — "
+            "считай данные: VIN, марку, модель, год, двигатель, мощность, объём. "
+            "НИКОГДА не показывай ФИО и адрес — только технические данные.\n\n"
+            "Если на фото ЭКРАН OBD-II сканера — считай и расшифруй коды ошибок.\n\n"
+            "Если на фото ПОВРЕЖДЕНИЕ — опиши что видишь, возможные причины, стоимость ремонта.\n\n"
+            "Если что-то другое — просто опиши что видишь."
+        )
+
+        # Build vision messages (OpenAI-compatible format with image_url)
+        user_content: list[dict] | str
+        if image_base64:
+            user_content = [
+                {"type": "text", "text": prompt or "Рассмотри это фото и расскажи что видишь"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            ]
+        else:
+            user_content = prompt or "Рассмотри фото"
+
         messages = [
-            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
-                "\n\nПользователь отправил фото. Рассмотри изображение максимально внимательно.\n\n"
-                "Если на фото BMW — определи: модель, поколение, год, тип кузова, "
-                "цвет, состояние, двигатель если возможно. Укажи ориентировочную стоимость.\n\n"
-                "Если на фото ЗАПЧАСТЬ — определи: что это за деталь, для какого BMW подходит. "
-                "НЕ пытайся подобрать по артикулу — предложи поискать на партнёрских сайтах.\n\n"
-                "Если на фото ДОКУМЕНТ на авто (ПТС, СТС) — "
-                "считай данные: VIN, марку, модель, год, двигатель, мощность, объём. "
-                "НИКОГДА не показывай ФИО и адрес — только технические данные.\n\n"
-                "Если на фото ЭКРАН OBD-II сканера — считай и расшифруй коды ошибок.\n\n"
-                "Если на фото ПОВРЕЖДЕНИЕ — опиши что видишь, возможные причины, стоимость ремонта.\n\n"
-                "Если что-то другое — просто опиши что видишь."
-            )},
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
         ]
 
-        # Add image as data URI for vision-capable models
-        if image_base64:
-            image_url = f"data:image/jpeg;base64,{image_base64[:100]}..."  # truncated for safety
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt or "Рассмотри это фото и расскажи что видишь"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                ],
-            })
-        else:
-            messages.append({
-                "role": "user",
-                "content": prompt or "Рассмотри фото",
-            })
-
         if context_str:
-            # Add context as a separate user message
             messages.append({"role": "user", "content": f"Дополнительный контекст:\n{context_str}"})
 
-        # Try vision-capable models
-        vision_models = ["openai", "openai-large", "qwen", "llama", "mistral", "deepseek"]
-        for model_name in vision_models[:3]:  # Try top 3
+        # 1. Try Cloudflare Workers AI (supports vision natively)
+        if self._manager.cloudflare and self._manager.cloudflare.is_available():
             try:
-                response = await self.provider.chat(
+                response = await self._manager.cloudflare.chat(
+                    messages=messages,
+                    model=None,  # Use default CF vision model
+                    temperature=0.5,
+                    max_tokens=1500,
+                )
+                if response.ok:
+                    return response
+            except Exception as e:
+                logger.debug(f"CF vision failed: {e}")
+
+        # 2. Try Pollinations vision models
+        vision_models = ["openai", "openai-large", "qwen", "llama", "mistral", "deepseek"]
+        for model_name in vision_models[:3]:
+            try:
+                response = await self._manager.chat(
                     messages=messages,
                     model=model_name,
                     temperature=0.5,
@@ -491,13 +518,14 @@ class AIRouter:
             "reasoning": list(REASONING_MODELS),
             "vision": list(VISION_MODELS),
             "content": list(CONTENT_MODELS),
-            "search": list(CHAT_MODELS),  # search uses chat models
+            "search": list(CHAT_MODELS),
             "image": list(IMAGE_MODELS),
+            "cloudflare": [CF_TEXT_MODEL] if self._manager.cloudflare else [],
         }
 
     def is_available(self) -> bool:
-        """Check if the AI router and its provider are available."""
-        return self.provider.is_available()
+        """Check if the AI router and its providers are available."""
+        return self._manager.is_available()
 
     @property
     def primary(self) -> PollinationsProvider:
@@ -514,11 +542,17 @@ class AIRouter:
 
     async def initialize(self) -> None:
         """Initialize the AI router (lazy setup). Called at bot startup."""
-        logger.info("AI Router initialized (provider: %s)", type(self.provider).__name__)
+        providers = ["Pollinations"]
+        if self._manager.cloudflare:
+            providers.append(f"Cloudflare ({len(self._manager.cloudflare._accounts)} accounts)")
+        logger.info("AI Router initialized (providers: %s)", ", ".join(providers))
+
+    def get_provider_status(self) -> dict[str, Any]:
+        """Get full provider status for monitoring."""
+        return self._manager.get_status()
 
 
 # ── Global singleton instance ────────────────────────────────────────────────
-# Created lazily with default PollinationsProvider from environment.
 
 ai_router: Optional[AIRouter] = None
 
@@ -526,10 +560,37 @@ ai_router: Optional[AIRouter] = None
 def _create_default_router() -> AIRouter:
     """Create the default AI router from environment config."""
     import os
+
+    # Pollinations credentials
     api_key = os.getenv("POLLINATIONS_API_KEY", "")
     api_key_2 = os.getenv("POLLINATIONS_API_KEY_2", "")
-    provider = PollinationsProvider(api_key=api_key, api_key_2=api_key_2)
-    return AIRouter(provider=provider)
+
+    # Cloudflare Workers AI credentials (dual account)
+    cf_account_1 = os.getenv("CF_ACCOUNT_ID_1", "")
+    cf_token_1 = os.getenv("CF_API_TOKEN_1", "")
+    cf_account_2 = os.getenv("CF_ACCOUNT_ID_2", "")
+    cf_token_2 = os.getenv("CF_API_TOKEN_2", "")
+
+    # Create Pollinations provider (with internal gen→legacy fallback)
+    pollinations = PollinationsProvider(api_key=api_key, api_key_2=api_key_2)
+
+    # Create Cloudflare provider (optional — works without it)
+    cloudflare = None
+    if cf_account_1 and cf_token_1:
+        cloudflare = CloudflareProvider(
+            account_id_1=cf_account_1,
+            api_token_1=cf_token_1,
+            account_id_2=cf_account_2 if cf_account_2 else "",
+            api_token_2=cf_token_2 if cf_token_2 else "",
+        )
+        logger.info(
+            "Cloudflare Workers AI configured (%d accounts)",
+            len(cloudflare._accounts),
+        )
+    else:
+        logger.info("Cloudflare Workers AI not configured (no CF_ACCOUNT_ID_1/CF_API_TOKEN_1)")
+
+    return AIRouter(provider=pollinations, cloudflare=cloudflare)
 
 
 def get_ai_router() -> AIRouter:

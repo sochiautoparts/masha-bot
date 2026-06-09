@@ -95,7 +95,7 @@ class ImageGenerator:
             if img_prompt:
                 prompt = img_prompt
 
-            response = await router.provider.generate_image(
+            response = await router.manager.generate_image(
                 prompt=prompt,
                 width=1024,
                 height=768,

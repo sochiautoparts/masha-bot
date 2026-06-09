@@ -4,7 +4,8 @@ Masha Bot Configuration — @asmasha_bot
 
 All credentials loaded from environment variables — NO hardcoded secrets.
 Use GitHub Secrets for CI/CD: BOT_TOKEN, CHANNEL_ID, OWNER_ID,
-POLLINATIONS_API_KEY, POLLINATIONS_API_KEY_2, GH_PAT_TOKEN
+POLLINATIONS_API_KEY, POLLINATIONS_API_KEY_2, GH_PAT_TOKEN,
+CF_ACCOUNT_ID_1, CF_API_TOKEN_1, CF_ACCOUNT_ID_2, CF_API_TOKEN_2
 """
 
 import os
@@ -32,6 +33,13 @@ class BotConfig:
     POLLINATIONS_API_KEY: str = os.getenv("POLLINATIONS_API_KEY", "")
     POLLINATIONS_API_KEY_2: str = os.getenv("POLLINATIONS_API_KEY_2", "")
     POLLINATIONS_BASE_URL: str = "https://gen.pollinations.ai"
+
+    # Cloudflare Workers AI — dual-account failover (10k req/day per account)
+    # MUST be set via environment / GitHub Secrets
+    CF_ACCOUNT_ID_1: str = os.getenv("CF_ACCOUNT_ID_1", "")
+    CF_API_TOKEN_1: str = os.getenv("CF_API_TOKEN_1", "")
+    CF_ACCOUNT_ID_2: str = os.getenv("CF_ACCOUNT_ID_2", "")
+    CF_API_TOKEN_2: str = os.getenv("CF_API_TOKEN_2", "")
 
     # GitHub PAT for self-dispatch
     GH_PAT_TOKEN: str = os.getenv("GH_PAT_TOKEN", "")

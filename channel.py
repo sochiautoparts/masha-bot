@@ -516,9 +516,20 @@ class ChannelManager:
 
         for i, prompt in enumerate(selected_prompts):
             try:
-                image_data = await ai_router.provider.generate_image(prompt=prompt, model="flux")
-                if image_data:
-                    images.append(image_data)
+                response = await ai_router.manager.generate_image(prompt=prompt, model="flux")
+                if response.ok and response.image_b64:
+                    import base64
+                    img_bytes = base64.b64decode(response.image_b64)
+                    images.append(img_bytes)
+                elif response.ok and response.image_url:
+                    # Download the image from the URL
+                    try:
+                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                            dl_resp = await client.get(response.image_url)
+                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                                images.append(dl_resp.content)
+                    except Exception as dl_err:
+                        logger.debug(f"Failed to download generated image: {dl_err}")
             except Exception as e:
                 logger.error(f"Image generation #{i+1} failed: {e}")
 

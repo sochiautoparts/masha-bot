@@ -203,3 +203,41 @@ def is_urgent(text: str) -> bool:
 def get_random_search_queries(count: int = 3) -> list[str]:
     """Get random BMW search queries."""
     return random.sample(BMW_SEARCH_QUERIES, min(count, len(BMW_SEARCH_QUERIES)))
+
+
+async def run_news_cycle() -> int:
+    """Run one news fetch cycle — fetch from RSS, store to DB.
+
+    Returns the number of new items added.
+    """
+    try:
+        from bot.database import _get_db
+        db = _get_db()
+
+        items = await fetch_bmw_news(limit=20)
+        new_count = 0
+
+        for item in items:
+            try:
+                added = await db.add_news_item(
+                    source=item.get("source", "rss"),
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    summary=item.get("summary", ""),
+                    published_at=item.get("published", ""),
+                    is_urgent=is_urgent(item.get("title", "") + " " + item.get("summary", "")),
+                    content_type=item.get("category", "auto"),
+                )
+                if added:
+                    new_count += 1
+            except Exception as exc:
+                logger.debug("Failed to store news item: %s", exc)
+
+        if new_count > 0:
+            logger.info("News cycle: %d new items out of %d fetched", new_count, len(items))
+
+        return new_count
+
+    except Exception as exc:
+        logger.error("News cycle error: %s", exc)
+        return 0

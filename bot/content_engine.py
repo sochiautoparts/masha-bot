@@ -41,7 +41,8 @@ from bot.bmw_knowledge import (
     is_bmw_topic, extract_bmw_model, extract_bmw_engine,
     build_bmw_context, BMW_MODELS, BMW_ENGINES, BMW_M_MODELS,
 )
-from ai.router import ai_router
+from ai.router import get_ai_router
+ai_router = get_ai_router()
 from bot.web_search import web_search, search_news, search_google_news_rss
 
 logger = logging.getLogger("masha.content_engine")

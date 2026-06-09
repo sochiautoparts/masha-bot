@@ -22,7 +22,8 @@ from bot.masha_data import (
     is_part_number, identify_car_brand, detect_symptoms,
     detect_obd2_codes, lookup_obd2_code,
 )
-from ai.router import ai_router
+from ai.router import get_ai_router
+ai_router = get_ai_router()
 
 logger = logging.getLogger("masha.handlers.inline")
 

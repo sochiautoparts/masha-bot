@@ -264,3 +264,30 @@ class AIRouter:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+
+    async def initialize(self) -> None:
+        """Initialize the AI router (lazy setup). Called at bot startup."""
+        logger.info("AI Router initialized (provider: %s)", type(self.provider).__name__)
+
+
+# ── Global singleton instance ────────────────────────────────────────────────
+# Created lazily with default PollinationsProvider from environment.
+
+ai_router: Optional[AIRouter] = None
+
+
+def _create_default_router() -> AIRouter:
+    """Create the default AI router from environment config."""
+    import os
+    api_key = os.getenv("POLLINATIONS_API_KEY", "")
+    api_key_2 = os.getenv("POLLINATIONS_API_KEY_2", "")
+    provider = PollinationsProvider(api_key=api_key, api_key_2=api_key_2)
+    return AIRouter(provider=provider)
+
+
+def get_ai_router() -> AIRouter:
+    """Get or create the global AI router singleton."""
+    global ai_router
+    if ai_router is None:
+        ai_router = _create_default_router()
+    return ai_router

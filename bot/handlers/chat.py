@@ -34,7 +34,8 @@ from bot.tech_docs import (
     search_repair_procedure, format_part_info, format_tech_context,
 )
 from bot.partners import partner_manager
-from ai.router import ai_router
+from ai.router import get_ai_router
+ai_router = get_ai_router()
 from ai.voice import process_voice_message
 
 logger = logging.getLogger("masha.handlers.chat")

@@ -1,6 +1,10 @@
 """
 Masha Bot Configuration — @asmasha_bot
 Маша — BMW M-Power эксперт, ведёт канал @bmw_mpower_club
+
+All credentials loaded from environment variables — NO hardcoded secrets.
+Use GitHub Secrets for CI/CD: BOT_TOKEN, CHANNEL_ID, OWNER_ID,
+POLLINATIONS_API_KEY, POLLINATIONS_API_KEY_2, GH_PAT_TOKEN
 """
 
 import os
@@ -12,18 +16,19 @@ from typing import List
 class BotConfig:
     """Main bot configuration loaded from environment variables."""
 
-    # Bot credentials
+    # Bot credentials — MUST be set via environment / GitHub Secrets
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     BOT_USERNAME: str = "@asmasha_bot"
 
-    # Owner / admin
-    OWNER_ID: int = int(os.getenv("OWNER_ID", "265070804"))
+    # Owner / admin — MUST be set via environment / GitHub Secrets
+    OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
 
-    # Channel — Telegram channel IDs need -100 prefix for private channels
-    CHANNEL_ID: str = os.getenv("CHANNEL_ID", "-1001580892981")
+    # Channel — MUST be set via environment / GitHub Secrets
+    CHANNEL_ID: str = os.getenv("CHANNEL_ID", "")
     CHANNEL_USERNAME: str = os.getenv("CHANNEL_USERNAME", "@bmw_mpower_club")
 
     # Pollinations AI — DUAL KEY FAILOVER (KEY1 -> KEY2 -> Error)
+    # MUST be set via environment / GitHub Secrets
     POLLINATIONS_API_KEY: str = os.getenv("POLLINATIONS_API_KEY", "")
     POLLINATIONS_API_KEY_2: str = os.getenv("POLLINATIONS_API_KEY_2", "")
     POLLINATIONS_BASE_URL: str = "https://gen.pollinations.ai"
@@ -71,6 +76,46 @@ class BotConfig:
 
     # Singleton lock
     LOCK_FILE: str = "/tmp/masha_bot.lock"
+
+    # ── Aliases for internal modules (lowercase snake_case) ──────────────
+    # Internal modules access config via snake_case property names.
+    # These aliases delegate to the UPPER_CASE env-backed fields.
+
+    @property
+    def bot_token(self) -> str:
+        return self.BOT_TOKEN
+
+    @property
+    def channel_id(self) -> str:
+        return self.CHANNEL_ID
+
+    @property
+    def pollinations_api_key(self) -> str:
+        return self.POLLINATIONS_API_KEY
+
+    @property
+    def pollinations_api_key_2(self) -> str:
+        return self.POLLINATIONS_API_KEY_2
+
+    @property
+    def max_posts_per_day(self) -> int:
+        return self.CHANNEL_MAX_POSTS_PER_DAY
+
+    @property
+    def partner_post_frequency(self) -> float:
+        return 0.1  # 10% of posts should be partner content
+
+    @property
+    def dedup_similarity_threshold(self) -> float:
+        return 0.75
+
+    @property
+    def enable_fact_check(self) -> bool:
+        return True
+
+    @property
+    def enable_images(self) -> bool:
+        return True
 
 
 @dataclass
@@ -278,3 +323,17 @@ class MashaPersona:
 
 config = BotConfig()
 persona = MashaPersona()
+
+
+# ── Accessor functions for internal modules ────────────────────────────────────
+# Internal modules import get_config / get_persona via relative imports:
+#   from ..core.config import get_config, get_persona
+
+def get_config() -> BotConfig:
+    """Return the singleton BotConfig instance."""
+    return config
+
+
+def get_persona() -> MashaPersona:
+    """Return the singleton MashaPersona instance."""
+    return persona

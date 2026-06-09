@@ -16,7 +16,8 @@ from bot.database import (
     get_stats, get_today_post_count, get_today_partner_post_count,
     get_unposted_news,
 )
-from ai.router import ai_router
+from ai.router import get_ai_router
+ai_router = get_ai_router()
 from bot.partners import partner_manager
 from bot.web_search import web_search, format_search_results
 from channel import channel_manager

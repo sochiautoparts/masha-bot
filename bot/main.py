@@ -31,7 +31,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot.core.config import config, persona
 from bot.database import init_db, cleanup_old_fingerprints, add_chat_message, load_topic_registry
 from bot.partners import partner_manager
-from ai.router import ai_router
+from ai.router import get_ai_router
 from news import run_news_cycle
 from channel import channel_manager
 
@@ -327,6 +327,7 @@ async def main():
         logger.warning(f"Could not load topic registry from DB: {e}")
 
     # Initialize AI router
+    ai_router = get_ai_router()
     await ai_router.initialize()
     logger.info("AI Router initialized")
 

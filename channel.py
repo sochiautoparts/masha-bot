@@ -31,7 +31,8 @@ from bot.database import (
     is_duplicate_post, add_post_fingerprint, cleanup_old_fingerprints,
     get_recent_post_titles, DB_PATH,
 )
-from ai.router import ai_router
+from ai.router import get_ai_router
+ai_router = get_ai_router()
 from bot.partners import partner_manager
 from bot.web_search import web_search, search_news, SearchResult
 from bot.content_engine import (

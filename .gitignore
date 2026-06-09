@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.sqlite3
+masha_bot.db
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bot data (runtime)
+bot/data/*.db
+
+# Lock files
+/tmp/
+*.lock
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/

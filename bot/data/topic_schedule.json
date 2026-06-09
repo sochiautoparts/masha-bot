@@ -1,0 +1,56 @@
+{
+  "schedule": [
+    {
+      "day": 0,
+      "name": "M-Monday",
+      "emoji": "🔥",
+      "description": "M-модели, M-division новости, M Performance",
+      "content_type": "news+reaction"
+    },
+    {
+      "day": 1,
+      "name": "Tech Tuesday",
+      "emoji": "🔧",
+      "description": "Двигатели, VANOS, Valvetronic, кодинг",
+      "content_type": "DIY/how-to"
+    },
+    {
+      "day": 2,
+      "name": "Workshop Wednesday",
+      "emoji": "🔩",
+      "description": "DIY, обслуживание, советы Серёги",
+      "content_type": "DIY/how-to"
+    },
+    {
+      "day": 3,
+      "name": "Throwback Thursday",
+      "emoji": "⏪",
+      "description": "Классика BMW, E30, E39, E46, история",
+      "content_type": "lore/history"
+    },
+    {
+      "day": 4,
+      "name": "Freaky Friday",
+      "emoji": "🤪",
+      "description": "Кастом, тюнинг, Alpina, AC Schnitzer",
+      "content_type": "polls/debates"
+    },
+    {
+      "day": 5,
+      "name": "Spotlight Saturday",
+      "emoji": "🔦",
+      "description": "Подробный обзор конкретной модели",
+      "content_type": "news+reaction"
+    },
+    {
+      "day": 6,
+      "name": "Sunday Drive",
+      "emoji": "🛣️",
+      "description": "Культура вождения, Нюрбургринг, роад-трипы",
+      "content_type": "lore/history"
+    }
+  ],
+  "posting_hours_utc": [7, 9, 11, 13, 15, 17, 19, 21],
+  "max_posts_per_day": 20,
+  "min_posts_per_day": 6
+}

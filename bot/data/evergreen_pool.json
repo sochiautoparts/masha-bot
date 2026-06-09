@@ -1,0 +1,144 @@
+{
+  "evergreen_pool": [
+    {
+      "id": "eg-001",
+      "topic": "E30 M3 — легенда автоспорта",
+      "content_type": "lore/history",
+      "context": "E30 M3 — первый M-автомобиль BMW, созданный для гоночного омологации. Выпускался с 1986 по 1991 год. S14B23 — 2.3L I4, 192-238 л.с.",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-002",
+      "topic": "N55 vs B58 — битва рядных шестёрок",
+      "content_type": "polls/debates",
+      "context": "N55 (302-335 л.с.) — один TwinPower turbo, 2010-2016. B58 (322-382 л.с.) — улучшенный преемник с отдельным охлаждением турбины. Серёга за N55, Костя за B58.",
+      "character_hint": "Маша + Серёга + Костя"
+    },
+    {
+      "id": "eg-003",
+      "topic": "S63 vs S68 — эволюция V8 M-division",
+      "content_type": "lore/history",
+      "context": "S63 — 4.4L V8 twin-turbo для M5 F90 (600-635 л.с.). S68 — преемник с mild hybrid, для X5M G05 LCI, X6M, M5 G90 (523-717 л.с.)",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-004",
+      "topic": "Interlagos Blue — самый красивый цвет BMW?",
+      "content_type": "polls/debates",
+      "context": "Interlagos Blue (A46) — Individual цвет для E9X M3. Глубокий синий с фиолетовым отливом. Один из самых любимых цветов среди фанатов BMW.",
+      "character_hint": "Лена"
+    },
+    {
+      "id": "eg-005",
+      "topic": "BMW 2002 Turbo — прародитель турбо-эры",
+      "content_type": "lore/history",
+      "context": "BMW 2002 Turbo (1973) — первый турбо-автомобиль в Европе. 170 л.с., 0-100 за 7 секунд. Выпущено всего 1672 штуки.",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-006",
+      "topic": "BMW M1 Procar — суперкар от BMW Motorsport",
+      "content_type": "lore/history",
+      "context": "M1 (1978-1981) — единственный настоящий суперкар BMW. 3.5L I6, 277 л.с. Procar серия — гоночный чемпионат с M1. Спроектирован с Giorgetto Giugiaro.",
+      "character_hint": "Маша + Лена"
+    },
+    {
+      "id": "eg-007",
+      "topic": "VANOS — инструкция по выживанию",
+      "content_type": "DIY/how-to",
+      "context": "VANOS стук на холодную — классическая проблема BMW. Соленоиды можно чистить, но иногда нужна замена. Советы от Серёги.",
+      "character_hint": "Серёга"
+    },
+    {
+      "id": "eg-008",
+      "topic": "BimmerCode — кодинг BMW для начинающих",
+      "content_type": "DIY/how-to",
+      "context": "BimmerCode позволяет кодировать скрытые функции BMW через OBD-II. Костя знает все секреты: от запирания дверей при движении до изменения поведения DRL.",
+      "character_hint": "Костя"
+    },
+    {
+      "id": "eg-009",
+      "topic": "San Remo Green — Individual цвет, который стоит каждого рубля",
+      "content_type": "polls/debates",
+      "context": "San Remo Green — один из самых популярных Individual цветов BMW. Лена считает его обязательным. Стоимость опции ~$3,000-5,000.",
+      "character_hint": "Лена"
+    },
+    {
+      "id": "eg-010",
+      "topic": "E39 M5 — лучший спортивный седан всех времён?",
+      "content_type": "polls/debates",
+      "context": "E39 M5 (1998-2003) — S62 V8, 400 л.с., 6-ступенчат manual. Многие считают его идеальным спортивным седаном.",
+      "character_hint": "Маша + Серёга"
+    },
+    {
+      "id": "eg-011",
+      "topic": "BMW vs Mercedes-AMG — вечный спор баварцев",
+      "content_type": "polls/debates",
+      "context": "M3 vs C63, M5 vs E63, X5M vs GLE63 — классические сравнения. BMW = управляемость и драйв, AMG = мощь и звук.",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-012",
+      "topic": "Nürburgring Nordschleife — Зелёный Ад и дом BMW",
+      "content_type": "lore/history",
+      "context": "20.832 км, 73 поворота. BMW тестирует каждую M-модель здесь. Рекорды: M4 CSL 7:20, M5 CS 7:29. Маша мечтает о sub-7:30.",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-013",
+      "topic": "B48 — проблемы и решения",
+      "content_type": "DIY/how-to",
+      "context": "B48 (2.0L I4 turbo) — массовый двигатель BMW. Проблемы: утечки масла, проблемы с охлаждением, TGK. Серёга делится опытом.",
+      "character_hint": "Серёга"
+    },
+    {
+      "id": "eg-014",
+      "topic": "i4 M50 — электромобиль с ///M характером",
+      "content_type": "news+reaction",
+      "context": "BMW i4 M50 — 536 л.с., AWD, 0-100 за 3.9 сек. Первый полностью электрический M Performance. Костя в восторге, Серёга скептичен.",
+      "character_hint": "Костя + Серёга"
+    },
+    {
+      "id": "eg-015",
+      "topic": "M-цвета: синий, фиолетовый, красный — что они значат",
+      "content_type": "lore/history",
+      "context": "Три полоски M-division: синий (BMW), фиолетовый (переход/традиция), красный (Motorsport/Motul partnership). История с 1972 года.",
+      "character_hint": "Маша + Лена"
+    },
+    {
+      "id": "eg-016",
+      "topic": "Алкантара vs Merino — битва материалов",
+      "content_type": "polls/debates",
+      "context": "Алкантара — синтетическая замша, практичная и спортивная. Merino — натуральная кожа BMW Individual, роскошная и мягкая. Лена однозначно за Merino.",
+      "character_hint": "Лена"
+    },
+    {
+      "id": "eg-017",
+      "topic": "ZF 8HP — почему это лучшая автоматическая КПП",
+      "content_type": "lore/history",
+      "context": "ZF 8HP — 8-ступенчатый автомат, используется почти во всех BMW. Быстрое переключение, эффективность, надёжность. Даже Rolls-Royce использует.",
+      "character_hint": "Серёга"
+    },
+    {
+      "id": "eg-018",
+      "topic": "Alpina — BMW для джентльменов",
+      "content_type": "lore/history",
+      "context": "Alpina — независимый автопроизводитель на базе BMW с 1965 года. B3, B4, B5, B7, XB7. Больше роскошь, чем трек. Сейчас часть BMW Group.",
+      "character_hint": "Маша + Лена"
+    },
+    {
+      "id": "eg-019",
+      "topic": "xDrive — полный привод по-баварски",
+      "content_type": "DIY/how-to",
+      "context": "xDrive — система полного привода BMW с задним bias 40/60. Раздатка VTG требует обслуживания. M xDrive в M5 F90 позволяет режим 2WD.",
+      "character_hint": "Маша"
+    },
+    {
+      "id": "eg-020",
+      "topic": "BMW Individual — ваш BMW, только уникальный",
+      "content_type": "news+reaction",
+      "context": "BMW Individual — программа персонализации. Эксклюзивные цвета, кожа Merino, ручная отделка. От San Remo Green до индивидуальной вышивки.",
+      "character_hint": "Лена"
+    }
+  ]
+}

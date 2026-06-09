@@ -173,10 +173,12 @@ async def _generate_inline_response(query: str, query_type: str):
 
     else:
         return await ai_router.chat(
-            user_id=inline_user_id,
-            message=query,
+            messages=[
+                {"role": "system", "content": "Ты Маша, BMW-эксперт. Отвечай кратко и живо."},
+                {"role": "user", "content": query},
+            ],
             use_cache=True,
-            save_history=False,
+            max_tokens=1000,
         )
 
 

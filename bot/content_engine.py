@@ -521,7 +521,7 @@ async def ai_discover_news() -> List[Dict]:
 
     for model_name in _DISCOVERY_MODELS:
         try:
-            response = await ai_router._primary.chat(
+            response = await ai_router.provider.chat(
                 messages=[
                     {"role": "system", "content": (
                         f"Ты BMW-эксперт. Сегодня {date_str}. "

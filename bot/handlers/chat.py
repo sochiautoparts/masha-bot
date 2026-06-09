@@ -34,7 +34,7 @@ from bot.tech_docs import (
     search_repair_procedure, format_part_info, format_tech_context,
 )
 from bot.partners import partner_manager
-from ai.router import get_ai_router
+from ai.router import get_ai_router, MASHA_SYSTEM_PROMPT
 ai_router = get_ai_router()
 from ai.voice import process_voice_message
 
@@ -454,11 +454,12 @@ async def handle_photo(message: Message):
         )
         try:
             response = await ai_router.chat(
-                user_id=message.from_user.id,
-                message=simple_prompt,
-                route_type="comment",
-                save_history=False,
+                messages=[
+                    {"role": "system", "content": "Ты Маша, BMW-эксперт. Напиши короткий комментарий (до 200 символов) на фото в группе. Живо и с характером."},
+                    {"role": "user", "content": simple_prompt},
+                ],
                 use_cache=False,
+                max_tokens=300,
             )
             if response.text:
                 reply_text = response.text[:COMMENT_MAX_CHARS]
@@ -860,10 +861,17 @@ async def _process_text_message(message: Message, text: str):
                 extra_context=extra_context,
             )
         else:
+            # Build messages list for chat
+            chat_messages = [
+                {"role": "system", "content": MASHA_SYSTEM_PROMPT},
+            ]
+            if extra_context:
+                chat_messages.append({"role": "user", "content": f"Контекст:\n{extra_context}"})
+            chat_messages.append({"role": "user", "content": text})
+
             response = await ai_router.chat(
-                user_id=user_id,
-                message=text,
-                extra_context=extra_context,
+                messages=chat_messages,
+                use_cache=True,
             )
     except Exception as e:
         logger.error(f"AI router error: {e}")

@@ -28,6 +28,11 @@ class AIResponse:
     def ok(self) -> bool:
         return self.error is None and bool(self.text or self.image_url or self.image_b64)
 
+    @property
+    def error_message(self) -> str:
+        """Alias for error — many callers use response.error_message."""
+        return self.error or ""
+
     def __bool__(self) -> bool:
         return self.ok
 
@@ -64,6 +69,10 @@ class BaseAIProvider(ABC):
     ) -> AIResponse:
         """Generate an image from a text prompt."""
         ...
+
+    def is_available(self) -> bool:
+        """Check if the provider is available for requests."""
+        return True
 
     async def close(self) -> None:
         """Clean up resources."""

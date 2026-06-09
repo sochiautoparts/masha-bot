@@ -516,7 +516,7 @@ class ChannelManager:
 
         for i, prompt in enumerate(selected_prompts):
             try:
-                image_data = await ai_router._primary.generate_image(prompt, model="flux")
+                image_data = await ai_router.provider.generate_image(prompt=prompt, model="flux")
                 if image_data:
                     images.append(image_data)
             except Exception as e:
@@ -632,10 +632,16 @@ class ChannelManager:
 
         # Generate with AI using persona
         try:
+            # Build combined context from summary + extra_context
+            full_context = ""
+            if summary:
+                full_context = f"Исходная новость: {summary[:500]}"
+            if extra_context:
+                full_context = (full_context + "\n\n" + extra_context).strip() if full_context else extra_context
+
             response = await ai_router.generate_channel_post(
                 topic=title,
-                source_text=summary,
-                extra_context=extra_context,
+                context=full_context,
             )
 
             if response.error or not response.text:

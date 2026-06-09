@@ -77,7 +77,7 @@ async def cmd_status(message: Message):
     if not await _is_admin(message):
         return
 
-    is_ai = await ai_router.primary.is_available() if ai_router.primary else False
+    is_ai = ai_router.is_available()
     partner_count = len(partner_manager.programs)
     unposted = await get_unposted_news(limit=1)
 
@@ -122,7 +122,7 @@ async def cmd_post(message: Message):
 
     response = await ai_router.generate_channel_post(
         topic=topic,
-        source_text=source_summary,
+        context=source_summary if source_summary else "",
     )
 
     if response.error:

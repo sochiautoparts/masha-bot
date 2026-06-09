@@ -262,6 +262,253 @@ class AIRouter:
 
         return text_resp, image_resp
 
+    async def decode_vin(
+        self,
+        user_id: int = 0,
+        vin_code: str = "",
+        extra_context: str = "",
+    ) -> AIResponse:
+        """Decode a VIN code with BMW-specific expertise."""
+        context_parts = []
+        if extra_context:
+            context_parts.append(extra_context)
+
+        # BMW VIN prefix hints
+        vin_upper = vin_code.upper().strip()
+        if vin_upper.startswith("WBA"):
+            context_parts.append("VIN начинается с WBA — это BMW!")
+        elif vin_upper.startswith("WBS"):
+            context_parts.append("VIN начинается с WBS — это BMW M-модель! ///M!")
+        elif vin_upper.startswith("WBU"):
+            context_parts.append("VIN начинается с WBU — это BMW Individual!")
+        elif vin_upper.startswith("5U"):
+            context_parts.append("VIN начинается с 5U — возможно BMW (US assembly)")
+
+        context_str = "\n\n".join(context_parts) if context_parts else ""
+
+        messages = [
+            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
+                "\n\nПользователь просит расшифровать VIN-код или номер кузова. "
+                "Определи по VIN: марку, модель, поколение, год, тип кузова, двигатель, "
+                "комплектацию если возможно. "
+                "Если VIN начинается с WBA/WBS — это BMW, расскажи подробнее! "
+                "Если не BMW — тоже расшифруй что сможешь. "
+                "Пиши живо и экспертно, как BMW-энтузиастка. "
+                "Предложи поискать запчасти на партнёрских сайтах (из контекста). "
+                "НЕ придумывай данные которых нет — честно скажи если не уверен."
+            )},
+            {"role": "user", "content": (
+                f"Расшифруй VIN/номер: {vin_code}\n"
+                f"{f'Контекст: {context_str}' if context_str else ''}"
+            )},
+        ]
+
+        return await self.chat(
+            messages=messages,
+            model=random.choice(["openai", "mistral-large", "deepseek"]),
+            temperature=0.5,
+            max_tokens=1500,
+        )
+
+    async def diagnose_car(
+        self,
+        user_id: int = 0,
+        symptoms: str = "",
+        extra_context: str = "",
+    ) -> AIResponse:
+        """Diagnose a car problem with BMW-specific expertise."""
+        context_parts = []
+        if extra_context:
+            context_parts.append(extra_context)
+
+        context_str = "\n\n".join(context_parts) if context_parts else ""
+
+        messages = [
+            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
+                "\n\nПользователь описывает проблему с BMW. "
+                "Дай пошаговую диагностику: возможные причины, как проверить каждую, "
+                "что скорее всего, и что делать. "
+                "Если можешь — укажи коды ошибок, OEM-номера запчастей, типичные проблемы для этой модели BMW. "
+                "Если нужны запчасти — предложи партнёрские сайты (из контекста). "
+                "Пиши живо и заботливо, как BMW-энтузиастка."
+            )},
+            {"role": "user", "content": (
+                f"Проблема: {symptoms}\n"
+                f"{f'Контекст: {context_str}' if context_str else ''}"
+            )},
+        ]
+
+        return await self.chat(
+            messages=messages,
+            model=random.choice(["openai", "mistral-large", "deepseek"]),
+            temperature=0.6,
+            max_tokens=1500,
+        )
+
+    async def find_spare_part(
+        self,
+        user_id: int = 0,
+        article: str = "",
+        extra_context: str = "",
+    ) -> AIResponse:
+        """Help find a spare part with BMW-specific expertise."""
+        context_parts = []
+        if extra_context:
+            context_parts.append(extra_context)
+
+        context_str = "\n\n".join(context_parts) if context_parts else ""
+
+        messages = [
+            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
+                "\n\nПользователь ищет запчасть для BMW. "
+                "У тебя НЕТ доступа к каталогам запчастей — ты не можешь искать по VIN или артикулу напрямую. "
+                "НЕ пытайся подобрать конкретную деталь по номеру — без каталогов это нереально. "
+                "Вместо этого ОБЯЗАТЕЛЬНО предложи ТРИ партнёрских сайта (из контекста): "
+                "1) Росско, 2) Autopiter, 3) AvtoALL. "
+                "На всех трёх сайтах можно искать по VIN-коду и артикулу, есть чаты с подбором. "
+                "Ссылки переданы в контексте — используй ИХ КАК ЕСТЬ. "
+                "Если знаешь что за деталь — кратко объясни что это и для какого BMW подходит. "
+                "Пиши живо и по-дружески, как BMW-энтузиастка."
+            )},
+            {"role": "user", "content": (
+                f"Ищу запчасть: {article}\n"
+                f"{f'Контекст: {context_str}' if context_str else ''}"
+            )},
+        ]
+
+        return await self.chat(
+            messages=messages,
+            model=random.choice(["openai", "mistral-large", "deepseek"]),
+            temperature=0.6,
+            max_tokens=1500,
+        )
+
+    async def analyze_image(
+        self,
+        user_id: int = 0,
+        image_base64: str = "",
+        prompt: str = "",
+        extra_context: str = "",
+    ) -> AIResponse:
+        """Analyze an image with BMW-specific expertise using vision-capable models.
+
+        Since Pollinations text API doesn't support multimodal input directly,
+        we use a text-based approach: describe what we know and ask the AI
+        for expert BMW advice based on the user's prompt.
+        """
+        context_parts = []
+        if extra_context:
+            context_parts.append(extra_context)
+
+        context_str = "\n\n".join(context_parts) if context_parts else ""
+
+        # Pollinations vision models accept image_url in messages
+        # Try sending with image_url first (data URI)
+        messages = [
+            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
+                "\n\nПользователь отправил фото. Рассмотри изображение максимально внимательно.\n\n"
+                "Если на фото BMW — определи: модель, поколение, год, тип кузова, "
+                "цвет, состояние, двигатель если возможно. Укажи ориентировочную стоимость.\n\n"
+                "Если на фото ЗАПЧАСТЬ — определи: что это за деталь, для какого BMW подходит. "
+                "НЕ пытайся подобрать по артикулу — предложи поискать на партнёрских сайтах.\n\n"
+                "Если на фото ДОКУМЕНТ на авто (ПТС, СТС) — "
+                "считай данные: VIN, марку, модель, год, двигатель, мощность, объём. "
+                "НИКОГДА не показывай ФИО и адрес — только технические данные.\n\n"
+                "Если на фото ЭКРАН OBD-II сканера — считай и расшифруй коды ошибок.\n\n"
+                "Если на фото ПОВРЕЖДЕНИЕ — опиши что видишь, возможные причины, стоимость ремонта.\n\n"
+                "Если что-то другое — просто опиши что видишь."
+            )},
+        ]
+
+        # Add image as data URI for vision-capable models
+        if image_base64:
+            image_url = f"data:image/jpeg;base64,{image_base64[:100]}..."  # truncated for safety
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or "Рассмотри это фото и расскажи что видишь"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+                ],
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": prompt or "Рассмотри фото",
+            })
+
+        if context_str:
+            # Add context as a separate user message
+            messages.append({"role": "user", "content": f"Дополнительный контекст:\n{context_str}"})
+
+        # Try vision-capable models
+        vision_models = ["openai", "openai-large", "qwen", "llama", "mistral", "deepseek"]
+        for model_name in vision_models[:3]:  # Try top 3
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    model=model_name,
+                    temperature=0.5,
+                    max_tokens=1500,
+                )
+                if response.ok:
+                    return response
+            except Exception as e:
+                logger.debug(f"Vision model {model_name} failed: {e}")
+                continue
+
+        # Fallback: text-only approach without image
+        fallback_messages = [
+            {"role": "system", "content": MASHA_SYSTEM_PROMPT + (
+                "\n\nПользователь отправил фото, но vision-модели недоступны. "
+                "Попроси пользователя описать проблему текстом."
+            )},
+            {"role": "user", "content": f"Пользователь отправил фото с подписью: {prompt[:200]}"},
+        ]
+
+        return await self.chat(
+            messages=fallback_messages,
+            model="openai",
+            temperature=0.5,
+            max_tokens=500,
+        )
+
+    def get_available_models(self) -> list[str]:
+        """Return list of all available model names."""
+        from .providers.pollinations_provider import (
+            CHAT_MODELS, VISION_MODELS, CONTENT_MODELS,
+            IMAGE_MODELS, REASONING_MODELS,
+        )
+        return list(set(CHAT_MODELS + VISION_MODELS + CONTENT_MODELS + IMAGE_MODELS + REASONING_MODELS))
+
+    def get_model_categories(self) -> dict[str, list[str]]:
+        """Return models grouped by category."""
+        from .providers.pollinations_provider import (
+            CHAT_MODELS, VISION_MODELS, CONTENT_MODELS,
+            IMAGE_MODELS, REASONING_MODELS,
+        )
+        return {
+            "chat": list(CHAT_MODELS),
+            "reasoning": list(REASONING_MODELS),
+            "vision": list(VISION_MODELS),
+            "content": list(CONTENT_MODELS),
+            "search": list(CHAT_MODELS),  # search uses chat models
+            "image": list(IMAGE_MODELS),
+        }
+
+    def is_available(self) -> bool:
+        """Check if the AI router and its provider are available."""
+        return self.provider.is_available()
+
+    @property
+    def primary(self) -> PollinationsProvider:
+        """Alias for provider — backwards compatibility."""
+        return self.provider
+
+    @property
+    def _primary(self) -> PollinationsProvider:
+        """Alias for provider — backwards compatibility."""
+        return self.provider
+
     def clear_cache(self) -> None:
         self._cache.clear()
 

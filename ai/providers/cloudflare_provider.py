@@ -2,6 +2,7 @@
 
 Uses @cf/mistralai/mistral-small-3.1-24b-instruct via OpenAI-compatible API.
 Supports vision (image_url in messages), dual-account failover.
+Supports image generation via @cf/stabilityai/stable-diffusion-xl-base-1.0.
 Free tier: 10,000 requests/day per account.
 """
 
@@ -20,7 +21,7 @@ from .base import AIResponse, BaseAIProvider
 
 logger = logging.getLogger(__name__)
 
-# ── Cloudflare Workers AI model ────────────────────────────────────────────────
+# ── Cloudflare Workers AI models ────────────────────────────────────────────────
 
 CF_TEXT_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
 
@@ -29,6 +30,12 @@ CF_TEXT_MODELS = [
     "@cf/mistralai/mistral-small-3.1-24b-instruct",
     "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+]
+
+# Image generation models (Stable Diffusion XL on Cloudflare)
+CF_IMAGE_MODELS = [
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+    "@cf/bytedance/stable-diffusion-xl-lightning",
 ]
 
 
@@ -46,6 +53,11 @@ class CFAccount:
     @property
     def base_url(self) -> str:
         return f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/v1"
+
+    @property
+    def native_url(self) -> str:
+        """URL for native Workers AI binding (non-OpenAI-compatible)."""
+        return f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run"
 
     @property
     def is_available(self) -> bool:
@@ -79,6 +91,7 @@ class CloudflareProvider(BaseAIProvider):
     Uses OpenAI-compatible format:
     - POST /chat/completions for text
     - Supports vision via image_url in messages
+    - Image generation via native Workers AI binding (SDXL)
     - 10,000 free requests/day per account
     """
 
@@ -120,7 +133,7 @@ class CloudflareProvider(BaseAIProvider):
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=90),
                 headers={"Content-Type": "application/json"},
             )
         return self._session
@@ -241,14 +254,152 @@ class CloudflareProvider(BaseAIProvider):
         model: str | None = None,
         **kwargs: Any,
     ) -> AIResponse:
-        """Cloudflare doesn't provide image generation for masha-bot.
+        """Generate an image using Cloudflare Workers AI (Stable Diffusion XL).
 
-        Returns error — image generation should use Pollinations.
+        Uses the native Workers AI binding endpoint (not OpenAI-compatible).
+        Dual-account failover — tries each account.
         """
+        chosen_model = model or CF_IMAGE_MODELS[0]
+        if not chosen_model.startswith("@cf/"):
+            chosen_model = CF_IMAGE_MODELS[0]
+
+        # SDXL only supports certain dimensions — snap to nearest supported
+        # Supported: 256x256, 512x512, 768x768, 896x1152, 1152x896, 1024x1024
+        supported_sizes = [
+            (256, 256), (512, 512), (768, 768),
+            (896, 1152), (1152, 896), (1024, 1024),
+        ]
+        # Pick the closest supported size
+        if width == height:
+            if width <= 256:
+                w, h = 256, 256
+            elif width <= 512:
+                w, h = 512, 512
+            elif width <= 768:
+                w, h = 768, 768
+            else:
+                w, h = 1024, 1024
+        elif width > height:
+            w, h = 1152, 896  # landscape
+        else:
+            w, h = 896, 1152  # portrait
+
+        # Try each account with each image model
+        for img_model in CF_IMAGE_MODELS:
+            for _ in range(len(self._accounts)):
+                account = self._get_next_account()
+                if not account:
+                    break
+
+                start = time.monotonic()
+
+                # Use native Workers AI binding endpoint for image generation
+                # POST /accounts/{account_id}/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0
+                url = f"{account.native_url}/{img_model}"
+
+                payload: dict[str, Any] = {
+                    "prompt": prompt,
+                    "width": w,
+                    "height": h,
+                    "num_steps": 20,
+                    "guidance": 7.5,
+                }
+
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {account.api_token}",
+                }
+
+                try:
+                    session = self._get_session()
+                    async with session.post(url, json=payload, headers=headers) as resp:
+                        elapsed = (time.monotonic() - start) * 1000
+
+                        if resp.status == 200:
+                            # CF returns image as binary (image/png)
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "image" in content_type:
+                                img_bytes = await resp.read()
+                                if len(img_bytes) > 1000:
+                                    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                                    account.record_success()
+                                    logger.info(
+                                        "CF image gen success: model=%s, %d bytes, %dms",
+                                        img_model, len(img_bytes), round(elapsed),
+                                    )
+                                    return AIResponse(
+                                        image_b64=img_b64,
+                                        model=img_model,
+                                        provider=self.name,
+                                        latency_ms=elapsed,
+                                    )
+                                else:
+                                    logger.warning("CF image too small (%d bytes)", len(img_bytes))
+                                    account.record_failure()
+                                    continue
+                            else:
+                                # Might be JSON response with base64
+                                try:
+                                    data = await resp.json()
+                                    image_data = data.get("image", "")
+                                    if not image_data and "result" in data:
+                                        result = data["result"]
+                                        if isinstance(result, dict):
+                                            image_data = result.get("image", "")
+                                        elif isinstance(result, str):
+                                            image_data = result
+
+                                    if image_data:
+                                        # Validate it's valid base64
+                                        try:
+                                            decoded = base64.b64decode(image_data)
+                                            if len(decoded) > 1000:
+                                                account.record_success()
+                                                logger.info(
+                                                    "CF image gen success (JSON): model=%s, %d bytes, %dms",
+                                                    img_model, len(decoded), round(elapsed),
+                                                )
+                                                return AIResponse(
+                                                    image_b64=image_data,
+                                                    model=img_model,
+                                                    provider=self.name,
+                                                    latency_ms=elapsed,
+                                                )
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                                account.record_failure()
+                                continue
+
+                        elif resp.status == 429:
+                            logger.warning("CF image gen rate limited on account %s", account.account_id[:8])
+                            account.record_failure()
+                            continue
+
+                        elif resp.status == 401:
+                            body = await resp.text()
+                            logger.error("CF image auth error on account %s: %s", account.account_id[:8], body[:200])
+                            account.record_failure()
+                            continue
+
+                        else:
+                            body = await resp.text()
+                            logger.error("CF image gen error %d: %s", resp.status, body[:200])
+                            account.record_failure()
+                            continue
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    logger.error("CF image gen request failed: %s", exc)
+                    if account:
+                        account.record_failure()
+                    continue
+
         return AIResponse(
-            error="Cloudflare provider does not support image generation",
+            error="Cloudflare image generation failed on all accounts/models",
             provider=self.name,
-            model=model or "none",
+            model=chosen_model,
         )
 
     def is_available(self) -> bool:
@@ -269,5 +420,6 @@ class CloudflareProvider(BaseAIProvider):
             "provider": self.name,
             "accounts": accounts,
             "model": CF_TEXT_MODEL,
+            "image_models": CF_IMAGE_MODELS,
             "available": self.is_available(),
         }

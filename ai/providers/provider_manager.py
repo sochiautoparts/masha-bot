@@ -31,8 +31,8 @@ class ProviderManager:
     2. Cloudflare Workers AI
 
     Provider chain for IMAGES:
-    1. Pollinations (gen API → legacy free)
-    (CF doesn't support image generation)
+    1. Pollinations (gen API → legacy free with retry)
+    2. Cloudflare Workers AI (Stable Diffusion XL)
     """
 
     def __init__(
@@ -117,12 +117,13 @@ class ProviderManager:
         model: str | None = None,
         **kwargs: Any,
     ) -> AIResponse:
-        """Generate an image. Only Pollinations supports this.
+        """Generate an image with provider failover.
 
-        Cloudflare does NOT support image generation.
+        Chain: Pollinations (gen→legacy with retry) → Cloudflare (SDXL)
         """
         self._total_requests += 1
 
+        # 1. Try Pollinations (which has internal gen→legacy fallback with retry)
         try:
             result = await self.pollinations.generate_image(
                 prompt=prompt,
@@ -134,11 +135,31 @@ class ProviderManager:
             if result.ok:
                 self._last_provider = result.provider or "pollinations"
                 return result
+            logger.warning("Pollinations image generation failed: %s", result.error or "unknown")
         except Exception as exc:
-            logger.error("Image generation failed: %s", exc)
+            logger.error("Pollinations image generation failed: %s", exc)
 
+        # 2. Try Cloudflare Workers AI (Stable Diffusion XL)
+        if self.cloudflare and self.cloudflare.is_available():
+            try:
+                result = await self.cloudflare.generate_image(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    model=None,  # Use default CF image model
+                )
+                if result.ok:
+                    self._last_provider = "cloudflare"
+                    logger.info("Cloudflare image fallback succeeded")
+                    return result
+
+                logger.warning("Cloudflare image generation failed: %s", result.error or "unknown")
+            except Exception as exc:
+                logger.error("Cloudflare image generation exception: %s", exc)
+
+        # All providers failed
         return AIResponse(
-            error="Image generation failed on Pollinations (only provider with image support)",
+            error="Image generation failed on all providers (Pollinations + Cloudflare)",
             provider="none",
             model=model or "unknown",
         )
@@ -156,8 +177,9 @@ class ProviderManager:
             "deepseek": "deepseek",
             "deepseek-r1": "deepseek",
             "llama": "llama",
-            "qwen": "mistral",
-            "command-r": "mistral",
+            "qwen-coder": "mistral",
+            "searchgpt": "mistral",
+            "sur": "mistral",
         }
         return mapping.get(model)
 

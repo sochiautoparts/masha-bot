@@ -373,9 +373,9 @@ class ChannelManager:
         self._semantic_loaded: bool = False
 
     _CONTENT_MODELS_ROTATION = [
-        "openai-large", "gpt-5.5", "mistral-4", "deepseek",
-        "qwen-large", "deepseek-pro", "deepseek-v4", "minimax-m3",
-        "qwen3-coder", "llama-3.3", "nova-2",
+        "openai-large", "mistral-large", "deepseek",
+        "openai", "llama", "mistral", "deepseek-r1",
+        "qwen-coder", "llama-scale", "searchgpt",
     ]
 
     def set_bot(self, bot: Bot) -> None:
@@ -500,7 +500,11 @@ class ChannelManager:
             return True
 
     async def _generate_post_images(self, news_title: str, count: int = 1) -> List[bytes]:
-        """Generate images for a news post using AI (fallback)."""
+        """Generate images for a news post using AI with full fallback chain.
+
+        Tries Pollinations (gen→legacy→retry) then Cloudflare Workers AI (SDXL).
+        Returns list of image bytes (may be empty if all fail).
+        """
         images = []
         prompts = [
             f"BMW M5 F90 professional automotive photography: {news_title}. "
@@ -530,6 +534,8 @@ class ChannelManager:
                                 images.append(dl_resp.content)
                     except Exception as dl_err:
                         logger.debug(f"Failed to download generated image: {dl_err}")
+                else:
+                    logger.warning(f"Image gen #{i+1} failed: {response.error_message[:100]}")
             except Exception as e:
                 logger.error(f"Image generation #{i+1} failed: {e}")
 
@@ -537,7 +543,16 @@ class ChannelManager:
         return images
 
     async def _get_post_images(self, news_item: Dict) -> tuple:
-        """Get images for a news post with smart strategy."""
+        """Get images for a news post with smart strategy.
+
+        Priority:
+        1. RSS images (from news source)
+        2. Article page scraping
+        3. Web search enrichment
+        4. AI generation (Pollinations gen→legacy→CF SDXL)
+
+        Returns (has_images, image_data_list).
+        """
         has_images = False
         image_data_list = []
 
@@ -567,7 +582,7 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Search image enrichment error: {e}")
 
-        # 4. AI generation fallback
+        # 4. AI generation fallback (Pollinations → Cloudflare SDXL)
         if not image_data_list:
             try:
                 ai_images = await self._generate_post_images(news_item["title"], count=1)
@@ -576,6 +591,13 @@ class ChannelManager:
                 logger.debug(f"AI image generation error: {e}")
 
         has_images = len(image_data_list) > 0
+
+        if not has_images:
+            logger.warning(
+                f"No images found for post: {news_item.get('title', '')[:60]}. "
+                f"All image sources failed (RSS, scrape, search, AI)."
+            )
+
         return has_images, image_data_list
 
     async def _scrape_article_images(self, article_url: str, max_count: int = 5) -> List[bytes]:
@@ -666,7 +688,13 @@ class ChannelManager:
             return None
 
     async def run_scheduled_post(self) -> bool:
-        """Try to create and post content to the channel."""
+        """Try to create and post content to the channel.
+
+        IMPORTANT: Posts are ALWAYS published WITH at least one image.
+        If no image is available after all fallback attempts, the post is
+        skipped rather than published as text-only. This ensures the channel
+        always has visual content.
+        """
         try:
             # Check posting limits
             today_count = await get_today_post_count()
@@ -711,73 +739,102 @@ class ChannelManager:
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
 
-            # Get images
+            # Get images — MANDATORY for channel posts
             has_images, image_data_list = await self._get_post_images(news_item)
+
+            # If no images from first attempt, try AI generation one more time
+            # with a simpler prompt (CF SDXL works better with simple prompts)
+            if not has_images:
+                logger.warning("No images from standard pipeline, trying direct CF image gen...")
+                try:
+                    simple_prompt = f"BMW car, professional automotive photography, dramatic lighting, no text, 4k"
+                    response = await ai_router.manager.generate_image(
+                        prompt=simple_prompt,
+                        model="flux",
+                        width=1024,
+                        height=768,
+                    )
+                    if response.ok and response.image_b64:
+                        import base64
+                        img_bytes = base64.b64decode(response.image_b64)
+                        if len(img_bytes) > 1000:
+                            image_data_list.append(img_bytes)
+                            has_images = True
+                            logger.info("Direct CF/SDXL image gen succeeded as last resort")
+                    elif response.ok and response.image_url:
+                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                            dl_resp = await client.get(response.image_url)
+                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                                image_data_list.append(dl_resp.content)
+                                has_images = True
+                                logger.info("Direct image gen URL download succeeded as last resort")
+                except Exception as e:
+                    logger.debug(f"Last-resort image gen failed: {e}")
+
+            # SKIP post if still no images — better to skip than post without photo
+            if not has_images or not image_data_list:
+                logger.warning(
+                    f"SKIPPING post (no images): {news_item['title'][:60]}. "
+                    f"All image sources failed. Post will not be published without photo."
+                )
+                return False
 
             # Ensure footer and char limit
             post_text = _ensure_footer(post_text)
-            post_text = _enforce_char_limit(post_text, has_media=has_images)
+            post_text = _enforce_char_limit(post_text, has_media=True)
 
-            # Post to channel
+            # Post to channel — always with image(s)
             sent_message = None
             try:
-                if has_images and image_data_list:
-                    if len(image_data_list) == 1:
-                        # Single photo
-                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
-                            f.write(image_data_list[0])
-                            temp_path = f.name
+                if len(image_data_list) == 1:
+                    # Single photo
+                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                        f.write(image_data_list[0])
+                        temp_path = f.name
 
-                        photo = FSInputFile(temp_path)
-                        sent_message = await self._bot.send_photo(
-                            chat_id=config.CHANNEL_ID,
-                            photo=photo,
-                            caption=post_text[:1024],
-                            parse_mode=ParseMode.HTML,
-                        )
-                        try:
-                            os.unlink(temp_path)
-                        except Exception:
-                            pass
-                    else:
-                        # Album
-                        media_group = []
-                        for i, img_data in enumerate(image_data_list[:3]):
-                            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
-                                f.write(img_data)
-                                temp_path = f.name
-
-                            if i == 0:
-                                media = InputMediaPhoto(
-                                    media=FSInputFile(temp_path),
-                                    caption=post_text[:1024],
-                                    parse_mode=ParseMode.HTML,
-                                )
-                            else:
-                                media = InputMediaPhoto(media=FSInputFile(temp_path))
-
-                            media_group.append(media)
-
-                        sent_messages = await self._bot.send_media_group(
-                            chat_id=config.CHANNEL_ID,
-                            media=media_group,
-                        )
-                        if sent_messages:
-                            sent_message = sent_messages[0]
-
-                        for m in media_group:
-                            try:
-                                if hasattr(m.media, 'path'):
-                                    os.unlink(m.media.path)
-                            except Exception:
-                                pass
-                else:
-                    # Text-only post
-                    sent_message = await self._bot.send_message(
+                    photo = FSInputFile(temp_path)
+                    sent_message = await self._bot.send_photo(
                         chat_id=config.CHANNEL_ID,
-                        text=post_text[:4096],
+                        photo=photo,
+                        caption=post_text[:1024],
                         parse_mode=ParseMode.HTML,
                     )
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                else:
+                    # Album
+                    media_group = []
+                    for i, img_data in enumerate(image_data_list[:3]):
+                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                            f.write(img_data)
+                            temp_path = f.name
+
+                        if i == 0:
+                            media = InputMediaPhoto(
+                                media=FSInputFile(temp_path),
+                                caption=post_text[:1024],
+                                parse_mode=ParseMode.HTML,
+                            )
+                        else:
+                            media = InputMediaPhoto(media=FSInputFile(temp_path))
+
+                        media_group.append(media)
+
+                    sent_messages = await self._bot.send_media_group(
+                        chat_id=config.CHANNEL_ID,
+                        media=media_group,
+                    )
+                    if sent_messages:
+                        sent_message = sent_messages[0]
+
+                    for m in media_group:
+                        try:
+                            if hasattr(m.media, 'path'):
+                                os.unlink(m.media.path)
+                        except Exception:
+                            pass
 
                 if sent_message:
                     # Add reaction

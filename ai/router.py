@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from .providers.base import AIResponse
 from .providers.pollinations_provider import PollinationsProvider, CHAT_MODELS, IMAGE_MODELS
-from .providers.cloudflare_provider import CloudflareProvider, CF_TEXT_MODEL
+from .providers.cloudflare_provider import CloudflareProvider, CF_TEXT_MODEL, CF_IMAGE_MODELS
 from .providers.provider_manager import ProviderManager
 
 logger = logging.getLogger(__name__)
@@ -521,6 +521,7 @@ class AIRouter:
             "search": list(CHAT_MODELS),
             "image": list(IMAGE_MODELS),
             "cloudflare": [CF_TEXT_MODEL] if self._manager.cloudflare else [],
+            "cloudflare_image": list(CF_IMAGE_MODELS) if self._manager.cloudflare else [],
         }
 
     def is_available(self) -> bool:

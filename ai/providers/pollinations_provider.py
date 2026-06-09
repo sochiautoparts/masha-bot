@@ -29,32 +29,33 @@ logger = logging.getLogger(__name__)
 # ── Model catalogues ──────────────────────────────────────────────────────────
 
 # Best models for masha-bot content (tested, good Russian support)
+# NOTE: Only valid model names/aliases on gen.pollinations.ai are listed.
+# "qwen" and "command-r" are NOT valid on gen API (400 errors).
 CHAT_MODELS = [
     "openai", "openai-large",
-    "qwen-coder", "qwen",
+    "qwen-coder",
     "llama", "llama-scale",
     "mistral", "mistral-large",
     "deepseek", "deepseek-r1", "deepseek-reasoner",
-    "command-r",
     "searchgpt", "sur",
 ]
 
 # Models that work well on legacy free API (text.pollinations.ai)
+# Legacy API may accept model names that gen API rejects.
 LEGACY_CHAT_MODELS = [
     "openai", "mistral", "deepseek", "llama",
-    "qwen", "mistral-large", "qwen-coder", "command-r",
+    "mistral-large", "qwen-coder",
 ]
 
 VISION_MODELS = [
-    "openai", "openai-large", "qwen", "llama",
+    "openai", "openai-large", "llama",
     "mistral", "mistral-large", "deepseek",
-    "command-r",
 ]
 
 CONTENT_MODELS = [
-    "openai", "openai-large", "qwen", "llama",
+    "openai", "openai-large", "llama",
     "mistral", "mistral-large", "deepseek",
-    "deepseek-r1", "command-r",
+    "deepseek-r1",
 ]
 
 IMAGE_MODELS = [
@@ -522,7 +523,11 @@ class PollinationsProvider(BaseAIProvider):
         nologo: bool,
         enhance: bool,
     ) -> AIResponse | None:
-        """Generate image via legacy image.pollinations.ai (free, no key)."""
+        """Generate image via legacy image.pollinations.ai (free, no key).
+
+        Implements retry with backoff because the legacy API has a per-IP
+        rate limit (1 concurrent request). Retries up to 3 times with delays.
+        """
         encoded_prompt = quote(prompt, safe="")
         url = f"{LEGACY_IMAGE_URL}/prompt/{encoded_prompt}"
 
@@ -535,42 +540,62 @@ class PollinationsProvider(BaseAIProvider):
             "seed": seed or random.randint(1, 999999),
         }
 
-        start = time.monotonic()
-        try:
-            session = self._get_session()
-            # NO Authorization header — free anonymous endpoint
-            async with session.get(url, params=params) as resp:
-                elapsed = (time.monotonic() - start) * 1000
+        max_retries = 3
+        for attempt in range(max_retries):
+            start = time.monotonic()
+            try:
+                session = self._get_session()
+                # NO Authorization header — free anonymous endpoint
+                async with session.get(url, params=params) as resp:
+                    elapsed = (time.monotonic() - start) * 1000
 
-                if resp.status == 200:
-                    img_bytes = await resp.read()
-                    if len(img_bytes) > 1000:
-                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                        direct_url = f"{url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
-                        logger.info("Legacy image API success: model=%s, %d bytes, %dms",
-                                    model, len(img_bytes), round(elapsed))
-                        return AIResponse(
-                            image_b64=img_b64,
-                            image_url=direct_url,
-                            model=model,
-                            provider=f"{self.name}-legacy",
-                            latency_ms=elapsed,
-                        )
-                    logger.warning("Legacy image too small (%d bytes)", len(img_bytes))
-                    return None
+                    if resp.status == 200:
+                        img_bytes = await resp.read()
+                        if len(img_bytes) > 1000:
+                            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                            direct_url = f"{url}?{'&'.join(f'{k}={v}' for k, v in params.items())}"
+                            logger.info("Legacy image API success: model=%s, %d bytes, %dms",
+                                        model, len(img_bytes), round(elapsed))
+                            return AIResponse(
+                                image_b64=img_b64,
+                                image_url=direct_url,
+                                model=model,
+                                provider=f"{self.name}-legacy",
+                                latency_ms=elapsed,
+                            )
+                        logger.warning("Legacy image too small (%d bytes)", len(img_bytes))
+                        return None
 
-                elif resp.status == 429:
-                    logger.warning("Legacy image API rate limited")
-                    return None
+                    elif resp.status in (402, 429):
+                        # 402 = queue full for IP, 429 = rate limited
+                        # Both are temporary — retry with backoff
+                        if attempt < max_retries - 1:
+                            wait = 3 * (attempt + 1)  # 3s, 6s, 9s
+                            logger.warning(
+                                "Legacy image API rate limited (status %d, attempt %d/%d), waiting %ds",
+                                resp.status, attempt + 1, max_retries, wait,
+                            )
+                            await asyncio.sleep(wait)
+                            # Change seed to avoid cache
+                            params["seed"] = random.randint(1, 999999)
+                            continue
+                        else:
+                            logger.warning("Legacy image API rate limited after %d retries", max_retries)
+                            return None
 
-                else:
-                    body = await resp.text()
-                    logger.error("Legacy image API error %d: %s", resp.status, body[:200])
-                    return None
+                    else:
+                        body = await resp.text()
+                        logger.error("Legacy image API error %d: %s", resp.status, body[:200])
+                        return None
 
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("Legacy image request failed: %s", exc)
-            return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.error("Legacy image request failed: %s", exc)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+
+        return None
 
     # ── Status and health ────────────────────────────────────────────────────
 

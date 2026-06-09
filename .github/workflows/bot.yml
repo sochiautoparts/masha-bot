@@ -94,17 +94,18 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v1.0 — Маша + Редакция ==="
+          echo "=== Starting Masha Bot v1.1 — Маша + Редакция (Image Fix) ==="
           echo "ALL ROUTES: Pollinations.ai (gen+legacy) -> Cloudflare Workers AI"
+          echo "IMAGE: Pollinations(gen->legacy->retry) -> Cloudflare SDXL"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг Конг(попугай)"
           echo "CONTENT: BMW-focused RSS, Google News RSS, Web Search, AI Discovery"
-          echo "CHANNEL: @bmw_mpower_club"
+          echo "CHANNEL: @bmw_mpower_club — POSTS ALWAYS WITH PHOTOS"
           echo "FORMATS: 6 content types — news+reaction, DIY, polls, lore, garage, partner"
           echo "CHAT: Pollinations(gen->legacy) -> Cloudflare Workers AI"
           echo "FUNCTION (posts, VIN, diagnostics): Pollinations(gen->legacy) -> Cloudflare"
           echo "VISION: Cloudflare Workers AI (mistral-small-3.1) -> Pollinations vision"
           echo "STRATEGY: Triple-failover, gen->legacy->CF, circuit-break=5min"
-          echo "CLOUDFLARE: 2 accounts x 10k req/day = 20k free req/day backup"
+          echo "CLOUDFLARE: 2 accounts x 10k req/day = 20k free req/day (text+image)"
           echo "SCHEDULE: 30 min intervals, 3 posts/cycle + partner posts"
           echo "BMW KNOWLEDGE: 3-level base (models, tech, culture)"
           echo "FACT CHECK: BMW model/engine/HP validation"

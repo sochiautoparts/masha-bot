@@ -517,7 +517,7 @@ async def ai_discover_news() -> List[Dict]:
             f"НЕ называй новости, которые дублируют уже опубликованные!"
         )
 
-    _DISCOVERY_MODELS = ["openai-large", "gpt-5.5", "mistral-4", "deepseek", "qwen-large"]
+    _DISCOVERY_MODELS = ["openai-large", "mistral-large", "deepseek", "openai", "llama"]
 
     for model_name in _DISCOVERY_MODELS:
         try:

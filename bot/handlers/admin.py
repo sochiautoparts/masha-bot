@@ -377,7 +377,7 @@ async def cmd_switch_model(message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("Использование: /switch <модель>\nПример: /switch mistral-4")
+        await message.answer("Использование: /switch <модель>\nПример: /switch mistral-large")
         return
 
     model_name = args[1].strip()

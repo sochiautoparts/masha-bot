@@ -7,7 +7,7 @@ and personalized communication with Masha's BMW-expert persona.
 import re
 import logging
 import base64
-from typing import Optional
+from typing import List, Optional
 
 from aiogram import Router, F, types
 from aiogram.filters import Command, CommandStart

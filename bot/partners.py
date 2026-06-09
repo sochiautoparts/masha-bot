@@ -101,7 +101,8 @@ class PartnerManager:
             async with aiohttp.ClientSession() as session:
                 async with session.get(ADMITAD_ADS_URL) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        text = await resp.text()
+                        data = json.loads(text)
                         raw_programs = data if isinstance(data, list) else data.get("programs", [])
 
                         for raw in raw_programs:

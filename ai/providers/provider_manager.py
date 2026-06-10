@@ -12,6 +12,7 @@ Automatically switches providers based on:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Optional
@@ -140,6 +141,8 @@ class ProviderManager:
             logger.error("Pollinations image generation failed: %s", exc)
 
         # 2. Try Cloudflare Workers AI (Stable Diffusion XL)
+        # Add delay before switching providers to avoid rapid-fire rate limits
+        await asyncio.sleep(3)
         if self.cloudflare and self.cloudflare.is_available():
             try:
                 result = await self.cloudflare.generate_image(

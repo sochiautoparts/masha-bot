@@ -28,6 +28,9 @@ env:
   CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
   GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
   GH_REPO: sochiautoparts/masha-bot
+  # Free image APIs (optional but recommended for reliable image sourcing)
+  PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+  PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
   ADMITAD_ADS_FILE: data/admitad_ads.json
   DB_PATH: masha_bot.db
   PYTHONUNBUFFERED: "1"
@@ -94,9 +97,9 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v1.1 — Маша + Редакция (Image Fix) ==="
+          echo "=== Starting Masha Bot v1.2 — Маша + Редакция (Multi-Source Image Fix) ==="
           echo "ALL ROUTES: Pollinations.ai (gen+legacy) -> Cloudflare Workers AI"
-          echo "IMAGE: Pollinations(gen->legacy->retry) -> Cloudflare SDXL"
+          echo "IMAGE: RSS -> Pexels -> Pixabay -> Wikimedia -> Web Search -> AI Gen -> Stock"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг Конг(попугай)"
           echo "CONTENT: BMW-focused RSS, Google News RSS, Web Search, AI Discovery"
           echo "CHANNEL: @bmw_mpower_club — POSTS ALWAYS WITH PHOTOS"

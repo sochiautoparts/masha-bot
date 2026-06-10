@@ -146,6 +146,7 @@ class PollinationsProvider(BaseAIProvider):
         self._request_count = 0
         self._legacy_request_count = 0
         self._gen_fail_count = 0  # Track gen API failures for smart fallback
+        self._last_time = time.monotonic()  # For latency calculation
 
     def _get_next_key(self) -> str | None:
         if not self._keys:
@@ -480,6 +481,8 @@ class PollinationsProvider(BaseAIProvider):
                 "model": model,
                 "prompt": prompt,
                 "size": f"{width}x{height}",
+                "nologo": True,
+                "enhance": True,
             }
 
             try:
@@ -501,7 +504,8 @@ class PollinationsProvider(BaseAIProvider):
                                     latency_ms=elapsed,
                                 )
                     elif resp.status in (402, 401):
-                        logger.debug("Gen image API auth/balance error %d", resp.status)
+                        body = await resp.text()
+                        logger.debug("Gen image API auth/balance error %d: %s", resp.status, body[:100])
                         continue
                     else:
                         body = await resp.text()
@@ -540,7 +544,10 @@ class PollinationsProvider(BaseAIProvider):
             "seed": seed or random.randint(1, 999999),
         }
 
-        max_retries = 3
+        # Wait before first attempt to let any existing queue clear
+        await asyncio.sleep(5)
+        
+        max_retries = 5
         for attempt in range(max_retries):
             start = time.monotonic()
             try:
@@ -568,9 +575,9 @@ class PollinationsProvider(BaseAIProvider):
 
                     elif resp.status in (402, 429):
                         # 402 = queue full for IP, 429 = rate limited
-                        # Both are temporary — retry with backoff
+                        # Both are temporary — retry with long backoff (GitHub Actions shared IPs need more time)
                         if attempt < max_retries - 1:
-                            wait = 3 * (attempt + 1)  # 3s, 6s, 9s
+                            wait = 10 * (attempt + 1)  # 10s, 20s, 30s, 40s, 50s
                             logger.warning(
                                 "Legacy image API rate limited (status %d, attempt %d/%d), waiting %ds",
                                 resp.status, attempt + 1, max_retries, wait,

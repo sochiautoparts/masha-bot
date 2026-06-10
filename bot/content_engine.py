@@ -656,14 +656,33 @@ async def search_auto_news() -> List[Dict]:
 
 
 async def enrich_with_search_images(title: str, max_images: int = 3) -> List[str]:
-    """Search for images related to a news topic."""
+    """Search for images related to a news topic using SearXNG image search."""
     image_urls = []
     try:
         clean_title = re.sub(r'[^\w\s]', '', title)[:60]
-        results = await web_search(f"{clean_title} BMW photo", max_results=3)
+        # Try image-specific search via SearXNG
+        from bot.web_search import search_searxng
+        results = await search_searxng(
+            f"{clean_title} BMW", 
+            max_results=5, 
+            language="ru",
+            categories="images"
+        )
         for r in results:
-            if r.url and any(ext in r.url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                image_urls.append(r.url)
+            if r.url:
+                # SearXNG image results often have direct image URLs
+                url_lower = r.url.lower()
+                if any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']):
+                    image_urls.append(r.url)
+                elif 'img' in url_lower or 'image' in url_lower or 'photo' in url_lower:
+                    image_urls.append(r.url)
+        
+        # If no image-specific results, try regular web search with image keywords
+        if not image_urls:
+            results = await web_search(f"{clean_title} BMW photo image", max_results=5)
+            for r in results:
+                if r.url:
+                    image_urls.append(r.url)
     except Exception as e:
         logger.debug(f"Image search failed: {e}")
     return image_urls[:max_images]

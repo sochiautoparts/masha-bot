@@ -13,6 +13,7 @@ import tempfile
 import os
 import re
 import hashlib
+from urllib.parse import quote
 import httpx
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
@@ -499,6 +500,211 @@ class ChannelManager:
         except Exception:
             return True
 
+    async def _fetch_pexels_images(self, query: str, max_count: int = 2) -> List[bytes]:
+        """Fetch images from Pexels API (free, 200 req/hour). Requires PEXELS_API_KEY."""
+        images = []
+        api_key = os.environ.get("PEXELS_API_KEY", "")
+        if not api_key:
+            return images
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(
+                    "https://api.pexels.com/v1/search",
+                    params={"query": query, "per_page": max_count, "locale": "ru-RU"},
+                    headers={"Authorization": api_key},
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    for photo in data.get("photos", [])[:max_count]:
+                        img_url = photo.get("src", {}).get("large", "")
+                        if not img_url:
+                            img_url = photo.get("src", {}).get("medium", "")
+                        if img_url:
+                            img_resp = await client.get(img_url)
+                            if img_resp.status_code == 200 and len(img_resp.content) > 3000:
+                                if self._is_content_image(img_resp.content):
+                                    images.append(img_resp.content)
+                                    logger.info(f"Pexels image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
+        except Exception as e:
+            logger.debug(f"Pexels image fetch error: {e}")
+        return images
+
+    async def _fetch_pixabay_images(self, query: str, max_count: int = 2) -> List[bytes]:
+        """Fetch images from Pixabay API (free, 5000 req/hour). Requires PIXABAY_API_KEY."""
+        images = []
+        api_key = os.environ.get("PIXABAY_API_KEY", "")
+        if not api_key:
+            return images
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(
+                    "https://pixabay.com/api/",
+                    params={
+                        "key": api_key,
+                        "q": query,
+                        "image_type": "photo",
+                        "per_page": max_count,
+                        "category": "transportation",
+                        "min_width": 800,
+                        "min_height": 600,
+                        "safesearch": "true",
+                    },
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    for hit in data.get("hits", [])[:max_count]:
+                        img_url = hit.get("largeImageURL", "") or hit.get("webformatURL", "")
+                        if img_url:
+                            img_resp = await client.get(img_url)
+                            if img_resp.status_code == 200 and len(img_resp.content) > 3000:
+                                if self._is_content_image(img_resp.content):
+                                    images.append(img_resp.content)
+                                    logger.info(f"Pixabay image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
+        except Exception as e:
+            logger.debug(f"Pixabay image fetch error: {e}")
+        return images
+
+    async def _fetch_wikimedia_images(self, query: str, max_count: int = 2) -> List[bytes]:
+        """Fetch images from Wikimedia Commons (free, no API key needed)."""
+        images = []
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                # Step 1: Search Wikimedia Commons
+                search_resp = await client.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": query,
+                        "srnamespace": "6",
+                        "format": "json",
+                        "srlimit": max_count * 3,
+                    },
+                )
+                if search_resp.status_code != 200:
+                    return images
+
+                search_data = search_resp.json()
+                titles = []
+                for item in search_data.get("query", {}).get("search", []):
+                    title = item.get("title", "")
+                    if title and "File:" in title:
+                        titles.append(title)
+
+                if not titles:
+                    return images
+
+                # Step 2: Get image URLs
+                image_info_resp = await client.get(
+                    "https://commons.wikimedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "titles": "|".join(titles[:5]),
+                        "prop": "imageinfo",
+                        "iiprop": "url|size",
+                        "iiurlwidth": 1200,
+                        "format": "json",
+                    },
+                )
+                if image_info_resp.status_code != 200:
+                    return images
+
+                info_data = image_info_resp.json()
+                pages = info_data.get("query", {}).get("pages", {})
+                image_urls = []
+                for page_id, page_data in pages.items():
+                    if page_id == "-1":
+                        continue
+                    image_info = page_data.get("imageinfo", [])
+                    for info in image_info:
+                        # Prefer thumburl (resized), fallback to url (original)
+                        url = info.get("thumburl", "") or info.get("url", "")
+                        width = info.get("width", 0)
+                        height = info.get("height", 0)
+                        # Skip tiny images and SVGs
+                        if url and width >= 600 and height >= 400 and "svg" not in url.lower():
+                            image_urls.append(url)
+
+                # Step 3: Download images
+                for img_url in image_urls[:max_count]:
+                    try:
+                        img_resp = await client.get(img_url)
+                        if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                            if self._is_content_image(img_resp.content):
+                                images.append(img_resp.content)
+                                logger.info(f"Wikimedia image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.debug(f"Wikimedia image fetch error: {e}")
+        return images
+
+    async def _fetch_stock_bmw_images(self) -> List[bytes]:
+        """Fetch a BMW stock photo from reliable public URLs as ultimate fallback.
+        
+        Uses Pollinations.ai with a fixed seed to get a deterministic BMW image.
+        Also tries direct image URLs from public BMW sources.
+        """
+        images = []
+        
+        # Try Pollinations with a fixed seed (deterministic — avoids queue issues)
+        bmw_prompts = [
+            "BMW M5 F90 Competition, front three-quarter view, professional automotive photography, dramatic lighting, 4k, no text",
+            "BMW M3 G80, side profile, studio lighting, M Performance, no text",
+            "BMW X5 M Competition, dynamic shot, professional car photography, no text",
+        ]
+        prompt = random.choice(bmw_prompts)
+        seed = random.randint(1, 999999)
+        
+        try:
+            encoded_prompt = quote(prompt, safe="")
+            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            params = {
+                "width": 1024,
+                "height": 768,
+                "model": "flux",
+                "nologo": "true",
+                "enhance": "true",
+                "seed": seed,
+            }
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                response = await client.get(url, params=params)
+                if response.status_code == 200 and len(response.content) > 5000:
+                    if self._is_content_image(response.content):
+                        images.append(response.content)
+                        logger.info(f"Stock BMW image from Pollinations: seed={seed} ({len(response.content)} bytes)")
+                        return images
+        except Exception as e:
+            logger.debug(f"Stock Pollinations image failed: {e}")
+        
+        # If Pollinations also fails, try downloading from public BMW image sources
+        stock_urls = [
+            # BMW press images (publicly accessible)
+            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/automotive-life/bmw-m-1000-xr/bmw-m-1000-xr-stage-teaser-hd.jpg",
+            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m3-cs-stage-teaser-hd.jpg",
+            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m5-stage-teaser-hd.jpg",
+            # Fallback to generic BMW M images
+        ]
+        
+        for url in stock_urls:
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    response = await client.get(url, headers={
+                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
+                    })
+                    if response.status_code == 200 and len(response.content) > 5000:
+                        if self._is_content_image(response.content):
+                            images.append(response.content)
+                            logger.info(f"Stock BMW image downloaded from URL ({len(response.content)} bytes)")
+                            return images
+            except Exception:
+                continue
+        
+        return images
+
     async def _generate_post_images(self, news_title: str, count: int = 1) -> List[bytes]:
         """Generate images for a news post using AI with full fallback chain.
 
@@ -548,13 +754,27 @@ class ChannelManager:
         Priority:
         1. RSS images (from news source)
         2. Article page scraping
-        3. Web search enrichment
-        4. AI generation (Pollinations gen→legacy→CF SDXL)
+        3. Pexels API (free car photos, needs key)
+        4. Pixabay API (free car photos, needs key)
+        5. Wikimedia Commons (free, no key needed)
+        6. Web search enrichment
+        7. AI generation (Pollinations gen→legacy→CF SDXL)
+        8. Stock BMW photo fallback
 
         Returns (has_images, image_data_list).
         """
         has_images = False
         image_data_list = []
+        title = news_item.get("title", "")
+
+        # Extract BMW model for better image search
+        bmw_query = "BMW car"
+        title_lower = title.lower()
+        for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
+                       "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
+            if model.lower() in title_lower:
+                bmw_query = f"BMW {model}"
+                break
 
         # 1. Try RSS images
         if news_item.get("image_urls"):
@@ -572,30 +792,62 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Article scraping error: {e}")
 
-        # 3. Web search enrichment
-        if len(image_data_list) < 2:
+        # 3. Try Pexels API (free, high-quality car photos)
+        if not image_data_list:
             try:
-                search_image_urls = await enrich_with_search_images(news_item["title"], max_images=2)
+                pexels_images = await self._fetch_pexels_images(bmw_query, max_count=2)
+                image_data_list.extend(pexels_images)
+            except Exception as e:
+                logger.debug(f"Pexels image fetch error: {e}")
+
+        # 4. Try Pixabay API (free, large collection)
+        if not image_data_list:
+            try:
+                pixabay_images = await self._fetch_pixabay_images(bmw_query, max_count=2)
+                image_data_list.extend(pixabay_images)
+            except Exception as e:
+                logger.debug(f"Pixabay image fetch error: {e}")
+
+        # 5. Try Wikimedia Commons (free, no API key needed)
+        if not image_data_list:
+            try:
+                wiki_images = await self._fetch_wikimedia_images(bmw_query, max_count=2)
+                image_data_list.extend(wiki_images)
+            except Exception as e:
+                logger.debug(f"Wikimedia image fetch error: {e}")
+
+        # 6. Web search enrichment
+        if not image_data_list:
+            try:
+                search_image_urls = await enrich_with_search_images(title, max_images=3)
                 if search_image_urls:
                     downloaded = await self._download_news_images(search_image_urls, max_count=2)
                     image_data_list.extend(downloaded)
             except Exception as e:
                 logger.debug(f"Search image enrichment error: {e}")
 
-        # 4. AI generation fallback (Pollinations → Cloudflare SDXL)
+        # 7. AI generation fallback (Pollinations → Cloudflare SDXL)
         if not image_data_list:
             try:
-                ai_images = await self._generate_post_images(news_item["title"], count=1)
+                ai_images = await self._generate_post_images(title, count=1)
                 image_data_list.extend(ai_images)
             except Exception as e:
                 logger.debug(f"AI image generation error: {e}")
+
+        # 8. Stock BMW photo fallback (last resort before giving up)
+        if not image_data_list:
+            try:
+                stock_images = await self._fetch_stock_bmw_images()
+                image_data_list.extend(stock_images)
+            except Exception as e:
+                logger.debug(f"Stock BMW image fallback error: {e}")
 
         has_images = len(image_data_list) > 0
 
         if not has_images:
             logger.warning(
-                f"No images found for post: {news_item.get('title', '')[:60]}. "
-                f"All image sources failed (RSS, scrape, search, AI)."
+                f"No images found for post: {title[:60]}. "
+                f"All image sources failed (RSS, scrape, Pexels, Pixabay, Wikimedia, search, AI, stock)."
             )
 
         return has_images, image_data_list

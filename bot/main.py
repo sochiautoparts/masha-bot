@@ -396,7 +396,7 @@ async def main():
     dp.shutdown.register(on_shutdown)
 
     # Run polling
-    logger.info("=== Masha Bot Starting (v1.1 — Image Fix + CF SDXL) ===")
+    logger.info("=== Masha Bot Starting (v1.2 — Multi-Source Image Fix) ===")
     try:
         await dp.start_polling(bot)
     except KeyboardInterrupt:

@@ -74,14 +74,16 @@ class CFAccount:
         self._request_count += 1
         self._error_count = 0
 
-    def record_failure(self) -> None:
+    def record_failure(self, is_image: bool = False) -> None:
         self._error_count += 1
         self._last_error_time = time.monotonic()
-        if self._error_count >= 5:
+        # Image generation failures are more common — use higher threshold
+        threshold = 10 if is_image else 5
+        if self._error_count >= threshold:
             self._available = False
             logger.warning(
-                "CF account %s disabled after %d errors",
-                self.account_id[:8], self._error_count,
+                "CF account %s disabled after %d errors (image=%s)",
+                self.account_id[:8], self._error_count, is_image,
             )
 
 
@@ -285,116 +287,127 @@ class CloudflareProvider(BaseAIProvider):
             w, h = 896, 1152  # portrait
 
         # Try each account with each image model
-        for img_model in CF_IMAGE_MODELS:
-            for _ in range(len(self._accounts)):
-                account = self._get_next_account()
-                if not account:
-                    break
+        # Start with smaller/faster settings, then try larger if that works
+        size_configs = [
+            (w, h, 8, 7.5),   # Fast: fewer steps
+            (512, 512, 8, 7.5),  # Smaller size as fallback
+            (w, h, 20, 7.5),   # Full quality
+        ]
+        
+        for size_w, size_h, steps, guidance in size_configs:
+            for img_model in CF_IMAGE_MODELS:
+                for _ in range(len(self._accounts)):
+                    # Add delay between attempts to avoid rate limiting
+                    await asyncio.sleep(2)
+                    
+                    account = self._get_next_account()
+                    if not account:
+                        break
 
-                start = time.monotonic()
+                    start = time.monotonic()
 
-                # Use native Workers AI binding endpoint for image generation
-                # POST /accounts/{account_id}/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0
-                url = f"{account.native_url}/{img_model}"
+                    # Use native Workers AI binding endpoint for image generation
+                    url = f"{account.native_url}/{img_model}"
 
-                payload: dict[str, Any] = {
-                    "prompt": prompt,
-                    "width": w,
-                    "height": h,
-                    "num_steps": 20,
-                    "guidance": 7.5,
-                }
+                    payload: dict[str, Any] = {
+                        "prompt": prompt,
+                        "width": size_w,
+                        "height": size_h,
+                        "num_steps": steps,
+                        "guidance": guidance,
+                    }
 
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {account.api_token}",
-                }
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {account.api_token}",
+                    }
 
-                try:
-                    session = self._get_session()
-                    async with session.post(url, json=payload, headers=headers) as resp:
-                        elapsed = (time.monotonic() - start) * 1000
+                    try:
+                        session = self._get_session()
+                        async with session.post(url, json=payload, headers=headers) as resp:
+                            elapsed = (time.monotonic() - start) * 1000
 
-                        if resp.status == 200:
-                            # CF returns image as binary (image/png)
-                            content_type = resp.headers.get("Content-Type", "")
-                            if "image" in content_type:
-                                img_bytes = await resp.read()
-                                if len(img_bytes) > 1000:
-                                    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                                    account.record_success()
-                                    logger.info(
-                                        "CF image gen success: model=%s, %d bytes, %dms",
-                                        img_model, len(img_bytes), round(elapsed),
-                                    )
-                                    return AIResponse(
-                                        image_b64=img_b64,
-                                        model=img_model,
-                                        provider=self.name,
-                                        latency_ms=elapsed,
-                                    )
+                            if resp.status == 200:
+                                # CF returns image as binary (image/png)
+                                content_type = resp.headers.get("Content-Type", "")
+                                if "image" in content_type:
+                                    img_bytes = await resp.read()
+                                    if len(img_bytes) > 1000:
+                                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                                        account.record_success()
+                                        logger.info(
+                                            "CF image gen success: model=%s, %d bytes, %dms",
+                                            img_model, len(img_bytes), round(elapsed),
+                                        )
+                                        return AIResponse(
+                                            image_b64=img_b64,
+                                            model=img_model,
+                                            provider=self.name,
+                                            latency_ms=elapsed,
+                                        )
+                                    else:
+                                        logger.warning("CF image too small (%d bytes)", len(img_bytes))
+                                        account.record_failure(is_image=True)
+                                        continue
                                 else:
-                                    logger.warning("CF image too small (%d bytes)", len(img_bytes))
-                                    account.record_failure()
+                                    # Might be JSON response with base64
+                                    try:
+                                        data = await resp.json()
+                                        image_data = data.get("image", "")
+                                        if not image_data and "result" in data:
+                                            result = data["result"]
+                                            if isinstance(result, dict):
+                                                image_data = result.get("image", "")
+                                            elif isinstance(result, str):
+                                                image_data = result
+
+                                        if image_data:
+                                            # Validate it's valid base64
+                                            try:
+                                                decoded = base64.b64decode(image_data)
+                                                if len(decoded) > 1000:
+                                                    account.record_success()
+                                                    logger.info(
+                                                        "CF image gen success (JSON): model=%s, %d bytes, %dms",
+                                                        img_model, len(decoded), round(elapsed),
+                                                    )
+                                                    return AIResponse(
+                                                        image_b64=image_data,
+                                                        model=img_model,
+                                                        provider=self.name,
+                                                        latency_ms=elapsed,
+                                                    )
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+
+                                    account.record_failure(is_image=True)
                                     continue
-                            else:
-                                # Might be JSON response with base64
-                                try:
-                                    data = await resp.json()
-                                    image_data = data.get("image", "")
-                                    if not image_data and "result" in data:
-                                        result = data["result"]
-                                        if isinstance(result, dict):
-                                            image_data = result.get("image", "")
-                                        elif isinstance(result, str):
-                                            image_data = result
 
-                                    if image_data:
-                                        # Validate it's valid base64
-                                        try:
-                                            decoded = base64.b64decode(image_data)
-                                            if len(decoded) > 1000:
-                                                account.record_success()
-                                                logger.info(
-                                                    "CF image gen success (JSON): model=%s, %d bytes, %dms",
-                                                    img_model, len(decoded), round(elapsed),
-                                                )
-                                                return AIResponse(
-                                                    image_b64=image_data,
-                                                    model=img_model,
-                                                    provider=self.name,
-                                                    latency_ms=elapsed,
-                                                )
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-
-                                account.record_failure()
+                            elif resp.status == 429:
+                                body = await resp.text()
+                                logger.warning("CF image gen rate limited on account %s: %s", account.account_id[:8], body[:100])
+                                account.record_failure(is_image=True)
                                 continue
 
-                        elif resp.status == 429:
-                            logger.warning("CF image gen rate limited on account %s", account.account_id[:8])
-                            account.record_failure()
-                            continue
+                            elif resp.status == 401:
+                                body = await resp.text()
+                                logger.error("CF image auth error on account %s: %s", account.account_id[:8], body[:200])
+                                account.record_failure(is_image=True)
+                                continue
 
-                        elif resp.status == 401:
-                            body = await resp.text()
-                            logger.error("CF image auth error on account %s: %s", account.account_id[:8], body[:200])
-                            account.record_failure()
-                            continue
+                            else:
+                                body = await resp.text()
+                                logger.error("CF image gen error %d: %s", resp.status, body[:200])
+                                account.record_failure(is_image=True)
+                                continue
 
-                        else:
-                            body = await resp.text()
-                            logger.error("CF image gen error %d: %s", resp.status, body[:200])
-                            account.record_failure()
-                            continue
-
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                    logger.error("CF image gen request failed: %s", exc)
-                    if account:
-                        account.record_failure()
-                    continue
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        logger.error("CF image gen request failed: %s", exc)
+                        if account:
+                            account.record_failure(is_image=True)
+                        continue
 
         return AIResponse(
             error="Cloudflare image generation failed on all accounts/models",

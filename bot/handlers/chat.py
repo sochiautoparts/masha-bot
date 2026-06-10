@@ -641,6 +641,12 @@ async def _process_text_message(message: Message, text: str):
         thinking_msg = random.choice(MASHA_PHRASES["thinking"])
     status_msg = await message.answer(thinking_msg)
 
+    # ── Ensure partner data loaded ────────────────────────────────────────
+    try:
+        await partner_manager.maybe_refresh()
+    except Exception as e:
+        logger.debug(f"Partner refresh error: {e}")
+
     # ── Build extra context ────────────────────────────────────────────────
 
     extra_context_parts = []
@@ -856,6 +862,13 @@ async def _process_text_message(message: Message, text: str):
                     collected_partner_links.append((pl['name'], pl['url']))
             except Exception:
                 pass
+            # Also generate AI-friendly partner context for natural link insertion
+            try:
+                partner_ctx = partner_manager.generate_partner_context(text, max_programs=3)
+                if partner_ctx and partner_ctx not in extra_context_parts:
+                    extra_context_parts.append(partner_ctx)
+            except Exception as e:
+                logger.debug(f"Partner context generation error: {e}")
         except Exception as e:
             logger.debug(f"Partner links error: {e}")
 

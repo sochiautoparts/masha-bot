@@ -306,6 +306,30 @@ async def cmd_normal(message: Message):
     await message.answer("Обычный режим 😊 Пиши о чём хочешь!")
 
 
+# ── /partners command ──────────────────────────────────────────────────────────
+
+@chat_router.message(Command("partners"))
+async def cmd_partners(message: Message):
+    """Show available partner programs."""
+    if not await _check_user(message):
+        return
+
+    await partner_manager.maybe_refresh()
+
+    if not partner_manager.programs:
+        await message.answer("Партнёрские программы пока не загружены 😅")
+        return
+
+    lines = ["🔧 Партнёры @bmw_mpower_club:\n"]
+    for p in partner_manager.programs[:10]:
+        url = p.goto_link or p.affiliate_url
+        if url:
+            lines.append(f"• {p.name}\n  👉 {url}")
+
+    lines.append(f"\nВсего программ: {len(partner_manager.programs)}")
+    await message.answer("\n".join(lines))
+
+
 # ── /mycar command ─────────────────────────────────────────────────────────────
 
 @chat_router.message(Command("mycar"))
@@ -834,6 +858,50 @@ async def _process_text_message(message: Message, text: str):
                 pass
         except Exception as e:
             logger.debug(f"Partner links error: {e}")
+
+    # Travel queries — add travel partner links (Aviasales, Localrent)
+    is_travel_query = any(kw in text_lower for kw in [
+        "авиа", "билеты", "путешеств", "полёт", "рейс", "отель", "прокат", "аренд",
+        "перелёт", "самолёт", "гостиниц", "тур", "vacation", "flight", "hotel",
+    ])
+    if is_travel_query:
+        try:
+            travel_links = partner_manager.get_travel_links()
+            for pl in travel_links:
+                collected_partner_links.append((pl['name'], pl['url']))
+            if travel_links:
+                travel_ctx = "\n".join(f"- {l['name']}: {l['url']}" for l in travel_links)
+                extra_context_parts.append(f"Партнёрские ссылки для путешествий:\n{travel_ctx}")
+        except Exception as e:
+            logger.debug(f"Travel partner links error: {e}")
+
+    # Tools queries — add tools partner links (VseInstrumenti, etc.)
+    is_tools_query = any(kw in text_lower for kw in [
+        "инструмент", "ключ", "гараж", "ремонт", "сервис", "оборудован",
+        "toolbox", "garage", "tool",
+    ])
+    if is_tools_query:
+        try:
+            tools_links = partner_manager.get_tools_links()
+            for pl in tools_links:
+                collected_partner_links.append((pl['name'], pl['url']))
+            if tools_links:
+                tools_ctx = "\n".join(f"- {l['name']}: {l['url']}" for l in tools_links)
+                extra_context_parts.append(f"Партнёрские ссылки для инструментов:\n{tools_ctx}")
+        except Exception as e:
+            logger.debug(f"Tools partner links error: {e}")
+
+    # General shopping queries — add relevant partner links
+    is_shopping_query = any(kw in text_lower for kw in [
+        "купить", "заказать", "цена", "стоимость", "магазин",
+    ])
+    if is_shopping_query and not is_spare_part_query and not is_travel_query and not is_tools_query:
+        try:
+            primary_links = partner_manager.get_primary_parts_links()
+            for pl in primary_links[:3]:
+                collected_partner_links.append((pl['name'], pl['url']))
+        except Exception as e:
+            logger.debug(f"Shopping partner links error: {e}")
 
     # BMW knowledge context
     try:

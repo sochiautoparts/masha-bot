@@ -25,6 +25,9 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "BMW Blog", "url": "https://bmwblog.com/feed/", "category": "bmw_official"},
     {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "category": "bmw_community"},
     {"name": "BMW Motorrad", "url": "https://www.bmw-motorrad.com/en/rss/feed.xml", "category": "bmw_motorrad"},
+    {"name": "BMW Group Press", "url": "https://www.press.bmwgroup.com/global/rss.xml", "category": "bmw_official"},
+    {"name": "CarScoops BMW", "url": "https://www.carscoops.com/category/bmw/feed/", "category": "bmw_news"},
+    {"name": "TopSpeed BMW", "url": "https://www.topspeed.com/cars/bmw/rss/", "category": "bmw_news"},
     # General auto with BMW coverage
     {"name": "Motor1", "url": "https://www.motor1.com/rss/feed/", "category": "general_auto"},
     {"name": "Reuters Auto", "url": "https://www.reuters.com/rssFeed/automobilesNews", "category": "news"},
@@ -117,7 +120,7 @@ class BMWRSSFetcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30),
-                headers={"User-Agent": "masha-bot/1.0 (BMW News Fetcher)"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
             )
         return self._session
 

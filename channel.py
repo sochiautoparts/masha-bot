@@ -1120,7 +1120,13 @@ class ChannelManager:
             return False
 
     async def post_partner_content(self) -> bool:
-        """Post partner content to the channel."""
+        """Post partner content to the channel with partner logo image.
+
+        Partner posts ALWAYS have an image:
+        1. Try downloading the partner's logo from image_url
+        2. Fallback: try Wikimedia/AI generation
+        3. Post as text-only only if absolutely no image is available
+        """
         if not partner_manager.should_post_partner():
             return False
 
@@ -1133,11 +1139,85 @@ class ChannelManager:
         if not _validate_post_text_partner(post_content):
             return False
 
+        # Try to get an image for the partner post
+        image_data = None
+
+        # 1. Try downloading the partner's logo/image from their image_url
+        logo_url = getattr(program, 'image_url', '') or getattr(program, 'logo_url', '')
+        if logo_url:
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    resp = await client.get(logo_url, headers={
+                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
+                    })
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        # For partner logos, be more lenient with size check
+                        content_type = resp.headers.get("content-type", "")
+                        if any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]):
+                            image_data = resp.content
+                            logger.info(f"Partner logo downloaded: {program.name} ({len(resp.content)} bytes)")
+            except Exception as e:
+                logger.debug(f"Partner logo download failed for {program.name}: {e}")
+
+        # 2. Try Wikimedia with partner name
+        if not image_data:
+            try:
+                wiki_images = await self._fetch_wikimedia_images(program.name, max_count=1)
+                if wiki_images:
+                    image_data = wiki_images[0]
+                    logger.info(f"Wikimedia fallback image for partner: {program.name}")
+            except Exception as e:
+                logger.debug(f"Wikimedia fallback for partner {program.name}: {e}")
+
+        # 3. Try AI generation
+        if not image_data:
+            try:
+                ai_images = await self._generate_post_images(
+                    f"professional logo design for {program.name}", count=1
+                )
+                if ai_images:
+                    image_data = ai_images[0]
+                    logger.info(f"AI-generated image for partner: {program.name}")
+            except Exception as e:
+                logger.debug(f"AI image gen for partner {program.name}: {e}")
+
+        # 4. Try stock BMW image as last resort
+        if not image_data:
+            try:
+                stock_images = await self._fetch_stock_bmw_images()
+                if stock_images:
+                    image_data = stock_images[0]
+                    logger.info(f"Stock BMW image for partner post: {program.name}")
+            except Exception as e:
+                logger.debug(f"Stock image for partner {program.name}: {e}")
+
         try:
-            sent = await self._bot.send_message(
-                chat_id=config.CHANNEL_ID,
-                text=post_content,
-            )
+            if image_data:
+                # Post with image
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp.write(image_data)
+                    tmp_path = tmp.name
+
+                try:
+                    photo = FSInputFile(tmp_path, filename=f"partner_{program.id}.jpg")
+                    sent = await self._bot.send_photo(
+                        chat_id=config.CHANNEL_ID,
+                        photo=photo,
+                        caption=post_content,
+                    )
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            else:
+                # No image available — post text-only (partner posts should not be skipped)
+                logger.warning(f"Partner post without image: {program.name}")
+                sent = await self._bot.send_message(
+                    chat_id=config.CHANNEL_ID,
+                    text=post_content,
+                )
+
             if sent:
                 await add_partner_post(
                     program_id=program.id,
@@ -1148,7 +1228,7 @@ class ChannelManager:
                     message_id=sent.message_id,
                 )
                 partner_manager.mark_posted()
-                logger.info(f"Partner post published: {program.name}")
+                logger.info(f"Partner post published: {program.name} (with_image={image_data is not None})")
                 return True
         except Exception as e:
             logger.error(f"Partner post error: {e}")

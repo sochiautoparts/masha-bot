@@ -3,6 +3,7 @@
 Manages the provider failover chain:
 1. Pollinations (gen API with key → legacy free API)
 2. Cloudflare Workers AI (free, 10k req/day per account)
+3. Hugging Face Spaces (free, unlimited)
 
 Automatically switches providers based on:
 - Availability (circuit breaker state)
@@ -20,6 +21,7 @@ from typing import Any, Optional
 from .base import AIResponse, BaseAIProvider
 from .pollinations_provider import PollinationsProvider
 from .cloudflare_provider import CloudflareProvider
+from .huggingface_provider import HuggingFaceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +36,20 @@ class ProviderManager:
     Provider chain for IMAGES:
     1. Pollinations (gen API → legacy free with retry)
     2. Cloudflare Workers AI (Stable Diffusion XL)
+    3. Hugging Face Spaces (free Inference API + Gradio Spaces)
     """
 
     def __init__(
         self,
         pollinations: PollinationsProvider,
         cloudflare: CloudflareProvider | None = None,
+        huggingface: HuggingFaceProvider | None = None,
     ) -> None:
         self.pollinations = pollinations
         self.cloudflare = cloudflare
+        self.huggingface = huggingface or HuggingFaceProvider()
         self._cf_fallback_count = 0
+        self._hf_fallback_count = 0
         self._total_requests = 0
         self._last_provider: str = ""
 
@@ -103,9 +109,26 @@ class ProviderManager:
             except Exception as exc:
                 logger.error("Cloudflare chat exception: %s", exc)
 
+        # 3. Try HuggingFace (text chat)
+        if self.huggingface and self.huggingface.is_available():
+            try:
+                result = await self.huggingface.chat(
+                    messages=messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    **kwargs,
+                )
+                if result.ok:
+                    self._last_provider = "huggingface"
+                    logger.info("HuggingFace fallback succeeded (text)")
+                    return result
+            except Exception as exc:
+                logger.debug("HuggingFace chat exception: %s", exc)
+
         # All providers failed
         return AIResponse(
-            error="All AI providers failed (Pollinations + Cloudflare)",
+            error="All AI providers failed (Pollinations + Cloudflare + HuggingFace)",
             provider="none",
             model=model or "unknown",
         )
@@ -120,7 +143,7 @@ class ProviderManager:
     ) -> AIResponse:
         """Generate an image with provider failover.
 
-        Chain: Pollinations (gen→legacy with retry) → Cloudflare (SDXL)
+        Chain: Pollinations (gen→legacy with retry) → Cloudflare (SDXL) → HuggingFace
         """
         self._total_requests += 1
 
@@ -160,9 +183,28 @@ class ProviderManager:
             except Exception as exc:
                 logger.error("Cloudflare image generation exception: %s", exc)
 
+        # 3. Try Hugging Face Spaces (free, always available)
+        if self.huggingface and self.huggingface.is_available():
+            try:
+                result = await self.huggingface.generate_image(
+                    prompt=prompt,
+                    width=width,
+                    height=height,
+                    model=model,
+                )
+                if result.ok:
+                    self._hf_fallback_count += 1
+                    self._last_provider = "huggingface"
+                    logger.info("HuggingFace image fallback succeeded")
+                    return result
+
+                logger.warning("HuggingFace image generation failed: %s", result.error or "unknown")
+            except Exception as exc:
+                logger.error("HuggingFace image generation exception: %s", exc)
+
         # All providers failed
         return AIResponse(
-            error="Image generation failed on all providers (Pollinations + Cloudflare)",
+            error="Image generation failed on all providers (Pollinations + Cloudflare + HuggingFace)",
             provider="none",
             model=model or "unknown",
         )
@@ -195,12 +237,15 @@ class ProviderManager:
         await self.pollinations.close()
         if self.cloudflare:
             await self.cloudflare.close()
+        if self.huggingface:
+            await self.huggingface.close()
 
     def get_status(self) -> dict[str, Any]:
         """Get full provider status."""
         status = {
             "total_requests": self._total_requests,
             "cf_fallback_count": self._cf_fallback_count,
+            "hf_fallback_count": self._hf_fallback_count,
             "last_provider": self._last_provider,
             "pollinations": self.pollinations.get_status(),
         }
@@ -208,4 +253,8 @@ class ProviderManager:
             status["cloudflare"] = self.cloudflare.get_status()
         else:
             status["cloudflare"] = {"available": False, "reason": "not configured"}
+        if self.huggingface:
+            status["huggingface"] = self.huggingface.get_status()
+        else:
+            status["huggingface"] = {"available": False, "reason": "not configured"}
         return status

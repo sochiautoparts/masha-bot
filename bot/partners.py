@@ -35,19 +35,21 @@ class PartnerProgram:
     """Represents a single partner program."""
 
     def __init__(self, data: dict[str, Any]) -> None:
-        self.id: str = data.get("id", data.get("name", "unknown"))
+        self.id: str = str(data.get("id", data.get("name", "unknown")))
         self.name: str = data.get("name", "Unknown")
-        self.description: str = data.get("description", "")
-        self.url: str = data.get("url", "")
-        self.affiliate_url: str = data.get("affiliate_url", data.get("goto_link", data.get("url", "")))
+        self.description: str = data.get("ad_text", data.get("description", ""))[:300]
+        self.url: str = data.get("site_url", data.get("url", ""))
+        self.affiliate_url: str = data.get("goto_link", data.get("affiliate_url", data.get("url", "")))
         self.goto_link: str = data.get("goto_link", self.affiliate_url)
-        self.logo_url: str = data.get("logo_url", "")
-        self.categories: list[str] = data.get("categories", [])
+        self.logo_url: str = data.get("image_url", data.get("logo", data.get("image", data.get("logo_url", ""))))
+        self.image_url: str = data.get("image_url", data.get("image", self.logo_url))
+        self.categories: list[str] = [data.get("category", "general")] if data.get("category") else data.get("categories", [])
         self.category: str = data.get("category", "general")
-        self.promo_text: str = data.get("promo_text", "")
+        self.promo_text: str = data.get("ad_text", data.get("promo_text", ""))
         self.promo_code: str = data.get("promo_code", "")
         self.discount: str = data.get("discount", "")
-        self.site: str = data.get("site", "")
+        self.site: str = data.get("site_url", data.get("site", ""))
+        self.allowed_regions: list[str] = data.get("allowed_regions", [])
         self.bmw_relevant: bool = self._check_bmw_relevance()
 
     def _check_bmw_relevance(self) -> bool:
@@ -181,6 +183,26 @@ class PartnerManager:
     def get_all_relevant_links(self, query: str = "", max_programs: int = 5) -> list[dict[str, str]]:
         """Get all relevant partner links for a query."""
         return self.get_primary_parts_links()[:max_programs]
+
+    def get_travel_links(self) -> list[dict[str, str]]:
+        """Get travel-related partner links (Aviasales, Localrent, etc.)."""
+        links = []
+        travel_keywords = ["авиа", "avi", "rent", "прокат", "аренд", "ticket", "билет", "отель", "hotel",
+                           "путешеств", "travel", "тур", "tour"]
+        for p in self._programs:
+            if any(kw.lower() in p.name.lower() or kw.lower() in p.category.lower() for kw in travel_keywords):
+                links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
+        return links[:5]
+
+    def get_tools_links(self) -> list[dict[str, str]]:
+        """Get tools-related partner links."""
+        links = []
+        tools_keywords = ["инструмент", "tool", "220", "всё инструмент", "ремонт", "оборудован",
+                          "garage", "гараж"]
+        for p in self._programs:
+            if any(kw.lower() in p.name.lower() or kw.lower() in p.category.lower() for kw in tools_keywords):
+                links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
+        return links[:5]
 
     async def generate_partner_post_content(self, program: PartnerProgram | None = None) -> str:
         """Generate a partner post text with Маша's voice."""

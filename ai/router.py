@@ -1,10 +1,18 @@
-"""AI Router — Multi-provider routing for masha-bot.
+"""AI Router v10.0 — LOCAL-FIRST MULTI-PROVIDER FAILOVER for masha-bot.
 
-Routes AI requests through ProviderManager with automatic failover:
-1. Pollinations (gen API with key → legacy free API)
-2. Cloudflare Workers AI (free, 10k req/day/account)
+FAILOVER CHAIN (4 levels before static fallback):
+  Level 0: Local Model (Qwen3-4B GGUF, CPU) — CHAT & COMMENT routes only
+  Level 1: Pollinations (with API key) → KEY1 → KEY2
+  Level 2: Pollinations FREE API (text.pollinations.ai, no auth)
+  Level 3: Cloudflare Workers AI (@cf/mistralai/mistral-small-3.1-24b-instruct)
+  Last resort: Static fallback responses
 
-Masha persona, BMW-focused system prompts, and content generation.
+Route strategy (v10.0 — LOCAL-FIRST for simple tasks):
+  CHAT route_type (user chats) → Local → Pollinations key → Pollinations free → Cloudflare → Static
+  FUNCTION route_type (posts, VIN, diagnostics, parts) → Pollinations key → Pollinations free → Cloudflare → Local(fallback) → Static
+  COMMENT route_type (comments) → Local → Pollinations key → Pollinations free → Cloudflare → Static
+  VISION tasks (photos) → Pollinations vision (key) → Pollinations vision (free) → Cloudflare vision → Static
+  IMAGE generation → Pollinations (key) → Pollinations free → None
 """
 
 from __future__ import annotations
@@ -16,15 +24,16 @@ import random
 from typing import Any, Optional
 
 from .providers.base import AIResponse
+from .providers.local_provider import LocalProvider
 from .providers.pollinations_provider import PollinationsProvider, CHAT_MODELS, IMAGE_MODELS
 from .providers.cloudflare_provider import CloudflareProvider, CF_TEXT_MODEL, CF_IMAGE_MODELS
-from .providers.provider_manager import ProviderManager
+from .providers.provider_manager import ProviderManager, ROUTE_CHAT, ROUTE_COMMENT, ROUTE_FUNCTION, ROUTE_VISION
 
 logger = logging.getLogger(__name__)
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
-MASHA_SYSTEM_PROMPT = """Ты — Маша, главред канала @bmw_mpower_club. Владелица BMW M5 F90 Competition (625 л.с., S63). Бывший юрист, ставший автомобильным экспертом.
+MASHA_SYSTEM_PROMPT = """Ты — Маша, главред канала @bmw_mpower_club. Владелица BMW M5 F90 Competition (625 л.с., S63). Бывший юрист, ставшая автомобильным экспертом.
 
 Твои характеристики:
 - Острая, как бритва, ирония и юридическая точность в аргументах
@@ -60,13 +69,20 @@ CHANNEL_PROMPT_SUFFIX = """НИКОГДА не начинай пост с "Мн�
 
 
 class AIRouter:
-    """Routes AI requests for masha-bot content generation with multi-provider failover."""
+    """Routes AI requests for masha-bot content generation with LOCAL-FIRST multi-provider failover."""
 
-    def __init__(self, provider: PollinationsProvider, cloudflare: CloudflareProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: PollinationsProvider,
+        cloudflare: CloudflareProvider | None = None,
+        local: LocalProvider | None = None,
+    ) -> None:
         self.provider = provider
+        self._local = local
         self._manager = ProviderManager(
             pollinations=provider,
             cloudflare=cloudflare,
+            local=local,
         )
         self._cache: dict[str, AIResponse] = {}
 
@@ -74,6 +90,11 @@ class AIRouter:
     def manager(self) -> ProviderManager:
         """Access the ProviderManager for direct provider calls."""
         return self._manager
+
+    @property
+    def local_provider(self) -> LocalProvider | None:
+        """Access the LocalProvider directly."""
+        return self._local
 
     def _cache_key(self, messages: list[dict[str, str]], model: str | None = None) -> str:
         raw = json.dumps(messages, ensure_ascii=False, sort_keys=True) + (model or "")
@@ -86,9 +107,16 @@ class AIRouter:
         temperature: float = 0.7,
         max_tokens: int = 2048,
         use_cache: bool = True,
+        route_type: str = ROUTE_CHAT,
         **kwargs: Any,
     ) -> AIResponse:
-        """Send a chat request through ProviderManager (Pollinations → Cloudflare)."""
+        """Send a chat request through ProviderManager with LOCAL-FIRST routing.
+
+        Route strategy:
+          CHAT/COMMENT → Local first → Cloud fallback
+          FUNCTION     → Cloud first → Local fallback
+          VISION       → Cloud only
+        """
         key = self._cache_key(messages, model)
         if use_cache and key in self._cache:
             cached = self._cache[key]
@@ -100,6 +128,7 @@ class AIRouter:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            route_type=route_type,
             **kwargs,
         )
 
@@ -121,13 +150,16 @@ class AIRouter:
         character_mix: str | None = None,
         temperature: float = 0.8,
         model: str | None = None,
-        source_text: str = "",  # Accept but merge into context for backward compat
+        source_text: str = "",
         extra_instructions: str = "",
         has_media: bool = False,
         media_count: int = 0,
     ) -> AIResponse:
         """Generate a channel post for @bmw_mpower_club.
-        
+
+        Uses FUNCTION route (Cloud first, Local as fallback) because
+        channel posts need quality and creativity that cloud models provide.
+
         Args:
             topic: Post topic/title
             context: Additional context for the AI
@@ -194,11 +226,13 @@ class AIRouter:
             {"role": "user", "content": user_msg},
         ]
 
+        # Channel posts use FUNCTION route (Cloud first, Local fallback)
         return await self.chat(
             messages=messages,
             model=model or random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=temperature,
             max_tokens=1500,
+            route_type=ROUTE_FUNCTION,
         )
 
     async def generate_image_prompt(
@@ -230,6 +264,7 @@ class AIRouter:
             temperature=0.7,
             max_tokens=300,
             use_cache=False,
+            route_type=ROUTE_FUNCTION,
         )
 
         if response.ok:
@@ -241,7 +276,7 @@ class AIRouter:
         claim: str,
         context: str = "",
     ) -> dict[str, Any]:
-        """Fact-check a BMW-related claim."""
+        """Fact-check a BMW-related claim. Uses FUNCTION route."""
         messages = [
             {
                 "role": "system",
@@ -265,6 +300,7 @@ class AIRouter:
             temperature=0.3,
             max_tokens=500,
             use_cache=False,
+            route_type=ROUTE_FUNCTION,
         )
 
         if response.ok:
@@ -294,7 +330,6 @@ class AIRouter:
         character_mix: str | None = None,
     ) -> tuple[AIResponse, AIResponse | None]:
         """Generate a channel post with optional image."""
-        # Generate text first
         text_resp = await self.generate_channel_post(
             topic=topic,
             context=context,
@@ -303,7 +338,6 @@ class AIRouter:
         )
 
         image_resp = None
-        # Generate image for most content types
         if content_type in ("news+reaction", "lore/history", "garage stories", "partner"):
             img_prompt = await self.generate_image_prompt(topic)
             image_resp = await self._manager.generate_image(
@@ -321,12 +355,11 @@ class AIRouter:
         vin_code: str = "",
         extra_context: str = "",
     ) -> AIResponse:
-        """Decode a VIN code with BMW-specific expertise."""
+        """Decode a VIN code with BMW-specific expertise. Uses FUNCTION route."""
         context_parts = []
         if extra_context:
             context_parts.append(extra_context)
 
-        # BMW VIN prefix hints
         vin_upper = vin_code.upper().strip()
         if vin_upper.startswith("WBA"):
             context_parts.append("VIN начинается с WBA — это BMW!")
@@ -361,6 +394,7 @@ class AIRouter:
             model=random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=0.5,
             max_tokens=1500,
+            route_type=ROUTE_FUNCTION,
         )
 
     async def diagnose_car(
@@ -369,7 +403,7 @@ class AIRouter:
         symptoms: str = "",
         extra_context: str = "",
     ) -> AIResponse:
-        """Diagnose a car problem with BMW-specific expertise."""
+        """Diagnose a car problem with BMW-specific expertise. Uses FUNCTION route."""
         context_parts = []
         if extra_context:
             context_parts.append(extra_context)
@@ -396,6 +430,7 @@ class AIRouter:
             model=random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=0.6,
             max_tokens=1500,
+            route_type=ROUTE_FUNCTION,
         )
 
     async def find_spare_part(
@@ -404,7 +439,7 @@ class AIRouter:
         article: str = "",
         extra_context: str = "",
     ) -> AIResponse:
-        """Help find a spare part with BMW-specific expertise."""
+        """Help find a spare part with BMW-specific expertise. Uses FUNCTION route."""
         context_parts = []
         if extra_context:
             context_parts.append(extra_context)
@@ -434,6 +469,7 @@ class AIRouter:
             model=random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=0.6,
             max_tokens=1500,
+            route_type=ROUTE_FUNCTION,
         )
 
     async def analyze_image(
@@ -445,8 +481,7 @@ class AIRouter:
     ) -> AIResponse:
         """Analyze an image with BMW-specific expertise using vision-capable models.
 
-        Tries Cloudflare Workers AI first (supports vision via image_url),
-        then falls back to Pollinations vision models.
+        Uses VISION route (Cloud only — local model can't do vision).
         """
         context_parts = []
         if extra_context:
@@ -468,7 +503,6 @@ class AIRouter:
             "Если что-то другое — просто опиши что видишь."
         )
 
-        # Build vision messages (OpenAI-compatible format with image_url)
         user_content: list[dict] | str
         if image_base64:
             user_content = [
@@ -486,12 +520,13 @@ class AIRouter:
         if context_str:
             messages.append({"role": "user", "content": f"Дополнительный контекст:\n{context_str}"})
 
+        # VISION route — Cloud only, local can't do vision
         # 1. Try Cloudflare Workers AI (supports vision natively)
         if self._manager.cloudflare and self._manager.cloudflare.is_available():
             try:
                 response = await self._manager.cloudflare.chat(
                     messages=messages,
-                    model=None,  # Use default CF vision model
+                    model=None,
                     temperature=0.5,
                     max_tokens=1500,
                 )
@@ -500,21 +535,18 @@ class AIRouter:
             except Exception as e:
                 logger.debug(f"CF vision failed: {e}")
 
-        # 2. Try Pollinations vision models
-        vision_models = ["openai", "openai-large", "qwen", "llama", "mistral", "deepseek"]
-        for model_name in vision_models[:3]:
-            try:
-                response = await self._manager.chat(
-                    messages=messages,
-                    model=model_name,
-                    temperature=0.5,
-                    max_tokens=1500,
-                )
-                if response.ok:
-                    return response
-            except Exception as e:
-                logger.debug(f"Vision model {model_name} failed: {e}")
-                continue
+        # 2. Try Pollinations vision models via VISION route
+        response = await self.chat(
+            messages=messages,
+            model="openai",
+            temperature=0.5,
+            max_tokens=1500,
+            use_cache=False,
+            route_type=ROUTE_VISION,
+        )
+
+        if response.ok:
+            return response
 
         # Fallback: text-only approach without image
         fallback_messages = [
@@ -530,6 +562,7 @@ class AIRouter:
             model="openai",
             temperature=0.5,
             max_tokens=500,
+            route_type=ROUTE_CHAT,
         )
 
     def get_available_models(self) -> list[str]:
@@ -538,7 +571,10 @@ class AIRouter:
             CHAT_MODELS, VISION_MODELS, CONTENT_MODELS,
             IMAGE_MODELS, REASONING_MODELS,
         )
-        return list(set(CHAT_MODELS + VISION_MODELS + CONTENT_MODELS + IMAGE_MODELS + REASONING_MODELS))
+        models = list(set(CHAT_MODELS + VISION_MODELS + CONTENT_MODELS + IMAGE_MODELS + REASONING_MODELS))
+        if self._local and self._local.is_available():
+            models.append("local-qwen3-4b")
+        return models
 
     def get_model_categories(self) -> dict[str, list[str]]:
         """Return models grouped by category."""
@@ -555,6 +591,7 @@ class AIRouter:
             "image": list(IMAGE_MODELS),
             "cloudflare": [CF_TEXT_MODEL] if self._manager.cloudflare else [],
             "cloudflare_image": list(CF_IMAGE_MODELS) if self._manager.cloudflare else [],
+            "local": ["local-qwen3-4b"] if self._local and self._local.is_available() else [],
         }
 
     def is_available(self) -> bool:
@@ -575,11 +612,36 @@ class AIRouter:
         self._cache.clear()
 
     async def initialize(self) -> None:
-        """Initialize the AI router (lazy setup). Called at bot startup."""
-        providers = ["Pollinations"]
+        """Initialize the AI router — pre-load local model if enabled.
+
+        Called at bot startup. Pre-loads the local model in a thread
+        to avoid blocking the event loop.
+        """
+        providers = []
+
+        # Pre-load local model if enabled
+        if self._local:
+            from bot.config import config
+            if config.ENABLE_LOCAL_MODEL:
+                logger.info("Pre-loading local model (Qwen3-4B)...")
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loaded = await loop.run_in_executor(None, self._local._load_model)
+                if loaded:
+                    providers.append(f"Local (Qwen3-4B, LOADED)")
+                else:
+                    providers.append("Local (FAILED — cloud-only mode)")
+            else:
+                providers.append("Local (DISABLED)")
+        else:
+            providers.append("Local (not configured)")
+
+        providers.append("Pollinations")
         if self._manager.cloudflare:
             providers.append(f"Cloudflare ({len(self._manager.cloudflare._accounts)} accounts)")
-        logger.info("AI Router initialized (providers: %s)", ", ".join(providers))
+        providers.append("HuggingFace")
+
+        logger.info("AI Router v10.0 LOCAL-FIRST initialized (providers: %s)", ", ".join(providers))
 
     def get_provider_status(self) -> dict[str, Any]:
         """Get full provider status for monitoring."""
@@ -624,7 +686,19 @@ def _create_default_router() -> AIRouter:
     else:
         logger.info("Cloudflare Workers AI not configured (no CF_ACCOUNT_ID_1/CF_API_TOKEN_1)")
 
-    return AIRouter(provider=pollinations, cloudflare=cloudflare)
+    # Create Local provider (optional — works without it)
+    local = None
+    from bot.config import config
+    if config.ENABLE_LOCAL_MODEL:
+        local = LocalProvider()
+        logger.info(
+            "Local model configured (path=%s, ctx=%d, threads=%d)",
+            config.MODEL_PATH, config.MODEL_N_CTX, config.MODEL_N_THREADS,
+        )
+    else:
+        logger.info("Local model not configured (ENABLE_LOCAL_MODEL=false)")
+
+    return AIRouter(provider=pollinations, cloudflare=cloudflare, local=local)
 
 
 def get_ai_router() -> AIRouter:

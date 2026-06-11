@@ -42,6 +42,7 @@ from bot.bmw_knowledge import (
     build_bmw_context, BMW_MODELS, BMW_ENGINES, BMW_M_MODELS,
 )
 from ai.router import get_ai_router
+from ai.providers.provider_manager import ROUTE_FUNCTION
 from bot.web_search import web_search, search_news, search_google_news_rss
 
 logger = logging.getLogger("masha.content_engine")
@@ -560,6 +561,7 @@ async def ai_discover_news() -> List[Dict]:
                 model=model_name,
                 temperature=0.7,
                 max_tokens=1500,
+                route_type=ROUTE_FUNCTION,
             )
 
             if response.error or not response.text or not response.text.strip():

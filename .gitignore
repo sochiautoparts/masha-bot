@@ -50,3 +50,6 @@ bot/data/*.db
 .cache/
 .pytest_cache/
 .mypy_cache/
+
+# Local model files (too large for git)
+models/*.gguf

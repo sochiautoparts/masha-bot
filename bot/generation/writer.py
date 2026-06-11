@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from ...ai.router import AIRouter
 from ...ai.providers.pollinations_provider import PollinationsProvider, CHAT_MODELS, CONTENT_MODELS
+from ...ai.providers.provider_manager import ROUTE_FUNCTION
 from ...bot.core.config import get_config, get_persona
 from ...bot.generation.persona import PersonaManager
 from ...bot.knowledge.characters import CharacterManager, ALL_CHARACTERS
@@ -65,6 +66,7 @@ class ContentWriter:
                 model=model,
                 temperature=temperature,
                 max_tokens=1500,
+                route_type=ROUTE_FUNCTION,
             )
 
             if not response.ok:

@@ -35,6 +35,7 @@ from bot.tech_docs import (
 )
 from bot.partners import partner_manager
 from ai.router import get_ai_router, MASHA_SYSTEM_PROMPT
+from ai.providers.provider_manager import ROUTE_CHAT, ROUTE_COMMENT, ROUTE_FUNCTION
 from ai.voice import process_voice_message
 
 logger = logging.getLogger("masha.handlers.chat")
@@ -483,6 +484,7 @@ async def handle_photo(message: Message):
                 ],
                 use_cache=False,
                 max_tokens=300,
+                route_type=ROUTE_COMMENT,
             )
             if response.text:
                 reply_text = response.text[:COMMENT_MAX_CHARS]
@@ -952,6 +954,7 @@ async def _process_text_message(message: Message, text: str):
             response = await get_ai_router().chat(
                 messages=chat_messages,
                 use_cache=True,
+                route_type=ROUTE_CHAT,
             )
     except Exception as e:
         logger.error(f"AI router error: {e}")

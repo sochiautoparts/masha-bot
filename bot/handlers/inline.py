@@ -23,6 +23,7 @@ from bot.masha_data import (
     detect_obd2_codes, lookup_obd2_code,
 )
 from ai.router import get_ai_router
+from ai.providers.provider_manager import ROUTE_CHAT, ROUTE_FUNCTION
 
 logger = logging.getLogger("masha.handlers.inline")
 
@@ -178,6 +179,7 @@ async def _generate_inline_response(query: str, query_type: str):
             ],
             use_cache=True,
             max_tokens=1000,
+            route_type=ROUTE_CHAT,
         )
 
 

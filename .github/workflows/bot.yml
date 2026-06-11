@@ -2,8 +2,8 @@ name: Masha Bot — BMW M-Power Club — Маша + Редакция
 
 on:
   schedule:
-    - cron: '0 */5 * * *'      # Every 5 hours
-  workflow_dispatch:                     # Manual trigger
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: masha-bot-single
@@ -58,19 +58,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Resolve @bmw_mpower_club channel ID
-        run: |
-          echo "=== Resolving @bmw_mpower_club channel ID ==="
-          CHANNEL_INFO=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=@bmw_mpower_club")
-          echo "Channel info response: ${CHANNEL_INFO}" | head -c 500
-          echo ""
-          # Extract the channel ID from the response
-          CHANNEL_RESOLVED_ID=$(echo "${CHANNEL_INFO}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(data.get('result',{}).get('id','NOT_FOUND'))" 2>/dev/null || echo "PARSE_ERROR")
-          echo "RESOLVED_CHANNEL_ID=${CHANNEL_RESOLVED_ID}"
-          # Also check current CHANNEL_ID
-          echo "CURRENT_CHANNEL_ID=${CHANNEL_ID}"
-          echo "=== If RESOLVED != CURRENT, the secret needs updating ==="
-
       - name: Clean Python cache
         run: |
           find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
@@ -93,7 +80,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: masha_bot.db
-          key: masha-bot-db-v1
+          key: masha-bot-db-v2
           restore-keys: |
             masha-bot-db-
 
@@ -105,9 +92,10 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v2.0 — Маша + Редакция (Image Fix) ==="
+          echo "=== Starting Masha Bot v2.1 — Маша + Редакция (Image Fix) ==="
           echo "FIX: AIResponse→bytes conversion bug fixed"
           echo "FIX: Proper image extraction from news sources"
+          echo "FIX: CHANNEL_ID corrected for @bmw_mpower_club"
           echo "CHANNEL: @bmw_mpower_club — POSTS WITH REAL PHOTOS FROM NEWS"
           echo ""
 

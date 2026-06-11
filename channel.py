@@ -3,6 +3,14 @@ Channel Manager -- Posts to @bmw_mpower_club with BMW-themed formatting.
 Handles news posts, partner posts, scheduled content, reactions,
 media, polls, and internet news search.
 Properly enforces Telegram character limits: 1024 with media, 4096 without.
+
+v2.0 KEY CHANGES:
+- PRIORITIZE real photos from news sources (up to 10 per post)
+- Enhanced article scraping (og:image + twitter:image + article body <img>)
+- Web search image enrichment BEFORE AI generation
+- Allow text-only posts as last resort (channel silence is worse)
+- Strip "🔥 Мнение Маши" banned headings from post text
+- Support up to 10 media files per Telegram post
 """
 
 import logging
@@ -49,8 +57,10 @@ logger = logging.getLogger("masha.channel")
 POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///M"]
 
 # ── How many images per news post ───────────────────────────────────────────
+# Telegram allows up to 10 media per post.
+# We aim for rich visual posts with multiple relevant images from news sources.
 NEWS_IMAGES_MIN = 2
-NEWS_IMAGES_MAX = 3
+NEWS_IMAGES_MAX = 10
 MAX_IMAGES_PER_POST = 10
 MAX_RSS_IMAGES = 5
 MAX_SCRAPE_IMAGES = 5
@@ -140,7 +150,8 @@ def _record_post_title(title: str):
 
 
 def _clean_post_text(text: str) -> str:
-    """Clean post text: remove markdown, formatting artifacts, AI meta-comments."""
+    """Clean post text: remove markdown, formatting artifacts, AI meta-comments,
+    and BANNED headings like '🔥 Мнение Маши'."""
     if not text:
         return text
 
@@ -167,6 +178,24 @@ def _clean_post_text(text: str) -> str:
     ]
     for pattern in meta_comment_patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+    # ── Remove banned opening headings that AI sometimes ignores instructions about ──
+    # These are EXPLICITLY FORBIDDEN in prompts but AI sometimes generates them anyway
+    _banned_openings = [
+        "🔥 Мнение Маши",
+        "Мнение Маши",
+        "🔥 Мнение редакции",
+        "Мнение редакции",
+        "🔥 Мнение",
+        "Мнение Маши (с сарказмом и BMW-экспертизой)",
+    ]
+    for banned in _banned_openings:
+        # Match opening at start of text, possibly with emoji prefix, dashes, colons
+        pattern = rf'^[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        # Also match anywhere in text if on its own line
+        pattern = rf'\n[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
+        text = re.sub(pattern, '\n', text, flags=re.IGNORECASE)
 
     for prefix in ["Маша:", "Masha:", "Assistant:"]:
         if text.startswith(prefix):
@@ -410,12 +439,18 @@ class ChannelManager:
             logger.debug(f"Could not add reaction: {e}")
 
     async def _download_news_images(self, image_urls: List[str], max_count: int = 3) -> List[bytes]:
-        """Download real images from news source URLs."""
+        """Download real images from news source URLs.
+        
+        Tries each URL, downloads only valid content images.
+        Filters out: icons, logos, banners, buttons, social media, tracking pixels,
+        and images with abnormal dimensions (too wide/narrow = banners/ads).
+        Returns list of image data bytes.
+        """
         images = []
         if not image_urls:
             return images
 
-        MAX_IMAGE_SIZE = 2 * 1024 * 1024
+        MAX_IMAGE_SIZE = 2 * 1024 * 1024  # 2MB
 
         for url in image_urls[:max_count * 3]:
             if len(images) >= max_count:
@@ -433,17 +468,25 @@ class ChannelManager:
                         continue
 
                     content = response.content
-                    if len(content) < 3000 or len(content) > MAX_IMAGE_SIZE:
-                        continue
-
-                    if b'<svg' in content[:500]:
-                        continue
-
                     content_type = response.headers.get("content-type", "")
+
+                    # Validate: must be an image and at least 3KB
+                    if len(content) < 3000:
+                        continue
+
+                    if len(content) > MAX_IMAGE_SIZE:
+                        continue
+
+                    # Skip SVG
+                    if b'<svg' in content[:500] or 'svg' in content_type:
+                        continue
+
                     if not any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]):
                         if content[:3] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG':
                             pass
                         elif content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+                            pass
+                        elif content[:6] in (b'GIF87a', b'GIF89a'):
                             pass
                         else:
                             continue
@@ -458,6 +501,7 @@ class ChannelManager:
                 logger.debug(f"Failed to download image {url[:50]}: {e}")
                 continue
 
+        logger.info(f"Downloaded {len(images)} real images from news")
         return images
 
     @staticmethod
@@ -465,15 +509,32 @@ class ChannelManager:
         """Check if an image URL is likely non-content."""
         url_lower = url.lower()
         junk_keywords = [
-            "icon", "logo", "favicon", "avatar", "badge", "button",
-            "banner", "spinner", "placeholder", "pixel", "tracker",
-            "ad.", "ads/", "advert", "emoji", "captcha",
-            "1x1", "spacer", "blank", "transparent",
+            "icon", "logo", "favicon", "avatar", "badge", "button", "btn",
+            "banner", "spinner", "loading", "placeholder", "pixel", "tracker",
+            "analytics", "social", "share", "facebook", "twitter", "vk.",
+            "telegram", "whatsapp", "instagram", "youtube", "tiktok",
+            "ad.", "ads/", "advert", "sponsor", "promo",
+            "emoji", "smileys", "captcha", "recaptcha",
+            "1x1", "spacer", "blank", "transparent", "dot.", "clear",
+            "rss", "feed", "subscribe", "newsletter",
+            "watermark", "overlay", "frame", "border",
+            # Thumbnail/small image patterns
             "thumb", "small", "preview", "mini", "tiny", "crop",
+            "resize", "scaled", "lowres", "low-res",
+            "gallery-thumb", "list-thumb", "card-thumb",
         ]
         for kw in junk_keywords:
             if kw in url_lower:
                 return True
+
+        # Skip URLs with very small size indicators
+        size_pattern = re.compile(r'[/=_x](\d{1,3})x(\d{1,3})[/._]')
+        size_match = size_pattern.search(url_lower)
+        if size_match:
+            w, h = int(size_match.group(1)), int(size_match.group(2))
+            if w < 100 or h < 100:
+                return True
+
         return False
 
     @staticmethod
@@ -571,7 +632,6 @@ class ChannelManager:
         images = []
         try:
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                # Step 1: Search Wikimedia Commons
                 search_resp = await client.get(
                     "https://commons.wikimedia.org/w/api.php",
                     params={
@@ -596,7 +656,6 @@ class ChannelManager:
                 if not titles:
                     return images
 
-                # Step 2: Get image URLs
                 image_info_resp = await client.get(
                     "https://commons.wikimedia.org/w/api.php",
                     params={
@@ -619,15 +678,12 @@ class ChannelManager:
                         continue
                     image_info = page_data.get("imageinfo", [])
                     for info in image_info:
-                        # Prefer thumburl (resized), fallback to url (original)
                         url = info.get("thumburl", "") or info.get("url", "")
                         width = info.get("width", 0)
                         height = info.get("height", 0)
-                        # Skip tiny images and SVGs
                         if url and width >= 600 and height >= 400 and "svg" not in url.lower():
                             image_urls.append(url)
 
-                # Step 3: Download images
                 for img_url in image_urls[:max_count]:
                     try:
                         img_resp = await client.get(img_url)
@@ -643,14 +699,9 @@ class ChannelManager:
         return images
 
     async def _fetch_stock_bmw_images(self) -> List[bytes]:
-        """Fetch a BMW stock photo from reliable public URLs as ultimate fallback.
-        
-        Uses Pollinations.ai with a fixed seed to get a deterministic BMW image.
-        Also tries direct image URLs from public BMW sources.
-        """
+        """Fetch a BMW stock photo from reliable public URLs as ultimate fallback."""
         images = []
         
-        # Try Pollinations with a fixed seed (deterministic — avoids queue issues)
         bmw_prompts = [
             "BMW M5 F90 Competition, front three-quarter view, professional automotive photography, dramatic lighting, 4k, no text",
             "BMW M3 G80, side profile, studio lighting, M Performance, no text",
@@ -680,13 +731,11 @@ class ChannelManager:
         except Exception as e:
             logger.debug(f"Stock Pollinations image failed: {e}")
         
-        # If Pollinations also fails, try downloading from public BMW image sources
+        # Public BMW press images
         stock_urls = [
-            # BMW press images (publicly accessible)
             "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/automotive-life/bmw-m-1000-xr/bmw-m-1000-xr-stage-teaser-hd.jpg",
             "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m3-cs-stage-teaser-hd.jpg",
             "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m5-stage-teaser-hd.jpg",
-            # Fallback to generic BMW M images
         ]
         
         for url in stock_urls:
@@ -710,6 +759,7 @@ class ChannelManager:
 
         Tries Pollinations (gen→legacy→retry) then Cloudflare Workers AI (SDXL).
         Returns list of image bytes (may be empty if all fail).
+        LIMITED to max 2 model attempts to avoid timeout/OOM on GitHub Actions.
         """
         images = []
         prompts = [
@@ -717,54 +767,128 @@ class ChannelManager:
             f"Front three-quarter view, vibrant colors, high quality, dramatic lighting, no text.",
             f"BMW automotive news illustration: {news_title}. "
             f"Side profile shot, studio lighting, sleek design, M Power styling, no text.",
-            f"BMW M Performance car: {news_title}. "
-            f"Dynamic composition, professional car photography, vivid colors, no text.",
-            f"BMW interior detail: {news_title}. "
-            f"M Sport steering wheel, dashboard, premium feel, cinematic lighting, no text.",
         ]
         selected_prompts = prompts[:min(count, len(prompts))]
 
-        for i, prompt in enumerate(selected_prompts):
-            try:
-                response = await ai_router.manager.generate_image(prompt=prompt, model="flux")
-                if response.ok and response.image_b64:
-                    import base64
-                    img_bytes = base64.b64decode(response.image_b64)
-                    images.append(img_bytes)
-                elif response.ok and response.image_url:
-                    # Download the image from the URL
-                    try:
-                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                            dl_resp = await client.get(response.image_url)
-                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
-                                images.append(dl_resp.content)
-                    except Exception as dl_err:
-                        logger.debug(f"Failed to download generated image: {dl_err}")
-                else:
-                    logger.warning(f"Image gen #{i+1} failed: {response.error_message[:100]}")
-            except Exception as e:
-                logger.error(f"Image generation #{i+1} failed: {e}")
+        _IMAGE_MODELS = ["flux", "flux-pro"]
+        attempts = 0
+        max_attempts = 2
 
-        logger.info(f"Generated {len(images)}/{count} AI images for post")
+        for i, prompt in enumerate(selected_prompts):
+            for img_model in _IMAGE_MODELS:
+                attempts += 1
+                if attempts > max_attempts:
+                    break
+                try:
+                    image_data = await asyncio.wait_for(
+                        ai_router._primary.generate_image(prompt, model=img_model),
+                        timeout=60.0
+                    )
+                    if image_data:
+                        images.append(image_data)
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.debug(f"Image gen #{i+1} with {img_model} failed: {e}")
+                    try:
+                        image_data = await asyncio.wait_for(
+                            ai_router._primary.generate_image_free(prompt, model=img_model),
+                            timeout=60.0
+                        )
+                        if image_data:
+                            images.append(image_data)
+                            break
+                    except Exception:
+                        pass
+                    continue
+            if images:
+                break
+            if attempts >= max_attempts:
+                break
+
+        logger.info(f"Generated {len(images)}/{count} AI images for post ({attempts} attempts)")
+        return images
+
+    async def _scrape_article_images(self, article_url: str, max_count: int = 5) -> List[bytes]:
+        """Scrape images from a news article page.
+        
+        Extracts og:image, twitter:image, and images from article body areas.
+        Prioritizes: og:image > twitter:image > article body <img> tags.
+        Returns list of image data bytes (up to max_count).
+        """
+        images = []
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(article_url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                })
+                if response.status_code != 200:
+                    return images
+
+                html = response.text
+                
+                # Extract og:image first (usually the main article image)
+                og_images = re.findall(r'<meta[^>]+property=["\x27]og:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
+                og_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+property=["\x27]og:image["\x27]', html, re.IGNORECASE)
+                
+                # Extract twitter:image
+                tw_images = re.findall(r'<meta[^>]+name=["\x27]twitter:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
+                tw_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+name=["\x27]twitter:image["\x27]', html, re.IGNORECASE)
+                
+                # Extract <img> tags — only from article body areas
+                article_html = ""
+                for pattern in [r'<article[^>]*>(.*?)</article>', r'<main[^>]*>(.*?)</main>', r'<div[^>]+class=["\x27][^"\x27]*(?:content|article|post|entry)[^"\x27]*["\x27][^>]*>(.*?)</div>']:
+                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                    for match in matches:
+                        article_html += match + "\n"
+                
+                # If no article body found, skip <img> tags entirely (too risky)
+                all_img_urls = []
+                if article_html:
+                    all_img_urls = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
+                
+                # Prioritize: og:image > twitter:image > article body images
+                candidate_urls = []
+                seen = set()
+                for url_list in [og_images, tw_images, all_img_urls]:
+                    for url in url_list:
+                        if url and url not in seen and len(url) > 30:
+                            if url.startswith("//"):
+                                url = "https:" + url
+                            if not self._is_junk_image_url(url):
+                                seen.add(url)
+                                candidate_urls.append(url)
+                
+                images = await self._download_news_images(candidate_urls, max_count=max_count)
+
+        except Exception as e:
+            logger.debug(f"Article scraping failed: {e}")
+
         return images
 
     async def _get_post_images(self, news_item: Dict) -> tuple:
-        """Get images for a news post with smart strategy.
+        """Get images for a news post — PRIORITIZE real photos from news sources.
+        
+        KEY CHANGE: Real photos from the actual news article are FAR more valuable
+        than AI-generated images. We now aggressively fetch up to MAX_IMAGES_PER_POST (10)
+        real photos from RSS feeds, article scraping, and web search BEFORE falling
+        back to AI generation.
 
         Priority:
-        1. RSS images (from news source)
-        2. Article page scraping
-        3. Pexels API (free car photos, needs key)
-        4. Pixabay API (free car photos, needs key)
-        5. Wikimedia Commons (free, no key needed)
-        6. Web search enrichment
-        7. AI generation (Pollinations gen→legacy→CF SDXL)
-        8. Stock BMW photo fallback
+        1. RSS images (from news source) — up to MAX_RSS_IMAGES
+        2. Article page scraping (og:image, twitter:image, article body) — up to MAX_SCRAPE_IMAGES
+        3. Web search enrichment (find images for this specific news) — up to MAX_SEARCH_IMAGES
+        4. Pexels API (free car photos, needs key)
+        5. Pixabay API (free car photos, needs key)
+        6. Wikimedia Commons (free, no key needed)
+        7. AI generation — LAST RESORT
+        8. Stock BMW photo fallback — ABSOLUTE LAST RESORT
 
-        Returns (has_images, image_data_list).
+        Returns (image_list: List[bytes], source: str)
         """
-        has_images = False
-        image_data_list = []
+        image_list = []
+        source = "none"
         title = news_item.get("title", "")
 
         # Extract BMW model for better image search
@@ -776,113 +900,134 @@ class ChannelManager:
                 bmw_query = f"BMW {model}"
                 break
 
-        # 1. Try RSS images
-        if news_item.get("image_urls"):
+        # 1. Try RSS images — download up to MAX_RSS_IMAGES real photos
+        rss_image_urls = news_item.get("image_urls", [])
+        if rss_image_urls:
             try:
-                downloaded = await self._download_news_images(news_item["image_urls"], max_count=2)
-                image_data_list.extend(downloaded)
+                rss_images = await self._download_news_images(
+                    rss_image_urls,
+                    max_count=MAX_RSS_IMAGES
+                )
+                if rss_images:
+                    image_list.extend(rss_images)
+                    source = "real"
+                    logger.info(f"Using {len(rss_images)} real images from RSS for: {title[:50]}")
             except Exception as e:
-                logger.debug(f"RSS image download error: {e}")
+                logger.warning(f"Failed to download RSS images: {e}")
 
-        # 2. Try scraping article page
-        if len(image_data_list) < 2 and news_item.get("url"):
+        # 2. Try scraping article page for images — ALWAYS try if URL exists
+        if news_item.get("url") and len(image_list) < MAX_IMAGES_PER_POST:
             try:
-                scraped = await self._scrape_article_images(news_item["url"], max_count=2)
-                image_data_list.extend(scraped)
+                scraped = await self._scrape_article_images(
+                    news_item["url"],
+                    max_count=MAX_SCRAPE_IMAGES
+                )
+                if scraped:
+                    for img in scraped:
+                        if len(image_list) >= MAX_IMAGES_PER_POST:
+                            break
+                        image_list.append(img)
+                    source = "scraped" if source == "none" else source + "+scraped"
+                    logger.info(f"Scraped {len(scraped)} images for: {title[:50]}")
             except Exception as e:
-                logger.debug(f"Article scraping error: {e}")
+                logger.debug(f"Article scraping skipped: {e}")
 
-        # 3. Try Pexels API (free, high-quality car photos)
-        if not image_data_list:
+        # 3. Web search enrichment — find MORE images for this specific news
+        if len(image_list) < 3 and title:
+            try:
+                search_image_urls = await enrich_with_search_images(title, max_images=5)
+                if search_image_urls:
+                    searched = await self._download_news_images(search_image_urls, max_count=MAX_SEARCH_IMAGES)
+                    if searched:
+                        for img in searched:
+                            if len(image_list) >= MAX_IMAGES_PER_POST:
+                                break
+                            image_list.append(img)
+                        source = "search" if source == "none" else source + "+search"
+                        logger.info(f"Found {len(searched)} images via web search for: {title[:50]}")
+            except Exception as e:
+                logger.debug(f"Web search image enrichment skipped: {e}")
+
+        # 4. Try Pexels API (free, high-quality car photos)
+        if len(image_list) < 2:
             try:
                 pexels_images = await self._fetch_pexels_images(bmw_query, max_count=2)
-                image_data_list.extend(pexels_images)
+                if pexels_images:
+                    image_list.extend(pexels_images)
+                    source = "pexels" if source == "none" else source + "+pexels"
             except Exception as e:
                 logger.debug(f"Pexels image fetch error: {e}")
 
-        # 4. Try Pixabay API (free, large collection)
-        if not image_data_list:
+        # 5. Try Pixabay API (free, large collection)
+        if len(image_list) < 2:
             try:
                 pixabay_images = await self._fetch_pixabay_images(bmw_query, max_count=2)
-                image_data_list.extend(pixabay_images)
+                if pixabay_images:
+                    image_list.extend(pixabay_images)
+                    source = "pixabay" if source == "none" else source + "+pixabay"
             except Exception as e:
                 logger.debug(f"Pixabay image fetch error: {e}")
 
-        # 5. Try Wikimedia Commons (free, no API key needed)
-        if not image_data_list:
+        # 6. Try Wikimedia Commons (free, no API key needed)
+        if len(image_list) < 2:
             try:
                 wiki_images = await self._fetch_wikimedia_images(bmw_query, max_count=2)
-                image_data_list.extend(wiki_images)
+                if wiki_images:
+                    image_list.extend(wiki_images)
+                    source = "wikimedia" if source == "none" else source + "+wikimedia"
             except Exception as e:
                 logger.debug(f"Wikimedia image fetch error: {e}")
 
-        # 6. Web search enrichment
-        if not image_data_list:
-            try:
-                search_image_urls = await enrich_with_search_images(title, max_images=3)
-                if search_image_urls:
-                    downloaded = await self._download_news_images(search_image_urls, max_count=2)
-                    image_data_list.extend(downloaded)
-            except Exception as e:
-                logger.debug(f"Search image enrichment error: {e}")
-
-        # 7. AI generation fallback (Pollinations → Cloudflare SDXL)
-        if not image_data_list:
+        # 7. AI generation fallback — LAST RESORT (all real sources failed)
+        if not image_list:
             try:
                 ai_images = await self._generate_post_images(title, count=1)
-                image_data_list.extend(ai_images)
+                if ai_images:
+                    image_list.extend(ai_images)
+                    source = "ai"
+                    logger.info(f"Generated {len(ai_images)} AI images (no real images found)")
+                else:
+                    # Specific prompts failed — try ONE generic prompt
+                    try:
+                        img_data = await asyncio.wait_for(
+                            ai_router._primary.generate_image(
+                                "Beautiful BMW car on a scenic road, professional automotive "
+                                "photography, golden hour, no text.",
+                                model="flux",
+                            ),
+                            timeout=60.0,
+                        )
+                        if img_data:
+                            image_list = [img_data]
+                            source = "ai-generic"
+                            logger.info("Generated generic AI BMW image")
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"Generic image generation failed: {e}")
             except Exception as e:
-                logger.debug(f"AI image generation error: {e}")
+                logger.warning(f"AI image generation skipped: {e}")
 
-        # 8. Stock BMW photo fallback (last resort before giving up)
-        if not image_data_list:
+        # 8. Stock BMW photo fallback (absolute last resort)
+        if not image_list:
             try:
                 stock_images = await self._fetch_stock_bmw_images()
-                image_data_list.extend(stock_images)
+                if stock_images:
+                    image_list.extend(stock_images)
+                    source = "stock"
+                    logger.info("Using stock BMW photo as last resort")
             except Exception as e:
                 logger.debug(f"Stock BMW image fallback error: {e}")
 
-        has_images = len(image_data_list) > 0
+        # HARD LIMIT: never more than MAX_IMAGES_PER_POST (10 max — Telegram limit)
+        image_list = image_list[:MAX_IMAGES_PER_POST]
 
-        if not has_images:
+        if not image_list:
             logger.warning(
                 f"No images found for post: {title[:60]}. "
-                f"All image sources failed (RSS, scrape, Pexels, Pixabay, Wikimedia, search, AI, stock)."
+                f"All image sources failed (RSS, scrape, Pexels, Pixabay, Wikimedia, search, AI, stock). "
+                f"Post will be published as text-only."
             )
 
-        return has_images, image_data_list
-
-    async def _scrape_article_images(self, article_url: str, max_count: int = 5) -> List[bytes]:
-        """Scrape images from a news article page."""
-        images = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(article_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                })
-                if response.status_code != 200:
-                    return images
-
-                html = response.text
-
-                og_images = re.findall(r'<meta[^>]+property=["\x27]og:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
-                og_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+property=["\x27]og:image["\x27]', html, re.IGNORECASE)
-
-                candidate_urls = []
-                seen = set()
-                for url in og_images:
-                    if url and url not in seen and len(url) > 30:
-                        if url.startswith("//"):
-                            url = "https:" + url
-                        if not self._is_junk_image_url(url):
-                            seen.add(url)
-                            candidate_urls.append(url)
-
-                images = await self._download_news_images(candidate_urls, max_count=max_count)
-        except Exception as e:
-            logger.debug(f"Article scraping failed: {e}")
-
-        return images
+        return image_list, source
 
     async def _generate_post_text(self, news_item: Dict) -> Optional[str]:
         """Generate post text for a news item using AI."""
@@ -917,7 +1062,6 @@ class ChannelManager:
 
         # Generate with AI using persona
         try:
-            # Build combined context from summary + extra_context
             full_context = ""
             if summary:
                 full_context = f"Исходная новость: {summary[:500]}"
@@ -942,10 +1086,9 @@ class ChannelManager:
     async def run_scheduled_post(self) -> bool:
         """Try to create and post content to the channel.
 
-        IMPORTANT: Posts are ALWAYS published WITH at least one image.
-        If no image is available after all fallback attempts, the post is
-        skipped rather than published as text-only. This ensures the channel
-        always has visual content.
+        v2.0: Posts are published WITH images whenever possible.
+        If no images are available, text-only is allowed as a last resort
+        (channel silence is worse than a post without a photo).
         """
         try:
             # Check posting limits
@@ -991,102 +1134,141 @@ class ChannelManager:
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
 
-            # Get images — MANDATORY for channel posts
-            has_images, image_data_list = await self._get_post_images(news_item)
+            # Get images — prioritize REAL photos from news, AI generation as LAST resort
+            image_data_list, image_source = await self._get_post_images(news_item)
+            has_media = len(image_data_list) > 0
+            media_count = len(image_data_list) if has_media else 0
 
-            # If no images from first attempt, try AI generation one more time
-            # with a simpler prompt (CF SDXL works better with simple prompts)
-            if not has_images:
-                logger.warning("No images from standard pipeline, trying direct CF image gen...")
+            # ── SMART MEDIA DECISION ──
+            #
+            # RULES (Telegram limits: caption=1024, text-only=4096):
+            #   1. Post with photo — ALWAYS preferred.
+            #   2. Post without photo — only when no image is available at all.
+            #      Channel silence is WORSE than a post without photo.
+            #
+            _CAPTION_LIMIT = config.TELEGRAM_CAPTION_LIMIT   # 1024
+            _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
+
+            if not has_media and len(post_text) <= _CAPTION_LIMIT:
+                # No media + short text — try one more image generation attempt
+                logger.warning(
+                    f"Post has NO media and text is {len(post_text)} chars. "
+                    f"Attempting last-resort image generation..."
+                )
                 try:
-                    simple_prompt = f"BMW car, professional automotive photography, dramatic lighting, no text, 4k"
-                    response = await ai_router.manager.generate_image(
-                        prompt=simple_prompt,
-                        model="flux",
-                        width=1024,
-                        height=768,
+                    last_resort = await self._generate_post_images(
+                        news_item.get("title", ""), count=1
                     )
-                    if response.ok and response.image_b64:
-                        import base64
-                        img_bytes = base64.b64decode(response.image_b64)
-                        if len(img_bytes) > 1000:
-                            image_data_list.append(img_bytes)
-                            has_images = True
-                            logger.info("Direct CF/SDXL image gen succeeded as last resort")
-                    elif response.ok and response.image_url:
-                        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                            dl_resp = await client.get(response.image_url)
-                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
-                                image_data_list.append(dl_resp.content)
-                                has_images = True
-                                logger.info("Direct image gen URL download succeeded as last resort")
+                    if last_resort:
+                        image_data_list = last_resort
+                        has_media = True
+                        image_source = "ai-last-resort"
+                        logger.info("Last-resort AI image gen succeeded")
                 except Exception as e:
                     logger.debug(f"Last-resort image gen failed: {e}")
 
-            # SKIP post if still no images — better to skip than post without photo
-            if not has_images or not image_data_list:
-                logger.warning(
-                    f"SKIPPING post (no images): {news_item['title'][:60]}. "
-                    f"All image sources failed. Post will not be published without photo."
+                if not has_media:
+                    # PUBLISH TEXT-ONLY as last resort — better than channel silence
+                    logger.warning(
+                        f"POSTING TEXT-ONLY (last resort): No images available, text is "
+                        f"{len(post_text)} chars. Channel silence is worse than no-photo post."
+                    )
+
+            elif has_media and len(post_text) > _CAPTION_LIMIT:
+                # Has media + text too long — compress to keep media
+                logger.info(
+                    f"Post text {len(post_text)} chars > caption limit {_CAPTION_LIMIT}. "
+                    f"Compressing text to preserve media attachment."
                 )
-                return False
+                compressed = _enforce_char_limit(post_text, has_media=True)
+                if len(compressed) <= _CAPTION_LIMIT and len(compressed) >= 400:
+                    post_text = compressed
+                else:
+                    # Check if content is interesting enough for text-only
+                    interest_score = _score_interest(
+                        news_item.get("title", ""),
+                        news_item.get("summary", "")
+                    )
+                    if interest_score >= 0.5 and len(post_text) <= _TEXT_LIMIT:
+                        has_media = False
+                        image_data_list = []
+                        logger.info(f"Text too long for caption, interest={interest_score:.2f}. Publishing text-only.")
+                    else:
+                        post_text = _enforce_char_limit(post_text, has_media=True)
+
+            elif not has_media and len(post_text) > _CAPTION_LIMIT:
+                # No media + long text — check if interesting enough for text-only
+                interest_score = _score_interest(
+                    news_item.get("title", ""),
+                    news_item.get("summary", "")
+                )
+                if interest_score < 0.5 or len(post_text) > _TEXT_LIMIT:
+                    post_text = _enforce_char_limit(post_text, has_media=False)
 
             # Ensure footer and char limit
             post_text = _ensure_footer(post_text)
-            post_text = _enforce_char_limit(post_text, has_media=True)
+            post_text = _enforce_char_limit(post_text, has_media)
 
-            # Post to channel — always with image(s)
+            # HARD SAFETY CHECK: never more than MAX_IMAGES_PER_POST images
+            if has_media and len(image_data_list) > MAX_IMAGES_PER_POST:
+                logger.warning(f"SAFETY: Truncating {len(image_data_list)} images to {MAX_IMAGES_PER_POST}")
+                image_data_list = image_data_list[:MAX_IMAGES_PER_POST]
+
+            # Post to channel
             sent_message = None
             try:
-                if len(image_data_list) == 1:
-                    # Single photo
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
-                        f.write(image_data_list[0])
-                        temp_path = f.name
-
-                    photo = FSInputFile(temp_path)
-                    sent_message = await self._bot.send_photo(
-                        chat_id=config.CHANNEL_ID,
-                        photo=photo,
-                        caption=post_text[:1024],
-                        parse_mode=ParseMode.HTML,
-                    )
-                    try:
-                        os.unlink(temp_path)
-                    except Exception:
-                        pass
-                else:
-                    # Album
-                    media_group = []
-                    for i, img_data in enumerate(image_data_list[:3]):
-                        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+                if has_media and image_data_list:
+                    # Save images to temp files
+                    tmp_paths = []
+                    for i, img_data in enumerate(image_data_list[:MAX_IMAGES_PER_POST]):
+                        tmp_path = os.path.join(tempfile.gettempdir(), f"masha_post_{int(time.time())}_{i}.jpg")
+                        with open(tmp_path, "wb") as f:
                             f.write(img_data)
-                            temp_path = f.name
+                        tmp_paths.append(tmp_path)
 
-                        if i == 0:
-                            media = InputMediaPhoto(
-                                media=FSInputFile(temp_path),
-                                caption=post_text[:1024],
-                                parse_mode=ParseMode.HTML,
-                            )
-                        else:
-                            media = InputMediaPhoto(media=FSInputFile(temp_path))
+                    if len(tmp_paths) == 1:
+                        # Single image — use send_photo
+                        photo = FSInputFile(tmp_paths[0], filename="masha_post.jpg")
+                        sent_message = await self._bot.send_photo(
+                            chat_id=config.CHANNEL_ID,
+                            photo=photo,
+                            caption=post_text[:1024],
+                            parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        # Multiple images — use send_media_group (album up to 10)
+                        media_group = []
+                        for i, tmp_path in enumerate(tmp_paths):
+                            photo_file = FSInputFile(tmp_path, filename=f"masha_post_{i}.jpg")
+                            if i == 0:
+                                media_group.append(InputMediaPhoto(
+                                    media=photo_file,
+                                    caption=post_text[:1024],
+                                    parse_mode=ParseMode.HTML,
+                                ))
+                            else:
+                                media_group.append(InputMediaPhoto(media=photo_file))
 
-                        media_group.append(media)
+                        sent_messages = await self._bot.send_media_group(
+                            chat_id=config.CHANNEL_ID,
+                            media=media_group,
+                        )
+                        if sent_messages:
+                            sent_message = sent_messages[0]
 
-                    sent_messages = await self._bot.send_media_group(
-                        chat_id=config.CHANNEL_ID,
-                        media=media_group,
-                    )
-                    if sent_messages:
-                        sent_message = sent_messages[0]
-
-                    for m in media_group:
+                    # Clean up temp files
+                    for tmp_path in tmp_paths:
                         try:
-                            if hasattr(m.media, 'path'):
-                                os.unlink(m.media.path)
+                            os.unlink(tmp_path)
                         except Exception:
                             pass
+                else:
+                    # Text-only post (no images available)
+                    sent_message = await self._bot.send_message(
+                        chat_id=config.CHANNEL_ID,
+                        text=post_text,
+                        parse_mode=ParseMode.HTML,
+                    )
 
                 if sent_message:
                     # Add reaction
@@ -1108,7 +1290,7 @@ class ChannelManager:
                     _register_topic(entity_key, news_item["title"])
                     _record_post_title(news_item["title"])
 
-                    logger.info(f"✅ Post published: {news_item['title'][:60]}")
+                    logger.info(f"✅ Post published: {news_item['title'][:60]} (images={media_count}, source={image_source})")
                     return True
 
             except Exception as e:
@@ -1142,8 +1324,8 @@ class ChannelManager:
         # Try to get an image for the partner post
         image_data = None
 
-        # 1. Try downloading the partner's logo/image from their image_url
-        logo_url = getattr(program, 'image_url', '') or getattr(program, 'logo_url', '')
+        # 1. Try downloading the partner's logo/image
+        logo_url = getattr(program, 'image_url', '') or getattr(program, 'logo_url', '') or getattr(program, 'image', '')
         if logo_url:
             try:
                 async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
@@ -1151,7 +1333,6 @@ class ChannelManager:
                         "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
                     })
                     if resp.status_code == 200 and len(resp.content) > 1000:
-                        # For partner logos, be more lenient with size check
                         content_type = resp.headers.get("content-type", "")
                         if any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]):
                             image_data = resp.content

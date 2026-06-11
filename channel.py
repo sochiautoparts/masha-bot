@@ -759,11 +759,48 @@ class ChannelManager:
         
         return images
 
+    @staticmethod
+    def _ai_response_to_bytes(response) -> Optional[bytes]:
+        """Convert AIResponse from generate_image to raw bytes.
+        
+        generate_image() returns AIResponse with image_b64 (base64) or image_url,
+        NOT raw bytes. This helper extracts the actual image bytes.
+        """
+        if response is None:
+            return None
+        # If it's already bytes, return as-is
+        if isinstance(response, bytes):
+            return response
+        # AIResponse object — extract image data
+        try:
+            from ai.providers.base import AIResponse
+            if isinstance(response, AIResponse):
+                if response.image_b64:
+                    import base64
+                    return base64.b64decode(response.image_b64)
+                if response.image_url:
+                    # Download the image from URL
+                    import httpx
+                    try:
+                        r = httpx.get(response.image_url, timeout=30.0, follow_redirects=True)
+                        if r.status_code == 200 and len(r.content) > 1000:
+                            return r.content
+                    except Exception:
+                        pass
+                return None
+        except ImportError:
+            pass
+        # Fallback: if it has image_b64 attribute
+        if hasattr(response, 'image_b64') and response.image_b64:
+            import base64
+            return base64.b64decode(response.image_b64)
+        return None
+
     async def _generate_post_images(self, news_title: str, count: int = 1) -> List[bytes]:
         """Generate images for a news post using AI with full fallback chain.
 
         Tries Pollinations (gen→legacy→retry) then Cloudflare Workers AI (SDXL).
-        Returns list of image bytes (may be empty if all fail).
+        Returns list of image BYTES (may be empty if all fail).
         LIMITED to max 2 model attempts to avoid timeout/OOM on GitHub Actions.
         """
         images = []
@@ -785,27 +822,18 @@ class ChannelManager:
                 if attempts > max_attempts:
                     break
                 try:
-                    image_data = await asyncio.wait_for(
+                    ai_response = await asyncio.wait_for(
                         get_ai_router()._primary.generate_image(prompt, model=img_model),
                         timeout=60.0
                     )
-                    if image_data:
-                        images.append(image_data)
+                    img_bytes = self._ai_response_to_bytes(ai_response)
+                    if img_bytes:
+                        images.append(img_bytes)
                         break
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
                     logger.debug(f"Image gen #{i+1} with {img_model} failed: {e}")
-                    try:
-                        image_data = await asyncio.wait_for(
-                            get_ai_router()._primary.generate_image_free(prompt, model=img_model),
-                            timeout=60.0
-                        )
-                        if image_data:
-                            images.append(image_data)
-                            break
-                    except Exception:
-                        pass
                     continue
             if images:
                 break
@@ -1080,7 +1108,7 @@ class ChannelManager:
                 else:
                     # Specific prompts failed — try ONE generic prompt
                     try:
-                        img_data = await asyncio.wait_for(
+                        ai_resp = await asyncio.wait_for(
                             get_ai_router()._primary.generate_image(
                                 "Beautiful BMW car on a scenic road, professional automotive "
                                 "photography, golden hour, no text.",
@@ -1088,8 +1116,9 @@ class ChannelManager:
                             ),
                             timeout=60.0,
                         )
-                        if img_data:
-                            image_list = [img_data]
+                        img_bytes = self._ai_response_to_bytes(ai_resp)
+                        if img_bytes:
+                            image_list = [img_bytes]
                             source = "ai-generic"
                             logger.info("Generated generic AI BMW image")
                     except (asyncio.TimeoutError, Exception) as e:

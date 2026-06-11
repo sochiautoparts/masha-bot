@@ -23,7 +23,6 @@ from bot.masha_data import (
     detect_obd2_codes, lookup_obd2_code,
 )
 from ai.router import get_ai_router
-ai_router = get_ai_router()
 
 logger = logging.getLogger("masha.handlers.inline")
 
@@ -154,25 +153,25 @@ async def _generate_inline_response(query: str, query_type: str):
 
     if query_type == "vin":
         vin_code = _detect_vin_inline(query) or query.strip()
-        return await ai_router.decode_vin(
+        return await get_ai_router().decode_vin(
             user_id=inline_user_id,
             vin_code=vin_code,
         )
 
     elif query_type == "diagnostic":
-        return await ai_router.diagnose_car(
+        return await get_ai_router().diagnose_car(
             user_id=inline_user_id,
             symptoms=query,
         )
 
     elif query_type == "parts":
-        return await ai_router.find_spare_part(
+        return await get_ai_router().find_spare_part(
             user_id=inline_user_id,
             article=query.strip(),
         )
 
     else:
-        return await ai_router.chat(
+        return await get_ai_router().chat(
             messages=[
                 {"role": "system", "content": "Ты Маша, BMW-эксперт. Отвечай кратко и живо."},
                 {"role": "user", "content": query},

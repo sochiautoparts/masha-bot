@@ -327,8 +327,7 @@ async def main():
         logger.warning(f"Could not load topic registry from DB: {e}")
 
     # Initialize AI router
-    ai_router = get_ai_router()
-    await ai_router.initialize()
+    await get_ai_router().initialize()
     logger.info("AI Router initialized")
 
     # Load partner programs

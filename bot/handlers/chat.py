@@ -35,7 +35,6 @@ from bot.tech_docs import (
 )
 from bot.partners import partner_manager
 from ai.router import get_ai_router, MASHA_SYSTEM_PROMPT
-ai_router = get_ai_router()
 from ai.voice import process_voice_message
 
 logger = logging.getLogger("masha.handlers.chat")
@@ -477,7 +476,7 @@ async def handle_photo(message: Message):
             f"Без анализа фото — просто живой комментарий."
         )
         try:
-            response = await ai_router.chat(
+            response = await get_ai_router().chat(
                 messages=[
                     {"role": "system", "content": "Ты Маша, BMW-эксперт. Напиши короткий комментарий (до 200 символов) на фото в группе. Живо и с характером."},
                     {"role": "user", "content": simple_prompt},
@@ -558,7 +557,7 @@ async def handle_photo(message: Message):
 
                 extra_context = "\n\n".join(extra_context_parts) if extra_context_parts else ""
 
-                response = await ai_router.analyze_image(
+                response = await get_ai_router().analyze_image(
                     user_id=message.from_user.id,
                     image_base64=image_base64,
                     prompt=prompt,
@@ -713,7 +712,7 @@ async def _process_text_message(message: Message, text: str):
         if primary_links_context:
             all_context.append(primary_links_context)
         
-        response = await ai_router.decode_vin(
+        response = await get_ai_router().decode_vin(
             user_id=user_id,
             vin_code=vin_or_body,
             extra_context="\n".join(all_context),
@@ -930,13 +929,13 @@ async def _process_text_message(message: Message, text: str):
 
     try:
         if is_diagnostic:
-            response = await ai_router.diagnose_car(
+            response = await get_ai_router().diagnose_car(
                 user_id=user_id,
                 symptoms=text,
                 extra_context=extra_context,
             )
         elif is_spare_part_query:
-            response = await ai_router.find_spare_part(
+            response = await get_ai_router().find_spare_part(
                 user_id=user_id,
                 article=text.strip(),
                 extra_context=extra_context,
@@ -950,7 +949,7 @@ async def _process_text_message(message: Message, text: str):
                 chat_messages.append({"role": "user", "content": f"Контекст:\n{extra_context}"})
             chat_messages.append({"role": "user", "content": text})
 
-            response = await ai_router.chat(
+            response = await get_ai_router().chat(
                 messages=chat_messages,
                 use_cache=True,
             )

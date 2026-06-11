@@ -17,7 +17,6 @@ from bot.database import (
     get_unposted_news,
 )
 from ai.router import get_ai_router
-ai_router = get_ai_router()
 from bot.partners import partner_manager
 from bot.web_search import web_search, format_search_results
 from channel import channel_manager
@@ -77,7 +76,7 @@ async def cmd_status(message: Message):
     if not await _is_admin(message):
         return
 
-    is_ai = ai_router.is_available()
+    is_ai = get_ai_router().is_available()
     partner_count = len(partner_manager.programs)
     unposted = await get_unposted_news(limit=1)
 
@@ -120,7 +119,7 @@ async def cmd_post(message: Message):
         source_url = ""
         source_summary = ""
 
-    response = await ai_router.generate_channel_post(
+    response = await get_ai_router().generate_channel_post(
         topic=topic,
         context=source_summary if source_summary else "",
     )
@@ -346,8 +345,8 @@ async def cmd_models(message: Message):
     if not await _is_admin(message):
         return
 
-    models = ai_router.get_available_models()
-    categories = ai_router.get_model_categories()
+    models = get_ai_router().get_available_models()
+    categories = get_ai_router().get_model_categories()
     categories = {
         "💬 Чат": categories.get("chat", []),
         "🧠 Рассуждения": categories.get("reasoning", []),
@@ -381,7 +380,7 @@ async def cmd_switch_model(message: Message):
         return
 
     model_name = args[1].strip()
-    available = ai_router.get_available_models()
+    available = get_ai_router().get_available_models()
 
     if model_name not in available:
         await message.answer(f"Модель '{model_name}' не найдена. Используйте /models для списка.")

@@ -41,7 +41,6 @@ from bot.database import (
     get_recent_post_titles, DB_PATH,
 )
 from ai.router import get_ai_router
-ai_router = get_ai_router()
 from bot.partners import partner_manager
 from bot.web_search import web_search, search_news, SearchResult
 from bot.content_engine import (
@@ -450,7 +449,7 @@ class ChannelManager:
         if not image_urls:
             return images
 
-        MAX_IMAGE_SIZE = 2 * 1024 * 1024  # 2MB
+        MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
 
         for url in image_urls[:max_count * 3]:
             if len(images) >= max_count:
@@ -460,7 +459,7 @@ class ChannelManager:
                 continue
 
             try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                     response = await client.get(url, headers={
                         "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
                     })
@@ -538,7 +537,12 @@ class ChannelManager:
 
     @staticmethod
     def _is_content_image(image_data: bytes) -> bool:
-        """Validate that image data represents a proper content photo."""
+        """Validate that image data represents a proper content photo.
+        
+        If PIL (Pillow) is available, checks dimensions and aspect ratio.
+        If PIL is not installed (e.g. GitHub Actions), falls back to minimum
+        file size check (3KB) as a reasonable proxy for content images.
+        """
         if len(image_data) < 3000:
             return False
         try:
@@ -556,7 +560,9 @@ class ChannelManager:
                 return False
             return True
         except ImportError:
-            return True
+            # PIL not available — fall back to file size check only
+            logger.debug("PIL not available, using file-size fallback for image validation")
+            return len(image_data) >= 3072  # 3KB minimum
         except Exception:
             return True
 
@@ -780,7 +786,7 @@ class ChannelManager:
                     break
                 try:
                     image_data = await asyncio.wait_for(
-                        ai_router._primary.generate_image(prompt, model=img_model),
+                        get_ai_router()._primary.generate_image(prompt, model=img_model),
                         timeout=60.0
                     )
                     if image_data:
@@ -792,7 +798,7 @@ class ChannelManager:
                     logger.debug(f"Image gen #{i+1} with {img_model} failed: {e}")
                     try:
                         image_data = await asyncio.wait_for(
-                            ai_router._primary.generate_image_free(prompt, model=img_model),
+                            get_ai_router()._primary.generate_image_free(prompt, model=img_model),
                             timeout=60.0
                         )
                         if image_data:
@@ -889,7 +895,7 @@ class ChannelManager:
                 seen = set()
                 for url_list in [og_images, tw_images, jsonld_images, srcset_images, all_img_urls]:
                     for url in url_list:
-                        if url and url not in seen and len(url) > 30:
+                        if url and url not in seen and len(url) > 10:
                             if url.startswith("//"):
                                 url = "https:" + url
                             if not self._is_junk_image_url(url):
@@ -1075,7 +1081,7 @@ class ChannelManager:
                     # Specific prompts failed — try ONE generic prompt
                     try:
                         img_data = await asyncio.wait_for(
-                            ai_router._primary.generate_image(
+                            get_ai_router()._primary.generate_image(
                                 "Beautiful BMW car on a scenic road, professional automotive "
                                 "photography, golden hour, no text.",
                                 model="flux",
@@ -1153,7 +1159,7 @@ class ChannelManager:
             if extra_context:
                 full_context = (full_context + "\n\n" + extra_context).strip() if full_context else extra_context
 
-            response = await ai_router.generate_channel_post(
+            response = await get_ai_router().generate_channel_post(
                 topic=title,
                 context=full_context,
             )

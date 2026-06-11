@@ -42,7 +42,6 @@ from bot.bmw_knowledge import (
     build_bmw_context, BMW_MODELS, BMW_ENGINES, BMW_M_MODELS,
 )
 from ai.router import get_ai_router
-ai_router = get_ai_router()
 from bot.web_search import web_search, search_news, search_google_news_rss
 
 logger = logging.getLogger("masha.content_engine")
@@ -543,7 +542,7 @@ async def ai_discover_news() -> List[Dict]:
 
     for model_name in _DISCOVERY_MODELS:
         try:
-            response = await ai_router.manager.chat(
+            response = await get_ai_router().manager.chat(
                 messages=[
                     {"role": "system", "content": (
                         f"Ты BMW-эксперт. Сегодня {date_str}. "

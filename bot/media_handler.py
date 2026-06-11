@@ -154,7 +154,7 @@ class MediaHandler:
         seen = set()
         
         def add_url(url: str):
-            if url and url not in seen and len(url) > 30:
+            if url and url not in seen and len(url) > 10:
                 if not url.startswith('data:'):
                     seen.add(url)
                     images.append(url)

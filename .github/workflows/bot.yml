@@ -18,24 +18,20 @@ env:
   OWNER_ID: ${{ secrets.OWNER_ID }}
   CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
   CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
-  # Pollinations.ai — DUAL KEY FAILOVER
   POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
   POLLINATIONS_API_KEY_2: ${{ secrets.POLLINATIONS_API_KEY_2 }}
-  # Cloudflare Workers AI — DUAL ACCOUNT FAILOVER (10k req/day each)
   CF_ACCOUNT_ID_1: ${{ secrets.CF_ACCOUNT_ID_1 }}
   CF_API_TOKEN_1: ${{ secrets.CF_API_TOKEN_1 }}
   CF_ACCOUNT_ID_2: ${{ secrets.CF_ACCOUNT_ID_2 }}
   CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
   GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
   GH_REPO: sochiautoparts/masha-bot
-  # Free image APIs (optional but recommended for reliable image sourcing)
   PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
   PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
   ADMITAD_ADS_FILE: data/admitad_ads.json
   DB_PATH: masha_bot.db
   PYTHONUNBUFFERED: "1"
   LOG_LEVEL: INFO
-  # Schedule settings
   NEWS_INTERVAL_MINUTES: "30"
   CHANNEL_POST_INTERVAL_MINUTES: "30"
   PARTNER_POST_INTERVAL_HOURS: "4"
@@ -43,7 +39,7 @@ env:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 330   # 5.5 hours max
+    timeout-minutes: 330
 
     steps:
       - name: Checkout repository
@@ -61,6 +57,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Resolve @bmw_mpower_club channel ID
+        run: |
+          echo "=== Resolving @bmw_mpower_club channel ID ==="
+          CHANNEL_INFO=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=@bmw_mpower_club")
+          echo "Channel info response: ${CHANNEL_INFO}" | head -c 500
+          echo ""
+          # Extract the channel ID from the response
+          CHANNEL_RESOLVED_ID=$(echo "${CHANNEL_INFO}" | python3 -c "import json,sys; data=json.load(sys.stdin); print(data.get('result',{}).get('id','NOT_FOUND'))" 2>/dev/null || echo "PARSE_ERROR")
+          echo "RESOLVED_CHANNEL_ID=${CHANNEL_RESOLVED_ID}"
+          # Also check current CHANNEL_ID
+          echo "CURRENT_CHANNEL_ID=${CHANNEL_ID}"
+          echo "=== If RESOLVED != CURRENT, the secret needs updating ==="
 
       - name: Clean Python cache
         run: |
@@ -90,28 +99,16 @@ jobs:
 
       - name: Ensure .gitignore allows database
         run: |
-          # Remove masha_bot.db from .gitignore if present
           if [ -f .gitignore ]; then
             sed -i '/masha_bot\.db/d' .gitignore
           fi
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v1.2 — Маша + Редакция (Multi-Source Image Fix) ==="
-          echo "ALL ROUTES: Pollinations.ai (gen+legacy) -> Cloudflare Workers AI"
-          echo "IMAGE: RSS -> Pexels -> Pixabay -> Wikimedia -> Web Search -> AI Gen -> Stock"
-          echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг Конг(попугай)"
-          echo "CONTENT: BMW-focused RSS, Google News RSS, Web Search, AI Discovery"
-          echo "CHANNEL: @bmw_mpower_club — POSTS ALWAYS WITH PHOTOS"
-          echo "FORMATS: 6 content types — news+reaction, DIY, polls, lore, garage, partner"
-          echo "CHAT: Pollinations(gen->legacy) -> Cloudflare Workers AI"
-          echo "FUNCTION (posts, VIN, diagnostics): Pollinations(gen->legacy) -> Cloudflare"
-          echo "VISION: Cloudflare Workers AI (mistral-small-3.1) -> Pollinations vision"
-          echo "STRATEGY: Triple-failover, gen->legacy->CF, circuit-break=5min"
-          echo "CLOUDFLARE: 2 accounts x 10k req/day = 20k free req/day (text+image)"
-          echo "SCHEDULE: 30 min intervals, 3 posts/cycle + partner posts"
-          echo "BMW KNOWLEDGE: 3-level base (models, tech, culture)"
-          echo "FACT CHECK: BMW model/engine/HP validation"
+          echo "=== Starting Masha Bot v2.0 — Маша + Редакция (Image Fix) ==="
+          echo "FIX: AIResponse→bytes conversion bug fixed"
+          echo "FIX: Proper image extraction from news sources"
+          echo "CHANNEL: @bmw_mpower_club — POSTS WITH REAL PHOTOS FROM NEWS"
           echo ""
 
           MAX_RESTARTS=10
@@ -125,7 +122,6 @@ jobs:
 
             echo "Bot exited with code: $EXIT_CODE"
 
-            # If bot exited normally (0) or was killed by timeout, try restart
             if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
               echo "Bot process ended, restarting..."
               RESTART_COUNT=$((RESTART_COUNT + 1))

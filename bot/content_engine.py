@@ -679,36 +679,18 @@ async def search_auto_news() -> List[Dict]:
 
 
 async def enrich_with_search_images(title: str, max_images: int = 3) -> List[str]:
-    """Search for images related to a news topic using SearXNG image search."""
-    image_urls = []
+    """Search for images related to a news topic — now uses ImageFetcher.
+
+    v2.0: Delegates to bot.sources.image_fetcher which implements
+    the ORIGINAL-FIRST pipeline: article images → RSS enclosures →
+    image search → AI generation.
+    """
     try:
-        clean_title = re.sub(r'[^\w\s]', '', title)[:60]
-        # Try image-specific search via SearXNG
-        from bot.web_search import search_searxng
-        results = await search_searxng(
-            f"{clean_title} BMW", 
-            max_results=5, 
-            language="ru",
-            categories="images"
-        )
-        for r in results:
-            if r.url:
-                # SearXNG image results often have direct image URLs
-                url_lower = r.url.lower()
-                if any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']):
-                    image_urls.append(r.url)
-                elif 'img' in url_lower or 'image' in url_lower or 'photo' in url_lower:
-                    image_urls.append(r.url)
-        
-        # If no image-specific results, try regular web search with image keywords
-        if not image_urls:
-            results = await web_search(f"{clean_title} BMW photo image", max_results=5)
-            for r in results:
-                if r.url:
-                    image_urls.append(r.url)
+        from bot.sources.image_fetcher import search_images
+        return await search_images(title, max_images=max_images)
     except Exception as e:
         logger.debug(f"Image search failed: {e}")
-    return image_urls[:max_images]
+        return []
 
 
 async def get_best_news_item(items: List[Dict] = None) -> Optional[Dict]:

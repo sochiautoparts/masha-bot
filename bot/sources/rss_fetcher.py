@@ -1,6 +1,9 @@
 """BMW-specific RSS and web search fetcher for masha-bot.
 
 BMW-focused RSS sources and search queries for content sourcing.
+
+v2.0: Now extracts image URLs from RSS enclosures, media:content,
+and article <img> tags for original-first image sourcing.
 """
 
 from __future__ import annotations
@@ -217,6 +220,9 @@ class BMWRSSFetcher:
                 if self._is_blocked(combined):
                     continue
 
+                # Extract image URLs from RSS enclosures and media:content
+                image_urls = self._extract_entry_images(entry)
+
                 items.append({
                     "source": name,
                     "title": title,
@@ -224,6 +230,8 @@ class BMWRSSFetcher:
                     "url": link,
                     "published": published,
                     "category": source.get("category", ""),
+                    "image_urls": image_urls,  # Original images from RSS
+                    "rss_entry": entry,         # Raw entry for image_fetcher
                 })
 
             return items
@@ -260,6 +268,15 @@ class BMWRSSFetcher:
         """Check if a title contains urgent BMW news keywords."""
         title_lower = title.lower()
         return any(kw.lower() in title_lower for kw in URGENT_BMW_KEYWORDS)
+
+    def _extract_entry_images(self, entry: Any) -> list[str]:
+        """Extract image URLs from a feedparser entry.
+
+        Checks enclosures, media:content, media:thumbnail,
+        and <img> tags in content/summary.
+        """
+        from .image_fetcher import extract_rss_images, _is_junk_url
+        return extract_rss_images(entry)
 
     def _get_theme_keywords(self, theme_name: str) -> list[str]:
         """Get keywords relevant to a theme day."""

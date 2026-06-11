@@ -1,6 +1,12 @@
 """Content orchestration pipeline for masha-bot.
 
-Coordinates the flow: source → generate → validate → publish.
+Coordinates the flow: source → generate → fetch image → validate → publish.
+
+v2.0: ORIGINAL-FIRST IMAGE PIPELINE
+  Priority 1: Real photos from article (og:image, twitter:image)
+  Priority 2: RSS enclosures / media:content
+  Priority 3: Image search (SearXNG)
+  Priority 4: AI generation (Pollinations) — LAST RESORT ONLY
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from ..generation.persona import PersonaManager
 from ..generation.writer import ContentWriter
 from ..generation.fact_checker import BMWFactChecker
 from ..generation.image_gen import ImageGenerator
+from ..sources.image_fetcher import ImageFetcher
 from ..publishing.telegram import ChannelManager
 from ..publishing.formatter import PostFormatter
 from ..sources.rss_fetcher import BMWRSSFetcher
@@ -48,6 +55,7 @@ class ContentPipeline:
         self.writer = ContentWriter()
         self.fact_checker = BMWFactChecker()
         self.image_gen = ImageGenerator()
+        self.image_fetcher = ImageFetcher()  # NEW: original-first image fetcher
         self.formatter = PostFormatter()
         self.channel = ChannelManager(db=db)
         self.partners = PartnerManager(db=db)
@@ -61,6 +69,7 @@ class ContentPipeline:
             "post_published": False,
             "content_type": None,
             "source": None,
+            "image_source": None,
             "errors": [],
         }
 
@@ -93,7 +102,13 @@ class ContentPipeline:
                 result["errors"].append("Post generation returned empty")
                 return result
 
-            # 5. Fact-check if enabled
+            # 5. Fetch image — ORIGINAL-FIRST pipeline
+            image_data = await self._fetch_image(content_item, post_data)
+            if image_data:
+                post_data["image"] = image_data
+                result["image_source"] = image_data.get("source", "unknown")
+
+            # 6. Fact-check if enabled
             if self.config.enable_fact_check and content_item.get("content_type") in (
                 "news+reaction", "lore/history"
             ):
@@ -103,7 +118,7 @@ class ContentPipeline:
                     result["errors"].append("Post failed fact-check validation")
                     return result
 
-            # 6. Format and publish
+            # 7. Format and publish
             published = await self._publish_post(post_data, content_item)
             if published:
                 result["post_published"] = True
@@ -170,6 +185,72 @@ class ContentPipeline:
 
         return None
 
+    async def _fetch_image(
+        self, content_item: dict[str, Any], post_data: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Fetch image using ORIGINAL-FIRST priority pipeline.
+
+        Priority:
+        1. Real photos from article (og:image, twitter:image) via ImageFetcher
+        2. RSS enclosures / media:content via ImageFetcher
+        3. Image search (SearXNG) via ImageFetcher
+        4. AI generation (Pollinations) — LAST RESORT ONLY
+        """
+        content_type = content_item.get("content_type", "news+reaction")
+
+        # Only fetch images for content types that need them
+        if content_type not in ("news+reaction", "lore/history", "garage stories", "partner"):
+            return None
+
+        if not self.config.enable_images:
+            return None
+
+        topic = content_item.get("topic", post_data.get("topic", ""))
+        article_url = content_item.get("url", "")
+        rss_entry = content_item.get("rss_entry")
+
+        # ── Steps 1-3: Try to get ORIGINAL image via ImageFetcher ─────────
+        try:
+            real_image = await self.image_fetcher.fetch(
+                topic=topic,
+                article_url=article_url,
+                rss_entry=rss_entry,
+                content_type=content_type,
+            )
+            if real_image:
+                source = real_image.get("source", "unknown")
+                logger.info(
+                    "Using ORIGINAL image for post (source=%s): %s",
+                    source,
+                    real_image.get("image_url", "")[:80],
+                )
+                # Normalize format for pipeline compatibility
+                return {
+                    "image_b64": real_image["image_b64"],
+                    "image_url": real_image.get("image_url", ""),
+                    "source": source,
+                }
+        except Exception as exc:
+            logger.warning("ImageFetcher failed, will try AI generation: %s", exc)
+
+        # ── Step 4: AI generation — LAST RESORT ───────────────────────────
+        logger.info("No real image found — falling back to AI generation for '%s'", topic[:50])
+        try:
+            ai_image = await self.image_gen.generate(
+                topic=topic,
+                content_type=content_type,
+            )
+            if ai_image:
+                ai_image["source"] = "ai_generated"
+                logger.info("Using AI-generated image for post")
+                return ai_image
+        except Exception as exc:
+            logger.warning("AI image generation also failed: %s", exc)
+
+        # No image at all — post without image
+        logger.info("No image available — posting without image")
+        return None
+
     async def _generate_post(self, content_item: dict[str, Any]) -> dict[str, Any] | None:
         """Generate a post from content item data."""
         topic = content_item.get("topic", "")
@@ -191,16 +272,7 @@ class ContentPipeline:
         if not post_data:
             return None
 
-        # Generate image if needed
-        if self.config.enable_images and content_type in (
-            "news+reaction", "lore/history", "garage stories", "partner"
-        ):
-            image = await self.image_gen.generate(
-                topic=topic,
-                content_type=content_type,
-            )
-            if image:
-                post_data["image"] = image
+        # NOTE: Image fetching moved to _fetch_image() — no longer done here
 
         post_data["content_type"] = content_type
         post_data["character_mix"] = character_mix

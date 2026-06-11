@@ -51,5 +51,8 @@ bot/data/*.db
 .pytest_cache/
 .mypy_cache/
 
+# Image cache (downloaded original photos)
+data/image_cache/
+
 # Local model files (too large for git)
 models/*.gguf

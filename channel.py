@@ -506,22 +506,21 @@ class ChannelManager:
 
     @staticmethod
     def _is_junk_image_url(url: str) -> bool:
-        """Check if an image URL is likely non-content."""
+        """Check if an image URL is likely non-content.
+        
+        NOTE: Intentionally NOT filtering 'crop', 'resize', 'scaled', 'preview'
+        because WordPress and other CMS use these in URLs for full-size images too.
+        """
         url_lower = url.lower()
         junk_keywords = [
             "icon", "logo", "favicon", "avatar", "badge", "button", "btn",
-            "banner", "spinner", "loading", "placeholder", "pixel", "tracker",
-            "analytics", "social", "share", "facebook", "twitter", "vk.",
+            "spinner", "loading", "placeholder", "pixel", "tracker",
+            "analytics", "share", "facebook", "twitter", "vk.",
             "telegram", "whatsapp", "instagram", "youtube", "tiktok",
-            "ad.", "ads/", "advert", "sponsor", "promo",
+            "ad.", "ads/", "advert", "sponsor",
             "emoji", "smileys", "captcha", "recaptcha",
-            "1x1", "spacer", "blank", "transparent", "dot.", "clear",
-            "rss", "feed", "subscribe", "newsletter",
-            "watermark", "overlay", "frame", "border",
-            # Thumbnail/small image patterns
-            "thumb", "small", "preview", "mini", "tiny", "crop",
-            "resize", "scaled", "lowres", "low-res",
-            "gallery-thumb", "list-thumb", "card-thumb",
+            "1x1", "spacer", "blank", "transparent", "dot.",
+            "watermark",
         ]
         for kw in junk_keywords:
             if kw in url_lower:
@@ -824,11 +823,20 @@ class ChannelManager:
         """
         images = []
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(article_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                })
+            # Use a realistic browser User-Agent — many news sites block bot-like UAs
+            _SCRAPE_HEADERS = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, max_redirects=5) as client:
+                response = await client.get(article_url, headers=_SCRAPE_HEADERS)
                 if response.status_code != 200:
+                    logger.debug(f"Scrape HTTP {response.status_code} for {article_url[:60]}")
                     return images
 
                 html = response.text

@@ -122,8 +122,24 @@ class AIRouter:
         temperature: float = 0.8,
         model: str | None = None,
         source_text: str = "",  # Accept but merge into context for backward compat
+        extra_instructions: str = "",
+        has_media: bool = False,
+        media_count: int = 0,
     ) -> AIResponse:
-        """Generate a channel post for @bmw_mpower_club."""
+        """Generate a channel post for @bmw_mpower_club.
+        
+        Args:
+            topic: Post topic/title
+            context: Additional context for the AI
+            content_type: Type of content (news+reaction, DIY/how-to, etc.)
+            character_mix: Which editorial characters participate
+            temperature: AI temperature
+            model: Specific model to use
+            source_text: Original news source text for rewriting
+            extra_instructions: Additional instructions to append
+            has_media: Whether the post will have media attached
+            media_count: Number of media files attached
+        """
         system = MASHA_SYSTEM_PROMPT + CHANNEL_PROMPT_SUFFIX
 
         character_note = ""
@@ -146,12 +162,26 @@ class AIRouter:
 
         instruction = type_instructions.get(content_type, type_instructions["news+reaction"])
 
+        # Media-aware instructions
+        media_note = ""
+        if has_media and media_count > 0:
+            media_note = f"\n\nК посту прикреплены {media_count} фото. Не описывай их подробно — они уже прикреплены. Пиши текст новости."
+        elif not has_media:
+            media_note = "\n\nК посту НЕТ прикреплённых фото. Пиши текст так, чтобы он был самодостаточным."
+
+        # Extra instructions from caller
+        extra_note = ""
+        if extra_instructions:
+            extra_note = f"\n\n{extra_instructions}"
+
         user_msg = f"""Тема: {topic}
 {f"Контекст: {full_context}" if full_context else ""}
 Тип контента: {content_type}
 {character_note}
 
 {instruction}
+{media_note}
+{extra_note}
 
 Ограничения:
 - Максимум 1024 символа (пост с фото) или 4096 (текстовый пост)

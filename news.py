@@ -116,7 +116,7 @@ async def fetch_bmw_news(
 
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=30),
-        headers={"User-Agent": "masha-bot/1.0 (BMW News Fetcher)"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"},
     ) as session:
         for source in BMW_RSS_SOURCES:
             try:
@@ -166,7 +166,7 @@ async def _fetch_rss_source(
         if not feed_url:
             continue
         try:
-            req_headers = {"User-Agent": "masha-bot/1.0 (BMW News Fetcher)"}
+            req_headers = {"User-Agent": "Mozilla/5.0 (compatible; Feedfetcher-Google; +http://www.google.com/feedfetcher.html)"}
             req_headers.update(custom_headers)
             async with session.get(feed_url, headers=req_headers) as resp:
                 if resp.status != 200:

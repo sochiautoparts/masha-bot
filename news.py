@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "BMW Blog", "url": "https://bmwblog.com/feed/", "category": "bmw"},
     {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "category": "bmw",
-     "alt_url": "https://bimmerpost.com/wp/feed/", "headers": {"User-Agent": "Mozilla/5.0 (compatible; Feedfetcher-Google)"}},
+     "alt_url": "https://bimmerpost.com/wp/feed/",
+     "fallback_url": "https://feeds.feedburner.com/Bimmerpost",
+     "headers": {"User-Agent": "Mozilla/5.0 (compatible; Feedfetcher-Google)"}},
     {"name": "Motor1", "url": "https://www.motor1.com/rss/feed/", "category": "general"},
     {"name": "Reuters Auto", "url": "https://www.reuters.com/rssFeed/automobilesNews", "category": "news"},
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
@@ -158,8 +160,9 @@ async def _fetch_rss_source(
     alt_url = source.get("alt_url", "")
     custom_headers = source.get("headers", {})
 
-    # Try primary URL first, then alt URL if it fails
-    for feed_url in [url, alt_url]:
+    # Try primary URL first, then alt URL, then fallback URL if they all fail
+    fallback_url = source.get("fallback_url", "")
+    for feed_url in [url, alt_url, fallback_url]:
         if not feed_url:
             continue
         try:

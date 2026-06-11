@@ -483,8 +483,30 @@ def get_editorial_aside() -> str:
     return ""
 
 
-def get_translation_uniquification_hint() -> str:
-    """Get hint for AI about translating and uniquifying content."""
+def get_translation_uniquification_hint(lang: str = "") -> str:
+    """Get hint for AI about translating and uniquifying content.
+    
+    Args:
+        lang: Source language code (e.g., 'en', 'de'). Empty = assume Russian.
+    """
+    if lang and lang != "ru":
+        lang_names = {
+            "en": "английском",
+            "de": "немецком",
+            "fr": "французском",
+            "it": "итальянском",
+            "es": "испанском",
+            "zh": "китайском",
+            "ja": "японском",
+            "ko": "корейском",
+        }
+        lang_name = lang_names.get(lang, "иностранном")
+        return (
+            f"ПЕРЕВОД И УНИКАЛИЗАЦИЯ: Исходная новость на {lang_name} — "
+            "ПЕРЕВЕДИ на русский и УНИКАЛИЗИРУЙ текст: перескажи СВОИМИ словами, "
+            "добавь мнение редакции, BMW-экспертный комментарий. "
+            "НЕ копируй перевод дословно!"
+        )
     return (
         "ПЕРЕВОД И УНИКАЛИЗАЦИЯ: Если исходная новость на английском — "
         "ПЕРЕВЕДИ на русский и УНИКАЛИЗИРУЙ текст: перескажи СВОИМИ словами, "

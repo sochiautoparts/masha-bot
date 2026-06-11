@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "BMW Blog", "url": "https://bmwblog.com/feed/", "category": "bmw"},
-    {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "category": "bmw"},
+    {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "category": "bmw",
+     "alt_url": "https://bimmerpost.com/wp/feed/", "headers": {"User-Agent": "Mozilla/5.0 (compatible; Feedfetcher-Google)"}},
     {"name": "Motor1", "url": "https://www.motor1.com/rss/feed/", "category": "general"},
     {"name": "Reuters Auto", "url": "https://www.reuters.com/rssFeed/automobilesNews", "category": "news"},
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
@@ -151,14 +152,36 @@ async def _fetch_rss_source(
     session: aiohttp.ClientSession,
     source: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Fetch items from a single RSS source."""
+    """Fetch items from a single RSS source with image extraction."""
     url = source["url"]
     name = source["name"]
+    alt_url = source.get("alt_url", "")
+    custom_headers = source.get("headers", {})
 
-    async with session.get(url) as resp:
-        if resp.status != 200:
+    # Try primary URL first, then alt URL if it fails
+    for feed_url in [url, alt_url]:
+        if not feed_url:
+            continue
+        try:
+            req_headers = {"User-Agent": "masha-bot/1.0 (BMW News Fetcher)"}
+            req_headers.update(custom_headers)
+            async with session.get(feed_url, headers=req_headers) as resp:
+                if resp.status != 200:
+                    if feed_url == url and alt_url:
+                        logger.debug(f"RSS {name}: primary URL failed ({resp.status}), trying alt URL")
+                        continue
+                    return []
+                content = await resp.text()
+                if not content or len(content) < 100:
+                    continue
+                break
+        except Exception as exc:
+            if feed_url == url and alt_url:
+                logger.debug(f"RSS {name}: primary URL error ({exc}), trying alt URL")
+                continue
             return []
-        content = await resp.text()
+    else:
+        return []
 
     feed = feedparser.parse(content)
     items = []
@@ -169,6 +192,9 @@ async def _fetch_rss_source(
         link = getattr(entry, "link", "")
         published = getattr(entry, "published", "")
 
+        # ── Extract image URLs from RSS entry ──
+        image_urls = _extract_rss_images(entry)
+
         items.append({
             "source": name,
             "title": title,
@@ -177,9 +203,113 @@ async def _fetch_rss_source(
             "published": published,
             "category": source.get("category", ""),
             "fingerprint": hashlib.sha256((title + link).encode()).hexdigest()[:16],
+            "image_urls": image_urls,
         })
 
     return items
+
+
+def _extract_rss_images(entry) -> list[str]:
+    """Extract image URLs from a feedparser RSS entry.
+
+    Checks multiple sources in priority order:
+    1. media_content (Media RSS — most reliable, includes dimensions)
+    2. enclosures (RSS 2.0 standard)
+    3. links with rel=enclosure
+    4. media_thumbnail (lower quality but still useful)
+    5. <image> tag from feed entry
+    6. <img> tags embedded in summary/content HTML
+    """
+    image_urls = []
+    seen = set()
+
+    def _add(url: str):
+        """Add URL if valid and not already seen."""
+        if not url or len(url) < 15 or url in seen:
+            return
+        # Normalize protocol-relative URLs
+        if url.startswith("//"):
+            url = "https:" + url
+        # Skip obvious non-content URLs
+        url_lower = url.lower()
+        junk = ["icon", "logo", "favicon", "avatar", "badge", "button", "banner",
+                "pixel", "tracker", "1x1", "spacer", "blank", "transparent",
+                "ad.", "ads/", "advert", "social", "share", "emoji", "rss",
+                "feed", "subscribe", "newsletter"]
+        if any(kw in url_lower for kw in junk):
+            return
+        seen.add(url)
+        image_urls.append(url)
+
+    # 1. media_content — Media RSS extension (most reliable)
+    #    Usually has medium="image" and width/height attributes
+    for mc in getattr(entry, "media_content", []):
+        url = mc.get("url", "")
+        medium = mc.get("medium", "")
+        if url and (not medium or medium == "image"):
+            # Prefer larger images — check width/height if available
+            try:
+                w = int(mc.get("width", 0))
+                h = int(mc.get("height", 0))
+                if w > 0 and h > 0 and w < 100 and h < 100:
+                    continue  # Too small, skip
+            except (ValueError, TypeError):
+                pass
+            _add(url)
+
+    # 2. enclosures — RSS 2.0 standard
+    for enc in getattr(entry, "enclosures", []):
+        url = enc.get("href", "") or enc.get("url", "")
+        enc_type = enc.get("type", "")
+        if url and ("image" in enc_type or not enc_type):
+            _add(url)
+
+    # 3. links with rel="enclosure"
+    for link_item in getattr(entry, "links", []):
+        if link_item.get("rel") == "enclosure":
+            url = link_item.get("href", "")
+            enc_type = link_item.get("type", "")
+            if url and ("image" in enc_type or not enc_type):
+                _add(url)
+
+    # 4. media_thumbnail — lower quality but still real images
+    for mt in getattr(entry, "media_thumbnail", []):
+        url = mt.get("url", "")
+        if url:
+            _add(url)
+
+    # 5. Direct image property (some feeds have entry.image)
+    img_obj = getattr(entry, "image", None)
+    if isinstance(img_obj, dict):
+        _add(img_obj.get("href", "") or img_obj.get("url", ""))
+    elif isinstance(img_obj, str) and img_obj.startswith("http"):
+        _add(img_obj)
+
+    # 6. Extract <img> from summary/content HTML (last resort)
+    for html_field in ["summary", "summary_detail", "content", "value"]:
+        html = ""
+        val = getattr(entry, html_field, None)
+        if isinstance(val, dict):
+            html = val.get("value", "")
+        elif isinstance(val, str):
+            html = val
+        if html and "<img" in html:
+            import re
+            img_srcs = re.findall(
+                r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]',
+                html, re.IGNORECASE
+            )
+            for src in img_srcs:
+                _add(src)
+            # Also check data-src for lazy-loaded images
+            data_srcs = re.findall(
+                r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]',
+                html, re.IGNORECASE
+            )
+            for src in data_srcs:
+                _add(src)
+
+    return image_urls
 
 
 def is_bmw_relevant(text: str) -> bool:

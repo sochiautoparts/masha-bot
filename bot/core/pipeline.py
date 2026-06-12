@@ -211,41 +211,47 @@ class ContentPipeline:
 
         # ── Steps 1-3: Try to get ORIGINAL image via ImageFetcher ─────────
         try:
-            real_image = await self.image_fetcher.fetch(
+            real_images, real_source = await self.image_fetcher.fetch(
                 topic=topic,
                 article_url=article_url,
                 rss_entry=rss_entry,
-                content_type=content_type,
             )
-            if real_image:
-                source = real_image.get("source", "unknown")
+            if real_images:
+                import base64
+                img_b64 = base64.b64encode(real_images[0]).decode("utf-8")
                 logger.info(
-                    "Using ORIGINAL image for post (source=%s): %s",
-                    source,
-                    real_image.get("image_url", "")[:80],
+                    "Using ORIGINAL image for post (source=%s): %d images found",
+                    real_source,
+                    len(real_images),
                 )
                 # Normalize format for pipeline compatibility
                 return {
-                    "image_b64": real_image["image_b64"],
-                    "image_url": real_image.get("image_url", ""),
-                    "source": source,
+                    "image_b64": img_b64,
+                    "image_url": article_url,
+                    "source": real_source,
                 }
         except Exception as exc:
-            logger.warning("ImageFetcher failed, will try AI generation: %s", exc)
+            logger.warning("ImageFetcher failed: %s", exc)
 
-        # ── Step 4: AI generation — LAST RESORT ───────────────────────────
-        logger.info("No real image found — falling back to AI generation for '%s'", topic[:50])
-        try:
-            ai_image = await self.image_gen.generate(
-                topic=topic,
-                content_type=content_type,
-            )
-            if ai_image:
-                ai_image["source"] = "ai_generated"
-                logger.info("Using AI-generated image for post")
-                return ai_image
-        except Exception as exc:
-            logger.warning("AI image generation also failed: %s", exc)
+        # ── Step 4: AI generation — DISABLED per user requirement ───────────
+        # User explicitly requested NO AI-generated photos in posts.
+        # Real photos only — text-only post is better than fake AI photos.
+        import os
+        _enable_ai_gen = os.environ.get("ENABLE_AI_IMAGE_GEN", "false").lower() == "true"
+        if _enable_ai_gen:
+            try:
+                ai_image = await self.image_gen.generate(
+                    topic=topic,
+                    content_type=content_type,
+                )
+                if ai_image:
+                    ai_image["source"] = "ai_generated"
+                    logger.info("Using AI-generated image (ENABLE_AI_IMAGE_GEN=true)")
+                    return ai_image
+            except Exception as exc:
+                logger.warning("AI image generation failed: %s", exc)
+        else:
+            logger.info("No real image found for '%s' — AI generation DISABLED, post without image", topic[:50])
 
         # No image at all — post without image
         logger.info("No image available — posting without image")

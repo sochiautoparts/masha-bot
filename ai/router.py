@@ -335,7 +335,12 @@ class AIRouter:
         content_type: str = "news+reaction",
         character_mix: str | None = None,
     ) -> tuple[AIResponse, AIResponse | None]:
-        """Generate a channel post with optional image."""
+        """Generate a channel post WITHOUT AI-generated image.
+
+        v4.0: AI image generation is DISABLED per user requirement.
+        Only real photos from news sources are used (handled by ImageFetcher).
+        This method now returns (text_response, None) — no AI images.
+        """
         text_resp = await self.generate_channel_post(
             topic=topic,
             context=context,
@@ -343,17 +348,8 @@ class AIRouter:
             character_mix=character_mix,
         )
 
-        image_resp = None
-        if content_type in ("news+reaction", "lore/history", "garage stories", "partner"):
-            img_prompt = await self.generate_image_prompt(topic)
-            image_resp = await self._manager.generate_image(
-                prompt=img_prompt,
-                width=1024,
-                height=768,
-                model="flux",
-            )
-
-        return text_resp, image_resp
+        # NO AI image generation — only real photos from ImageFetcher
+        return text_resp, None
 
     async def decode_vin(
         self,

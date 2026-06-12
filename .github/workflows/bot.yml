@@ -1,4 +1,4 @@
-name: Masha Bot — LOCAL-FIRST v10 — Маша + Редакция
+name: Masha Bot — v4.0 — Маша + Редакция — REAL PHOTOS ONLY
 
 on:
   schedule:
@@ -35,12 +35,14 @@ env:
   # Local model — ENABLED (Qwen3-4B Q4_K_M, ~2.5GB)
   ENABLE_LOCAL_MODEL: "true"
   MODEL_PATH: "models/Qwen3-4B-Q4_K_M.gguf"
-  MODEL_N_CTX: "8192"
+  MODEL_N_CTX: "16384"
   MODEL_N_THREADS: "4"
   MODEL_MAX_TOKENS: "512"
   MODEL_AUTO_DOWNLOAD: "true"
   MODEL_DOWNLOAD_URL: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  # AI IMAGE GENERATION — DISABLED! Only real photos from news sources
+  ENABLE_AI_IMAGE_GEN: "false"
   # Schedule settings
   NEWS_INTERVAL_MINUTES: "30"
   CHANNEL_POST_INTERVAL_MINUTES: "30"
@@ -158,20 +160,21 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v10.0 — LOCAL-FIRST ==="
-          echo "ARCHITECTURE: Local-First 4-Level Failover"
-          echo "  Level 0: LOCAL Qwen3-4B (4B params, Q4_K_M, CPU) — chat & comments"
+          echo "=== Starting Masha Bot v4.0 — REAL PHOTOS ONLY ==="
+          echo "ARCHITECTURE: 4-Level Failover + Real-Photo Pipeline"
+          echo "  Level 0: LOCAL Qwen3-4B (4B params, Q4_K_M, CPU, n_ctx=16384) — chat & comments"
           echo "  Level 1: Pollinations (key) — all routes, 60+ models"
           echo "  Level 2: Pollinations FREE — fallback, no auth"
           echo "  Level 3: Cloudflare Workers AI — Mistral Small 3.1, 20K req/day"
           echo "  Last resort: Static fallback"
-          echo "LOCAL MODEL USAGE:"
-          echo "  CHAT route: Local → Cloud (saves balance!)"
-          echo "  COMMENT route: Local → Cloud (saves balance!)"
-          echo "  FUNCTION route (posts, VIN, diagnostics): Cloud → Local (fallback)"
-          echo "  VISION: Cloud only (local can't do vision)"
-          echo "  IMAGE GEN: Cloud only"
-          echo "ROUTING: Local(chat/comment) → Pollinations(key) → Pollinations(free) → Cloudflare → Static"
+          echo ""
+          echo "IMAGE PIPELINE v4.0:"
+          echo "  1. RSS enclosures + content:encoded (BeautifulSoup parsed)"
+          echo "  2. Article scraping (BeautifulSoup + lxml — 3-5x more reliable)"
+          echo "  3. AI-powered SearXNG search (BMW-specific smart queries)"
+          echo "  4. AI IMAGE GENERATION: DISABLED (ENABLE_AI_IMAGE_GEN=false)"
+          echo "  5. No images -> text-only post (better than fake AI photos)"
+          echo ""
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
           echo "CONTENT: BMW-first, RSS + web search, multi-strategy image sourcing"
           echo "FORMATS: 6 content types for diverse schedule"

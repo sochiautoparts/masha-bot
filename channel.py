@@ -151,23 +151,34 @@ def _record_post_title(title: str):
 
 def _clean_post_text(text: str) -> str:
     """Clean post text: remove markdown, formatting artifacts, AI meta-comments,
-    and BANNED headings like '🔥 Мнение Маши'."""
+    and BANNED headings like '🔥 Мнение Маши'.
+    
+    v4.0: Added more aggressive AI leak patterns — "Заметка:", "Примечание:",
+    "Шутка:", "Note:", brackets with instructions, etc.
+    """
     if not text:
         return text
 
+    # Strip markdown
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1', text)
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'\*(.+?)\*', r'\1', text)
     text = re.sub(r'data:\s*\{[^}]*\}', '', text)
     text = re.sub(r'\[DONE\]', '', text)
 
+    # Remove AI provider artifacts
     for phrase in ["As an AI", "Как AI", "Как искусственный интеллект",
-                   "powered by pollinations", "pollinations.ai"]:
+                   "powered by pollinations", "pollinations.ai",
+                   "I am an AI", "Я искусственный", "Я языковая модель",
+                   "I'm an AI", "Я ИИ-ассистент", "Я нейросеть"]:
         text = re.sub(rf'.*{re.escape(phrase)}.*', '', text, flags=re.IGNORECASE)
 
+    # Remove think/reasoning tags
     text = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'</?think[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<reasoning\b[^>]*>.*?</reasoning\s*>', '', text, flags=re.DOTALL | re.IGNORECASE)
 
+    # Remove AI meta-comments and editorial instructions that leak into post text
     meta_comment_patterns = [
         r'[^\n]*тему\s+в\s+канал\s+не\s+ставим[^\n]*',
         r'[^\n]*не\s+наш\s+формат[^\n]*',
@@ -175,12 +186,23 @@ def _clean_post_text(text: str) -> str:
         r'[^\n]*дубликат[^\n]*',
         r'[^\n]*already\s+(posted|published|covered)[^\n]*',
         r'[^\n]*do\s+not\s+(publish|post)[^\n]*',
+        # AI instruction leaks
+        r'[^\n]*(?:заметка|примечание|шутка|комментарий редактора|editor\'?s?\s*note)[\s:—–][^\n]*',
+        r'^\s*(?:Note|Comment|Remark|NB)\s*[:.]?\s*[^\n]*$',
+        r'[^\n]*\(шутка\)[^\n]*',
+        r'[^\н]*\[шутка\][^\n]*',
+        r'[^\n]*\(примечание\)[^\n]*',
+        r'[^\n]*\(editorial\)[^\n]*',
+        # Lines that look like AI instructions (contain imperative verbs + context)
+        r'^\s*(?:напиши|создай|сгенерируй|подготовь|опубликуй|напоминание)[\s:][^\n]*$',
+        r'^\s*(?:write|create|generate|prepare|publish|reminder)[\s:][^\n]*$',
+        # "Контекст:" / "Context:" lines (AI prompt leaks)
+        r'^\s*(?:контекст|context|исходная\s+новость|source)[\s:][^\n]*$',
     ]
     for pattern in meta_comment_patterns:
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
 
-    # ── Remove banned opening headings that AI sometimes ignores instructions about ──
-    # These are EXPLICITLY FORBIDDEN in prompts but AI sometimes generates them anyway
+    # ── Remove banned opening headings ──
     _banned_openings = [
         "🔥 Мнение Маши",
         "Мнение Маши",
@@ -190,17 +212,17 @@ def _clean_post_text(text: str) -> str:
         "Мнение Маши (с сарказмом и BMW-экспертизой)",
     ]
     for banned in _banned_openings:
-        # Match opening at start of text, possibly with emoji prefix, dashes, colons
         pattern = rf'^[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-        # Also match anywhere in text if on its own line
         pattern = rf'\n[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
         text = re.sub(pattern, '\n', text, flags=re.IGNORECASE)
 
-    for prefix in ["Маша:", "Masha:", "Assistant:"]:
+    # Remove AI prefix names
+    for prefix in ["Маша:", "Masha:", "Assistant:", "AI:", "ИИ:", "Бот:", "Bot:"]:
         if text.startswith(prefix):
             text = text[len(prefix):].strip()
 
+    # Remove formal phrases that AI sometimes generates despite instructions
     formal_phrases = [
         ("Редакция сообщает:", ""), ("Редакция сообщает —", ""),
         ("Редакция сообщает", ""),
@@ -211,6 +233,7 @@ def _clean_post_text(text: str) -> str:
         if phrase in text:
             text = text.replace(phrase, replacement)
 
+    # Remove editorial trigger phrases (lines that are editorial instructions, not content)
     _editorial_trigger_phrases = [
         "не ставим", "не наш формат",
         "перепишу тему", "напишу готовый",
@@ -230,6 +253,7 @@ def _clean_post_text(text: str) -> str:
             cleaned_lines.append(line)
     text = '\n'.join(cleaned_lines)
 
+    # Clean up extra whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = text.strip()
 
@@ -1236,27 +1260,25 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Wikimedia image fetch error: {e}")
 
-        # 7. AI generation — VERY LAST RESORT, only 1 image
-        if not image_list:
+        # 7. AI generation — DISABLED by default (user requirement: NO AI-generated photos)
+        # Only enable if ENABLE_AI_IMAGE_GEN env var is explicitly set to "true"
+        _enable_ai_gen = os.environ.get("ENABLE_AI_IMAGE_GEN", "false").lower() == "true"
+        if not image_list and _enable_ai_gen:
             try:
                 ai_images = await self._generate_post_images(title, count=1)
                 if ai_images:
                     image_list.extend(ai_images)
                     source = "ai"
-                    logger.info(f"Generated 1 AI image (no real images found for '{title[:50]}')")
+                    logger.info(f"Generated 1 AI image (ENABLE_AI_IMAGE_GEN=true, no real images for '{title[:50]}')")
             except Exception as e:
                 logger.warning(f"AI image generation skipped: {e}")
+        elif not image_list:
+            logger.info(f"No real images found for '{title[:50]}' — AI generation DISABLED, post will be text-only")
 
-        # 8. Stock BMW photo fallback
+        # 8. Stock BMW photo fallback — ALSO uses AI generation (Pollinations), so DISABLED
+        # Stock photos that are AI-generated are not real news photos
         if not image_list:
-            try:
-                stock_images = await self._fetch_stock_bmw_images()
-                if stock_images:
-                    image_list.extend(stock_images)
-                    source = "stock"
-                    logger.info("Using stock BMW photo as last resort")
-            except Exception as e:
-                logger.debug(f"Stock BMW image fallback error: {e}")
+            logger.info(f"Stock BMW image fallback skipped (AI-generated, not real news photo)")
 
         # HARD LIMIT: never more than MAX_IMAGES_PER_POST
         image_list = image_list[:MAX_IMAGES_PER_POST]
@@ -1390,13 +1412,13 @@ class ChannelManager:
             _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
 
             if not has_media and len(post_text) <= _CAPTION_LIMIT:
-                # No media + short text — search for REAL images first, AI as VERY last resort
+                # No media + short text — search for REAL images (NO AI generation!)
                 logger.warning(
                     f"Post has NO media and text is {len(post_text)} chars. "
-                    f"Searching for real images first, AI generation as last resort."
+                    f"Searching for real images. AI generation is DISABLED."
                 )
 
-                # Try 1: Search for real images
+                # Try: Search for real images
                 real_image_found = False
                 try:
                     from bot.sources.image_fetcher import ImageFetcher, deduplicate_images
@@ -1421,25 +1443,14 @@ class ChannelManager:
                 except Exception as e:
                     logger.debug(f"Real image search for text-only post failed: {e}")
 
-                # Try 2: AI generation — ONLY if no real images found
-                if not real_image_found:
-                    try:
-                        last_resort = await self._generate_post_images(
-                            news_item.get("title", ""), count=1
-                        )
-                        if last_resort:
-                            image_data_list = last_resort
-                            has_media = True
-                            image_source = "ai-last-resort"
-                            logger.info("AI image generation SUCCEEDED (no real images found)")
-                    except Exception as e:
-                        logger.debug(f"Last-resort image gen failed: {e}")
+                # NO AI generation — only real photos!
+                # If no real images found, publish as text-only (better than fake AI photos)
 
                 if not has_media:
-                    # PUBLISH TEXT-ONLY as last resort — better than channel silence
+                    # PUBLISH TEXT-ONLY — better than channel silence or fake AI photos
                     logger.warning(
-                        f"POSTING TEXT-ONLY (last resort): No images available, text is "
-                        f"{len(post_text)} chars. Channel silence is worse than no-photo post."
+                        f"POSTING TEXT-ONLY: No real images found for post "
+                        f"({len(post_text)} chars). AI generation DISABLED per user request."
                     )
 
             elif has_media and len(post_text) > _CAPTION_LIMIT:
@@ -1621,27 +1632,14 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Wikimedia fallback for partner {program.name}: {e}")
 
-        # 3. Try AI generation
+        # 3. AI generation — DISABLED (user requirement: NO AI-generated photos)
+        # For partner posts, use real images only
         if not image_data:
-            try:
-                ai_images = await self._generate_post_images(
-                    f"professional logo design for {program.name}", count=1
-                )
-                if ai_images:
-                    image_data = ai_images[0]
-                    logger.info(f"AI-generated image for partner: {program.name}")
-            except Exception as e:
-                logger.debug(f"AI image gen for partner {program.name}: {e}")
+            logger.info(f"No real image for partner: {program.name} — posting text-only (AI gen disabled)")
 
-        # 4. Try stock BMW image as last resort
+        # 4. Stock BMW image — ALSO uses AI generation (Pollinations), so DISABLED
         if not image_data:
-            try:
-                stock_images = await self._fetch_stock_bmw_images()
-                if stock_images:
-                    image_data = stock_images[0]
-                    logger.info(f"Stock BMW image for partner post: {program.name}")
-            except Exception as e:
-                logger.debug(f"Stock image for partner {program.name}: {e}")
+            logger.info(f"Stock BMW image fallback skipped for partner {program.name} (AI-generated)")
 
         try:
             if image_data:

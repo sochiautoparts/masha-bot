@@ -184,34 +184,35 @@ async def search_yandex(query: str, max_results: int = 5) -> List[SearchResult]:
 # ── SearXNG search ─────────────────────────────────────────────────────────────
 
 SEARXNG_INSTANCES = [
-    "https://searx.be",
+    # Tested and working as of 2025-06 (with proper User-Agent)
+    "https://search.mdosch.de",
+    "https://searx.tiekoetter.com",
     "https://search.sapti.me",
+    "https://search.rowie.at",
+    "https://searx.be",
     "https://searxng.ch",
     "https://baresearch.org",
-    "https://searx.tiekoetter.com",
     "https://search.ononoki.org",
-    "https://search.lvkaszus.pl",
     "https://searxng.site",
-    "https://searxng.perennialte.ch",
-    "https://search.0relay.com",
-    "https://searxng.au",
-    "https://searxng.shreven.org",
-    "https://search.privacyredirect.com",
-    "https://searxng.tordenskjold.one",
-    "https://search.cronobox.one",
-    "https://searx.fmac.xyz",
-    "https://search.mdosch.de",
-    "https://searx.prvcy.eu",
-    "https://search.bus-hit.me",
-    "https://search.rowie.at",
-    "https://searx.divided-by-zero.eu",
-    "https://search.sergioprado.blog",
     "https://searx.work",
+    "https://searx.prvcy.eu",
+    "https://search.cronobox.one",
+    # Often rate-limited but worth trying
+    "https://searxng.perennialte.ch",
     "https://searxng.bravefence.com",
-    "https://searx.no-logs.com",
     "https://searx.datura.network",
+    "https://searxng.tordenskjold.one",
+    "https://searx.fmac.xyz",
     "https://search.rhscze.cf",
     "https://search.charleseroop.com",
+    "https://searx.divided-by-zero.eu",
+    "https://search.sergioprado.blog",
+    "https://searxng.shreven.org",
+    "https://search.privacyredirect.com",
+    "https://searxng.au",
+    "https://search.0relay.com",
+    "https://search.lvkaszus.pl",
+    "https://searx.no-logs.com",
 ]
 
 
@@ -222,12 +223,19 @@ async def search_searxng(query: str, max_results: int = 5, language: str = "ru",
     instances = SEARXNG_INSTANCES.copy()
     random.shuffle(instances)
 
-    CONCURRENT_LIMIT = 5
-    PER_INSTANCE_TIMEOUT = 6.0
+    CONCURRENT_LIMIT = 3  # Fewer concurrent to avoid rate limiting
+    PER_INSTANCE_TIMEOUT = 10.0  # Longer timeout for reliability
 
     async def _try_instance(instance: str) -> List[SearchResult]:
         try:
-            async with httpx.AsyncClient(timeout=PER_INSTANCE_TIMEOUT) as client:
+            async with httpx.AsyncClient(
+                timeout=PER_INSTANCE_TIMEOUT,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "application/json, text/html, */*",
+                },
+            ) as client:
                 params = {
                     "q": query,
                     "format": "json",
@@ -238,6 +246,9 @@ async def search_searxng(query: str, max_results: int = 5, language: str = "ru",
                     params["categories"] = categories
                 response = await client.get(f"{instance}/search", params=params)
                 if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "")
+                    if "json" not in content_type and "javascript" not in content_type:
+                        return []
                     data = response.json()
                     instance_results = []
                     for item in data.get("results", [])[:max_results]:

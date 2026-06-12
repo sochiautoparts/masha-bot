@@ -82,7 +82,7 @@ _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # ── Keyword-based semantic dedup ────────────────────────────────────────────
 _recent_post_keywords: list = []
-_MAX_RECENT_POSTS = 100
+_MAX_RECENT_POSTS = 50  # Reduced from 100 — 100 was too aggressive
 
 _SEMANTIC_STOP_WORDS = frozenset([
     "в", "на", "с", "о", "у", "по", "из", "за", "от", "до", "к", "не", "и", "но",
@@ -126,13 +126,13 @@ def _is_semantically_duplicate(title: str) -> bool:
 
     for recent_words in _recent_post_keywords:
         matches = sum(1 for w in significant if w in recent_words)
-        if matches >= 3:
+        if matches >= 5:  # Raised from 3 — too many false positives for BMW channel
             return True
 
-        if len(core_words) >= 2:
+        if len(core_words) >= 3:  # Raised from 2 — need more specific overlap
             recent_core = [w for w in recent_words if w in _BMW_CORE_WORDS]
             core_matches = sum(1 for w in core_words if w in recent_core)
-            if core_matches >= 2:
+            if core_matches >= 3:  # Raised from 2 — BMW terms are too common in our posts
                 return True
 
     return False
@@ -404,7 +404,8 @@ class ChannelManager:
     _CONTENT_MODELS_ROTATION = [
         "openai-large", "mistral-large", "deepseek",
         "openai", "llama", "mistral", "deepseek-r1",
-        "qwen-coder", "llama-scale", "searchgpt",
+        "qwen-coder", "llama-scale",
+        # REMOVED: "searchgpt" — invalid on gen.pollinations.ai (400 errors)
     ]
 
     def set_bot(self, bot: Bot) -> None:

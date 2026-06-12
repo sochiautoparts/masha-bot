@@ -73,7 +73,7 @@ _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # ── Topic Registry ─────────────────────────────────────────────────────────────
 _topic_registry: Dict[str, Dict] = {}
-_REGISTRY_MAX_AGE_HOURS = 72
+_REGISTRY_MAX_AGE_HOURS = 24  # Reduced from 72 — too long for focused channel
 
 # BMW-focused brands for entity extraction
 _AUTO_BRANDS = [
@@ -180,9 +180,19 @@ def _extract_entities(title: str) -> str:
 
 
 def _is_topic_covered(entity_key: str) -> bool:
-    """Check if this topic/entity was already posted about recently."""
+    """Check if this topic/entity was already posted about recently.
+    
+    IMPORTANT: Brand-only keys (e.g. "bmw") are SKIPPED — they would block
+    an entire channel's content. Only compound keys like "bmw_m5" are checked.
+    """
     if not entity_key:
         return False
+    
+    # Skip brand-only keys — they're too broad for a focused channel
+    brand_only_keys = {b.lower().replace(" ", "_") for b in _AUTO_BRANDS}
+    if entity_key in brand_only_keys:
+        return False
+    
     entry = _topic_registry.get(entity_key)
     if not entry:
         return False
@@ -210,37 +220,28 @@ def _register_topic(entity_key: str, title: str):
             "titles": [title],
         }
 
-    # Register brand-only key
-    for b in _AUTO_BRANDS:
-        b_key = b.lower().replace(" ", "_")
-        if b_key in entity_key:
-            if b_key not in _topic_registry:
-                _topic_registry[b_key] = {
-                    "first_seen": now,
-                    "last_posted": now,
-                    "post_count": 1,
-                    "titles": [f"[brand-dedup] {title}"],
-                }
-            else:
-                _topic_registry[b_key]["post_count"] += 1
-                _topic_registry[b_key]["last_posted"] = now
-            break
+    # NOTE: Brand-only key registration REMOVED — was too aggressive for a
+    # BMW-focused channel. "bmw" brand key blocked ALL subsequent BMW posts.
+    # Now only model+engine specific keys (e.g. "bmw_m5", "bmw_x5_s63") are tracked.
 
-    # Register person-only key
-    for p in _NOTABLE_PEOPLE:
-        p_key = p.lower().replace(" ", "_")
-        if p_key in entity_key:
-            if p_key not in _topic_registry:
-                _topic_registry[p_key] = {
-                    "first_seen": now,
-                    "last_posted": now,
-                    "post_count": 1,
-                    "titles": [f"[person-dedup] {title}"],
-                }
-            else:
-                _topic_registry[p_key]["post_count"] += 1
-                _topic_registry[p_key]["last_posted"] = now
-            break
+    # Register person-only key (only if person is part of a compound key, not alone)
+    # Avoid blocking all posts about a popular figure
+    parts_count = len(entity_key.split("_"))
+    if parts_count >= 2:  # Only if person appears with other context
+        for p in _NOTABLE_PEOPLE:
+            p_key = p.lower().replace(" ", "_")
+            if p_key in entity_key and entity_key != p_key:
+                if p_key not in _topic_registry:
+                    _topic_registry[p_key] = {
+                        "first_seen": now,
+                        "last_posted": now,
+                        "post_count": 1,
+                        "titles": [f"[person-dedup] {title}"],
+                    }
+                else:
+                    _topic_registry[p_key]["post_count"] += 1
+                    _topic_registry[p_key]["last_posted"] = now
+                break
 
     try:
         entry = _topic_registry[entity_key]

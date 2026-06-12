@@ -178,7 +178,7 @@ class ContentWriter:
             return random.choice(["openai", "mistral-large", "deepseek"])
         elif content_type in ("polls/debates", "garage stories"):
             # Creative content — use more creative models
-            return random.choice(["openai-large", "mistral-large", "qwen"])
+            return random.choice(["openai-large", "mistral-large", "deepseek"])
         elif content_type == "lore/history":
             # History — needs accuracy + storytelling
             return random.choice(["openai", "openai-large", "deepseek"])

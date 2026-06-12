@@ -261,6 +261,17 @@ class LocalProvider(BaseAIProvider):
             self._model_loaded = True
             self._available = True
 
+            # Warn if n_ctx is much smaller than model's training context
+            try:
+                n_ctx_train = getattr(self._llm, 'n_ctx_train', 0)
+                if n_ctx_train > 0 and n_ctx < n_ctx_train:
+                    logger.warning(
+                        f"n_ctx ({n_ctx}) < n_ctx_train ({n_ctx_train}) — "
+                        f"model capacity limited. If segfaults occur, increase MODEL_N_CTX."
+                    )
+            except Exception:
+                pass
+
             logger.info(
                 f"Local model loaded in {elapsed:.1f}s "
                 f"(Qwen3-4B Q4_K_M, ctx={n_ctx}, threads={n_threads})"
@@ -335,10 +346,19 @@ class LocalProvider(BaseAIProvider):
                 error="Local model not available (not loaded or not enabled)",
             )
 
-        # Circuit breaker: if too many consecutive errors, pause briefly
-        if self._consecutive_errors >= 5:
+        # Circuit breaker: if too many consecutive errors, try reinitializing
+        if self._consecutive_errors >= 3:
             elapsed_since_error = time.time() - self._last_error_time
             if elapsed_since_error < 120:  # 2-minute cooldown
+                # Try to reinitialize model once
+                if self._consecutive_errors == 3:
+                    logger.warning("Local model: 3 consecutive errors — attempting reinitialize")
+                    self.unload()
+                    if self._load_model():
+                        self._consecutive_errors = 0
+                        logger.info("Local model reinitialized successfully")
+                    else:
+                        logger.error("Local model reinitialize failed — entering cooldown")
                 return AIResponse(
                     text="",
                     model="local-qwen3-4b",
@@ -427,15 +447,23 @@ class LocalProvider(BaseAIProvider):
 
     def _generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
         """Synchronous generation call (runs in thread pool)."""
-        result = self._llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=0.9,
-            top_k=40,
-            repeat_penalty=1.1,
-            stop=["<|im_end|>", "</s>", "<|im_start|>"],
-        )
+        try:
+            result = self._llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.9,
+                top_k=40,
+                repeat_penalty=1.1,
+                stop=["<|im_end|>", "</s>", "<|im_start|>"],
+            )
+        except Exception as e:
+            # Catch llama_decode errors before they cause segfaults
+            logger.error(f"Local model generation error: {e}")
+            # Mark model as potentially broken
+            self._consecutive_errors += 1
+            self._last_error_time = time.time()
+            return ""
 
         # Extract text from result
         if isinstance(result, dict):

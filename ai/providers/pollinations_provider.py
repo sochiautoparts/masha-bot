@@ -37,7 +37,7 @@ CHAT_MODELS = [
     "llama", "llama-scale",
     "mistral", "mistral-large",
     "deepseek", "deepseek-r1", "deepseek-reasoner",
-    "searchgpt", "sur",
+    # REMOVED: "searchgpt", "sur" — invalid on gen.pollinations.ai (400 errors)
 ]
 
 # Models that work well on legacy free API (text.pollinations.ai)

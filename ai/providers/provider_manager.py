@@ -337,8 +337,6 @@ class ProviderManager:
             "deepseek-r1": "deepseek",
             "llama": "llama",
             "qwen-coder": "mistral",
-            "searchgpt": "mistral",
-            "sur": "mistral",
         }
         return mapping.get(model)
 

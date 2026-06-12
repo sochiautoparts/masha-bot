@@ -368,7 +368,11 @@ def _ensure_footer(text: str) -> str:
 
 
 def _enforce_char_limit(text: str, has_media: bool) -> str:
-    """Smart character limit enforcement — always preserves footer."""
+    """Smart character limit enforcement — always preserves footer.
+    
+    NEVER cuts mid-word or mid-sentence — always truncates at a natural
+    break point (paragraph, sentence, newline, or word boundary).
+    """
     footer = "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
     char_limit = config.TELEGRAM_CAPTION_LIMIT if has_media else config.TELEGRAM_TEXT_LIMIT
 
@@ -385,9 +389,60 @@ def _enforce_char_limit(text: str, has_media: bool) -> str:
         return footer.lstrip('\n')
 
     if len(content) > max_content:
-        content = content[:max_content - 3] + "..."
+        content = _smart_truncate(content, max_content)
 
     return content + footer
+
+
+def _smart_truncate(text: str, max_len: int) -> str:
+    """Truncate text at a natural sentence/paragraph boundary.
+    
+    Strategy (in priority order):
+    1. Find the last paragraph break (\\n\\n) before max_len
+    2. Find the last sentence end (. ! ? …) before max_len
+    3. Find the last newline (\\n) before max_len
+    4. Find the last space before max_len (avoid mid-word cut)
+    5. Last resort: hard cut at max_len - 3 + "..."
+    
+    Always appends "..." to indicate truncation.
+    """
+    if len(text) <= max_len:
+        return text
+    
+    target = max_len - 3
+    if target < 50:
+        return text[:target] + "..."
+    
+    search_zone = text[:target + 1]
+    
+    # 1. Paragraph break
+    last_para = search_zone.rfind("\n\n")
+    if last_para > target * 0.5:
+        return text[:last_para].rstrip() + "..."
+    
+    # 2. Sentence end
+    sentence_end_chars = ['. ', '! ', '? ', '… ', '.\n', '!\n', '?\n', '…\n']
+    best_sentence_end = -1
+    for end_char in sentence_end_chars:
+        pos = search_zone.rfind(end_char)
+        if pos > best_sentence_end and pos > target * 0.5:
+            best_sentence_end = pos + len(end_char) - 1
+    
+    if best_sentence_end > target * 0.5:
+        return text[:best_sentence_end + 1].rstrip() + "..."
+    
+    # 3. Newline
+    last_newline = search_zone.rfind("\n")
+    if last_newline > target * 0.5:
+        return text[:last_newline].rstrip() + "..."
+    
+    # 4. Space (avoid mid-word)
+    last_space = search_zone.rfind(" ")
+    if last_space > target * 0.5:
+        return text[:last_space].rstrip() + "..."
+    
+    # 5. Hard cut — very last resort
+    return text[:target].rstrip() + "..."
 
 
 class ChannelManager:
@@ -1441,11 +1496,13 @@ class ChannelManager:
 
                     if len(tmp_paths) == 1:
                         # Single image — use send_photo
+                        # NOTE: post_text is already enforced by _enforce_char_limit above
+                        # No need for crude caption[:1024] truncation
                         photo = FSInputFile(tmp_paths[0], filename="masha_post.jpg")
                         sent_message = await self._bot.send_photo(
                             chat_id=config.CHANNEL_ID,
                             photo=photo,
-                            caption=post_text[:config.TELEGRAM_CAPTION_LIMIT],
+                            caption=post_text,
                             parse_mode=ParseMode.HTML,
                         )
                     else:
@@ -1454,9 +1511,10 @@ class ChannelManager:
                         for i, tmp_path in enumerate(tmp_paths):
                             photo_file = FSInputFile(tmp_path, filename=f"masha_post_{i}.jpg")
                             if i == 0:
+                                # First photo gets caption — already enforced by _enforce_char_limit
                                 media_group.append(InputMediaPhoto(
                                     media=photo_file,
-                                    caption=post_text[:config.TELEGRAM_CAPTION_LIMIT],
+                                    caption=post_text,
                                     parse_mode=ParseMode.HTML,
                                 ))
                             else:

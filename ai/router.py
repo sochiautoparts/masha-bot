@@ -216,22 +216,28 @@ class AIRouter:
 {extra_note}
 
 Ограничения:
-- Максимум 1024 символа (пост с фото) или 4096 (текстовый пост)
+- ⛔ СТРОГИЙ ЛИМИТ: с фото — 1024 символа ВЕСЬ пост, без фото — 4096
+- ЕСЛИ ТЫ НАПИШЕШЬ БОЛЬШЕ 1024 СИМВОЛОВ ДЛЯ ПОСТА С ФОТО — ОН ОБРЕЖЕТСЯ НА ПОЛУСЛОВЕ!
+- Пиши КОМПАКТНО и ЁМКО: 500-800 символов оптимально для поста с фото
+- НЕ ПИШИ длинных вступлений. Сразу к делу.
 - Живой язык, не энциклопедия
 - BMW-экспертность, не вода
-- Подпись в конце обязательна"""
+- Подпись в конце обязательна — никогда не обрезай её"""
 
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ]
 
+        # Media posts need shorter text (1024 char limit), text-only can be longer (4096)
+        post_max_tokens = 600 if has_media else 1500
+
         # Channel posts use FUNCTION route (Cloud first, Local fallback)
         return await self.chat(
             messages=messages,
             model=model or random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=temperature,
-            max_tokens=1500,
+            max_tokens=post_max_tokens,
             route_type=ROUTE_FUNCTION,
         )
 

@@ -137,7 +137,7 @@ class ChannelManager:
 
         payload = {
             "chat_id": self.config.channel_id,
-            "caption": text[:1024],  # Telegram caption limit
+            "caption": text,  # Already enforced by formatter/channel.py
             "parse_mode": "HTML",
         }
 

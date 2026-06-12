@@ -57,10 +57,11 @@ POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///
 
 # ── How many images per news post ───────────────────────────────────────────
 # Telegram allows up to 10 media per post.
-# We aim for rich visual posts with multiple relevant images from news sources.
-NEWS_IMAGES_MIN = 2
+# We aim for rich visual posts with real news photos.
+# Images are deduplicated by hash — no duplicate photos in posts!
+NEWS_IMAGES_MIN = 1
 NEWS_IMAGES_MAX = 10
-MAX_IMAGES_PER_POST = 10
+MAX_IMAGES_PER_POST = 10  # Telegram hard limit
 MAX_RSS_IMAGES = 10
 MAX_SCRAPE_IMAGES = 10
 MAX_SEARCH_IMAGES = 5
@@ -988,146 +989,210 @@ class ChannelManager:
         return images
 
     async def _get_post_images(self, news_item: Dict) -> tuple:
-        """Get images for a news post — PRIORITIZE real photos from news sources.
-        
-        KEY CHANGE: Real photos from the actual news article are FAR more valuable
-        than AI-generated images. We now aggressively fetch up to MAX_IMAGES_PER_POST (10)
-        real photos from RSS feeds, article scraping, and web search BEFORE falling
-        back to AI generation.
+        """Get images for a news post — REAL photos from news, DEDUPLICATED.
 
-        Priority:
-        1. RSS images (from news source) — up to MAX_RSS_IMAGES
-        2. Article page scraping (og:image, twitter:image, article body) — up to MAX_SCRAPE_IMAGES
-        3. Web search enrichment (find images for this specific news) — up to MAX_SEARCH_IMAGES
-        4. Pexels API (free car photos, needs key)
-        5. Pixabay API (free car photos, needs key)
-        6. Wikimedia Commons (free, no key needed)
-        7. AI generation — LAST RESORT
-        8. Stock BMW photo fallback — ABSOLUTE LAST RESORT
+        v3.0: Uses ImageFetcher with hash-based deduplication pipeline:
+        1. RSS image URLs — DEDUPLICATED by hash
+        2. RSS enclosures — DEDUPLICATED by hash
+        3. Article page images — DEDUPLICATED
+        4. Image search (SearXNG) — DEDUPLICATED
+        5. AI generation — VERY LAST RESORT, only 1 image
 
         Returns (image_list: List[bytes], source: str)
+        source is 'rss', 'article', 'search', 'cache', or 'ai' for logging.
+        Images are deduplicated by SHA256 hash to prevent duplicate photos.
         """
-        image_list = []
-        source = "none"
         title = news_item.get("title", "")
-
-        # Extract BMW model for better image search
-        bmw_query = "BMW car"
-        title_lower = title.lower()
-        for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
-                       "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
-            if model.lower() in title_lower:
-                bmw_query = f"BMW {model}"
-                break
-
-        # 1. Try RSS images — download up to MAX_RSS_IMAGES real photos
+        article_url = news_item.get("url", "")
         rss_image_urls = news_item.get("image_urls", [])
+
+        # ── Steps 1-4: Try ImageFetcher for REAL images ──────────────────
+        # ImageFetcher includes hash-based deduplication built-in
+        try:
+            from bot.sources.image_fetcher import ImageFetcher, deduplicate_images
+            if not hasattr(self, '_image_fetcher'):
+                self._image_fetcher = ImageFetcher()
+
+            real_images, real_source = await self._image_fetcher.fetch(
+                topic=title,
+                article_url=article_url,
+                image_urls=rss_image_urls,
+                max_images=MAX_IMAGES_PER_POST,
+            )
+            if real_images:
+                # Extra safety: deduplicate again at channel level
+                real_images = deduplicate_images(real_images)[:MAX_IMAGES_PER_POST]
+                logger.info(f"Got {len(real_images)} UNIQUE REAL images for '{title[:50]}' (source={real_source})")
+                return real_images, real_source
+        except ImportError:
+            # deduplicate_images not available — use ImageFetcher without extra dedup
+            try:
+                from bot.sources.image_fetcher import ImageFetcher
+                if not hasattr(self, '_image_fetcher'):
+                    self._image_fetcher = ImageFetcher()
+
+                real_images, real_source = await self._image_fetcher.fetch(
+                    topic=title,
+                    article_url=article_url,
+                    image_urls=rss_image_urls,
+                    max_images=MAX_IMAGES_PER_POST,
+                )
+                if real_images:
+                    logger.info(f"Got {len(real_images)} REAL images for '{title[:50]}' (source={real_source})")
+                    return real_images[:MAX_IMAGES_PER_POST], real_source
+            except Exception as e:
+                logger.warning(f"ImageFetcher failed, falling back to legacy pipeline: {e}")
+        except Exception as e:
+            logger.warning(f"ImageFetcher failed, falling back to legacy pipeline: {e}")
+
+        # ── Legacy fallback: try scraping directly (with dedup) ────────────
+        image_list = []
+        seen_hashes = set()
+        source = "none"
+
+        def _hash_dedup_add(img_bytes: bytes) -> bool:
+            """Add image only if not a duplicate. Returns True if added."""
+            import hashlib
+            h = hashlib.sha256(img_bytes).hexdigest()
+            if h in seen_hashes:
+                logger.debug(f"Legacy pipeline: skipping duplicate image (hash={h[:12]})")
+                return False
+            seen_hashes.add(h)
+            return True
+
+        # 1. Try RSS images directly
         if rss_image_urls:
             try:
-                rss_images = await self._download_news_images(
-                    rss_image_urls,
-                    max_count=MAX_RSS_IMAGES
-                )
-                if rss_images:
-                    image_list.extend(rss_images)
+                rss_images = await self._download_news_images(rss_image_urls, max_count=MAX_RSS_IMAGES)
+                for img in rss_images:
+                    if _hash_dedup_add(img):
+                        image_list.append(img)
+                if image_list:
                     source = "real"
-                    logger.info(f"Using {len(rss_images)} real images from RSS for: {title[:50]}")
+                    logger.info(f"Using {len(image_list)} unique real images from RSS for: {title[:50]}")
             except Exception as e:
                 logger.warning(f"Failed to download RSS images: {e}")
 
-        # 2. Try scraping article page for images — ALWAYS try if URL exists
-        if news_item.get("url") and len(image_list) < MAX_IMAGES_PER_POST:
+        # 2. Try article scraping
+        if article_url and len(image_list) < MAX_IMAGES_PER_POST:
             try:
-                scraped = await self._scrape_article_images(
-                    news_item["url"],
-                    max_count=MAX_SCRAPE_IMAGES
-                )
-                if scraped:
-                    for img in scraped:
-                        if len(image_list) >= MAX_IMAGES_PER_POST:
-                            break
+                scraped = await self._scrape_article_images(article_url, max_count=MAX_SCRAPE_IMAGES)
+                for img in scraped:
+                    if len(image_list) >= MAX_IMAGES_PER_POST:
+                        break
+                    if _hash_dedup_add(img):
                         image_list.append(img)
-                    source = "scraped" if source == "none" else source + "+scraped"
-                    logger.info(f"Scraped {len(scraped)} images for: {title[:50]}")
+                if image_list and source == "none":
+                    source = "scraped"
+                elif image_list:
+                    source += "+scraped"
+                logger.info(f"Scraped {len(scraped)} images for: {title[:50]}")
             except Exception as e:
                 logger.debug(f"Article scraping skipped: {e}")
 
-        # 3. Web search enrichment — find MORE images for this specific news
+        # 3. Web search enrichment
         if len(image_list) < NEWS_IMAGES_MIN and title:
             try:
                 search_image_urls = await enrich_with_search_images(title, max_images=5)
                 if search_image_urls:
                     searched = await self._download_news_images(search_image_urls, max_count=MAX_SEARCH_IMAGES)
-                    if searched:
-                        for img in searched:
-                            if len(image_list) >= MAX_IMAGES_PER_POST:
-                                break
+                    for img in searched:
+                        if len(image_list) >= MAX_IMAGES_PER_POST:
+                            break
+                        if _hash_dedup_add(img):
                             image_list.append(img)
-                        source = "search" if source == "none" else source + "+search"
-                        logger.info(f"Found {len(searched)} images via web search for: {title[:50]}")
+                    if image_list and source == "none":
+                        source = "search"
+                    elif image_list:
+                        source += "+search"
+                    logger.info(f"Found {len(searched)} images via web search for: {title[:50]}")
             except Exception as e:
                 logger.debug(f"Web search image enrichment skipped: {e}")
 
-        # 4. Try Pexels API (free, high-quality car photos)
+        # 4. Try Pexels API
         if len(image_list) < 2:
             try:
+                bmw_query = "BMW car"
+                title_lower = title.lower()
+                for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
+                               "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
+                    if model.lower() in title_lower:
+                        bmw_query = f"BMW {model}"
+                        break
                 pexels_images = await self._fetch_pexels_images(bmw_query, max_count=2)
                 if pexels_images:
-                    image_list.extend(pexels_images)
-                    source = "pexels" if source == "none" else source + "+pexels"
+                    for img in pexels_images:
+                        if len(image_list) >= MAX_IMAGES_PER_POST:
+                            break
+                        if _hash_dedup_add(img):
+                            image_list.append(img)
+                    if image_list and source == "none":
+                        source = "pexels"
+                    elif image_list:
+                        source += "+pexels"
             except Exception as e:
                 logger.debug(f"Pexels image fetch error: {e}")
 
-        # 5. Try Pixabay API (free, large collection)
+        # 5. Try Pixabay API
         if len(image_list) < 2:
             try:
+                bmw_query = "BMW car"
+                title_lower = title.lower()
+                for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
+                               "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
+                    if model.lower() in title_lower:
+                        bmw_query = f"BMW {model}"
+                        break
                 pixabay_images = await self._fetch_pixabay_images(bmw_query, max_count=2)
                 if pixabay_images:
-                    image_list.extend(pixabay_images)
-                    source = "pixabay" if source == "none" else source + "+pixabay"
+                    for img in pixabay_images:
+                        if len(image_list) >= MAX_IMAGES_PER_POST:
+                            break
+                        if _hash_dedup_add(img):
+                            image_list.append(img)
+                    if image_list and source == "none":
+                        source = "pixabay"
+                    elif image_list:
+                        source += "+pixabay"
             except Exception as e:
                 logger.debug(f"Pixabay image fetch error: {e}")
 
-        # 6. Try Wikimedia Commons (free, no API key needed)
+        # 6. Try Wikimedia Commons
         if len(image_list) < 2:
             try:
+                bmw_query = "BMW car"
+                title_lower = title.lower()
+                for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
+                               "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
+                    if model.lower() in title_lower:
+                        bmw_query = f"BMW {model}"
+                        break
                 wiki_images = await self._fetch_wikimedia_images(bmw_query, max_count=2)
                 if wiki_images:
-                    image_list.extend(wiki_images)
-                    source = "wikimedia" if source == "none" else source + "+wikimedia"
+                    for img in wiki_images:
+                        if len(image_list) >= MAX_IMAGES_PER_POST:
+                            break
+                        if _hash_dedup_add(img):
+                            image_list.append(img)
+                    if image_list and source == "none":
+                        source = "wikimedia"
+                    elif image_list:
+                        source += "+wikimedia"
             except Exception as e:
                 logger.debug(f"Wikimedia image fetch error: {e}")
 
-        # 7. AI generation fallback — LAST RESORT (all real sources failed)
+        # 7. AI generation — VERY LAST RESORT, only 1 image
         if not image_list:
             try:
                 ai_images = await self._generate_post_images(title, count=1)
                 if ai_images:
                     image_list.extend(ai_images)
                     source = "ai"
-                    logger.info(f"Generated {len(ai_images)} AI images (no real images found)")
-                else:
-                    # Specific prompts failed — try ONE generic prompt
-                    try:
-                        ai_resp = await asyncio.wait_for(
-                            get_ai_router()._primary.generate_image(
-                                "Beautiful BMW car on a scenic road, professional automotive "
-                                "photography, golden hour, no text.",
-                                model="flux",
-                            ),
-                            timeout=60.0,
-                        )
-                        img_bytes = self._ai_response_to_bytes(ai_resp)
-                        if img_bytes:
-                            image_list = [img_bytes]
-                            source = "ai-generic"
-                            logger.info("Generated generic AI BMW image")
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"Generic image generation failed: {e}")
+                    logger.info(f"Generated 1 AI image (no real images found for '{title[:50]}')")
             except Exception as e:
                 logger.warning(f"AI image generation skipped: {e}")
 
-        # 8. Stock BMW photo fallback (absolute last resort)
+        # 8. Stock BMW photo fallback
         if not image_list:
             try:
                 stock_images = await self._fetch_stock_bmw_images()
@@ -1138,13 +1203,12 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Stock BMW image fallback error: {e}")
 
-        # HARD LIMIT: never more than MAX_IMAGES_PER_POST (10 max — Telegram limit)
+        # HARD LIMIT: never more than MAX_IMAGES_PER_POST
         image_list = image_list[:MAX_IMAGES_PER_POST]
 
         if not image_list:
             logger.warning(
                 f"No images found for post: {title[:60]}. "
-                f"All image sources failed (RSS, scrape, Pexels, Pixabay, Wikimedia, search, AI, stock). "
                 f"Post will be published as text-only."
             )
 
@@ -1271,22 +1335,50 @@ class ChannelManager:
             _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
 
             if not has_media and len(post_text) <= _CAPTION_LIMIT:
-                # No media + short text — try one more image generation attempt
+                # No media + short text — search for REAL images first, AI as VERY last resort
                 logger.warning(
                     f"Post has NO media and text is {len(post_text)} chars. "
-                    f"Attempting last-resort image generation..."
+                    f"Searching for real images first, AI generation as last resort."
                 )
+
+                # Try 1: Search for real images
+                real_image_found = False
                 try:
-                    last_resort = await self._generate_post_images(
-                        news_item.get("title", ""), count=1
-                    )
-                    if last_resort:
-                        image_data_list = last_resort
-                        has_media = True
-                        image_source = "ai-last-resort"
-                        logger.info("Last-resort AI image gen succeeded")
+                    from bot.sources.image_fetcher import ImageFetcher, deduplicate_images
+                    if not hasattr(self, '_image_fetcher'):
+                        self._image_fetcher = ImageFetcher()
+
+                    search_topic = news_item.get("title", "")
+                    if search_topic:
+                        search_images, search_src = await self._image_fetcher.fetch(
+                            topic=search_topic,
+                            article_url=news_item.get("url", ""),
+                            image_urls=news_item.get("image_urls", []),
+                            max_images=2,
+                        )
+                        if search_images:
+                            search_images = deduplicate_images(search_images)[:2]
+                            image_data_list = search_images
+                            has_media = True
+                            real_image_found = True
+                            image_source = search_src
+                            logger.info(f"Found {len(search_images)} REAL images via search for text-only post (source={search_src})")
                 except Exception as e:
-                    logger.debug(f"Last-resort image gen failed: {e}")
+                    logger.debug(f"Real image search for text-only post failed: {e}")
+
+                # Try 2: AI generation — ONLY if no real images found
+                if not real_image_found:
+                    try:
+                        last_resort = await self._generate_post_images(
+                            news_item.get("title", ""), count=1
+                        )
+                        if last_resort:
+                            image_data_list = last_resort
+                            has_media = True
+                            image_source = "ai-last-resort"
+                            logger.info("AI image generation SUCCEEDED (no real images found)")
+                    except Exception as e:
+                        logger.debug(f"Last-resort image gen failed: {e}")
 
                 if not has_media:
                     # PUBLISH TEXT-ONLY as last resort — better than channel silence
@@ -1353,7 +1445,7 @@ class ChannelManager:
                         sent_message = await self._bot.send_photo(
                             chat_id=config.CHANNEL_ID,
                             photo=photo,
-                            caption=post_text[:1024],
+                            caption=post_text[:config.TELEGRAM_CAPTION_LIMIT],
                             parse_mode=ParseMode.HTML,
                         )
                     else:
@@ -1364,7 +1456,7 @@ class ChannelManager:
                             if i == 0:
                                 media_group.append(InputMediaPhoto(
                                     media=photo_file,
-                                    caption=post_text[:1024],
+                                    caption=post_text[:config.TELEGRAM_CAPTION_LIMIT],
                                     parse_mode=ParseMode.HTML,
                                 ))
                             else:

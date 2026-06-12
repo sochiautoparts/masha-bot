@@ -1,18 +1,22 @@
-"""Smart Image Fetcher v2.0 — Original-first image sourcing for masha-bot.
+"""Smart Image Fetcher v3.0 — Original-first image sourcing for masha-bot.
 
 PRIORITY PIPELINE:
-  1. Article images — og:image / twitter:image / <img> from source URL
+  1. Article images — og:image / twitter:image / JSON-LD / <img> from source URL
   2. RSS enclosures — <enclosure> / <media:content> from RSS feed
-  3. Image search — SearXNG images / Google Images
+  3. Image search — SearXNG images / web search
   4. AI generation — Pollinations (LAST RESORT ONLY, handled by caller)
 
 KEY FEATURES:
-  - Extracts original photos from article pages (og:image, twitter:image)
+  - Extracts original photos from article pages (og:image, twitter:image, JSON-LD)
   - Parses RSS enclosures and media:content
-  - Validates images: min size, content-type, magic bytes
+  - Validates images: min size, content-type, dimensions (PIL when available)
+  - **DEDUPLICATES images by SHA256 hash** — no duplicate photos in a post!
   - Caches images by topic/entity with 7-day TTL
   - Blacklist of junk image domains and patterns
-  - Returns base64-encoded images ready for Telegram
+  - Returns image BYTES ready for Telegram (compatible with channel.py)
+
+NOTE: This module returns image BYTES (not base64) because that's what
+channel.py expects for Telegram posting.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import re
@@ -36,40 +41,49 @@ logger = logging.getLogger("masha.image_fetcher")
 
 IMAGE_CACHE_DIR = Path("data/image_cache")
 IMAGE_CACHE_TTL_DAYS = 7
-IMAGE_MIN_SIZE_BYTES = 10_000        # 10 KB — filter out tracking pixels, icons
-IMAGE_MAX_SIZE_BYTES = 10_485_760    # 10 MB — Telegram limit
+IMAGE_MIN_SIZE_BYTES = 3_000         # 3 KB — lower threshold for news images
+IMAGE_MAX_SIZE_BYTES = 5_242_880     # 5 MB — matching channel.py limit
 IMAGE_MIN_WIDTH = 400
 IMAGE_MIN_HEIGHT = 300
-IMAGE_FETCH_TIMEOUT = 12.0
-ARTICLE_FETCH_TIMEOUT = 15.0
-MAX_IMAGES_PER_SOURCE = 3
+IMAGE_FETCH_TIMEOUT = 15.0
+ARTICLE_FETCH_TIMEOUT = 20.0
+MAX_IMAGES_PER_SOURCE = 10           # Up to 10 candidates per source
+MAX_IMAGES_PER_POST = 10             # Telegram mediagroup limit
 
 # ── Blacklist — junk image URLs that should never be used ─────────────────────
 
 JUNK_DOMAINS = {
-    # Tracking / analytics
     "pixel", "tracker", "analytics", "counter", "beacon",
     "mc.yandex.ru", "mc.yandex.com", "google-analytics.com",
     "facebook.com/tr", "connect.facebook.net",
-    # Icons / UI elements
-    "gravatar.com", "wp.com/mu-plugins/",
-    # Ad networks
+    "feeds.feedburner.com", "feedburner.google.com",
+    "pixel.wp.com", "stats.wordpress.com",
     "doubleclick.net", "adservice.google.com",
     "pagead2.googlesyndication.com", "ad.doubleclick.net",
-    # Social media UI
     "platform.twitter.com", "apis.google.com",
 }
 
 JUNK_PATTERNS = [
     r"[\?&](utm_|ref|share|action|callback|client_id)=.*$",
     r"/(icon|logo|favicon|badge|avatar|spinner|loading|placeholder|blank|pixel)\b",
-    r"\d+x\d+\.(gif|png)$",              # e.g. 16x16.gif, 32x32.png
+    r"\d+x\d+\.(gif|png)$",
     r"tracker|beacon|pixel|counter|analytics",
     r"gravatar|avatar|profile.*photo",
     r"(button|btn|icon|logo|badge|spinner)\.(png|gif|svg|webp)$",
 ]
 
-JUNK_EXTENSIONS = {".gif", ".svg"}  # Too often icons/buttons; very rarely real photos
+JUNK_KEYWORDS = [
+    "icon", "logo", "favicon", "avatar", "badge", "button", "btn",
+    "spinner", "loading", "placeholder", "pixel", "tracker",
+    "analytics", "share", "facebook", "twitter", "vk.",
+    "telegram", "whatsapp", "instagram", "youtube", "tiktok",
+    "ad.", "ads/", "advert", "sponsor",
+    "emoji", "smileys", "captcha", "recaptcha",
+    "1x1", "spacer", "blank", "transparent", "dot.",
+    "watermark",
+]
+
+JUNK_EXTENSIONS = {".gif", ".svg"}
 
 
 # ── Image Cache ───────────────────────────────────────────────────────────────
@@ -85,7 +99,6 @@ class ImageCache:
         self._load_index()
 
     def _load_index(self) -> None:
-        """Load cache index from disk."""
         try:
             if self._index_path.exists():
                 with open(self._index_path, "r", encoding="utf-8") as f:
@@ -95,7 +108,6 @@ class ImageCache:
             self._index = {}
 
     def _save_index(self) -> None:
-        """Save cache index to disk."""
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             with open(self._index_path, "w", encoding="utf-8") as f:
@@ -104,77 +116,69 @@ class ImageCache:
             logger.debug(f"Failed to save image cache index: {e}")
 
     def _cache_key(self, topic: str) -> str:
-        """Generate cache key from topic."""
         return hashlib.md5(topic.lower().strip().encode()).hexdigest()
 
-    def get(self, topic: str) -> Optional[Dict[str, Any]]:
-        """Get cached image data for a topic."""
+    def get(self, topic: str) -> Optional[List[bytes]]:
+        """Get cached image bytes for a topic."""
         key = self._cache_key(topic)
         entry = self._index.get(key)
         if not entry:
             return None
 
-        # Check TTL
         cached_at = entry.get("cached_at", 0)
         age_days = (time.time() - cached_at) / 86400
         if age_days > self.ttl_days:
             self.delete(topic)
             return None
 
-        # Check file exists
-        file_path = self.cache_dir / entry.get("filename", "")
-        if not file_path.exists():
-            self.delete(topic)
-            return None
+        # Load all cached files for this topic
+        results = []
+        for filename in entry.get("filenames", []):
+            file_path = self.cache_dir / filename
+            if file_path.exists():
+                try:
+                    with open(file_path, "rb") as f:
+                        results.append(f.read())
+                except Exception:
+                    continue
 
-        try:
-            with open(file_path, "rb") as f:
-                img_bytes = f.read()
-            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-            return {
-                "image_b64": img_b64,
-                "source": entry.get("source", "cache"),
-                "url": entry.get("url", ""),
-            }
-        except Exception as e:
-            logger.debug(f"Failed to read cached image: {e}")
-            return None
+        return results if results else None
 
-    def put(self, topic: str, img_b64: str, source: str, url: str = "") -> None:
-        """Store image in cache."""
+    def put(self, topic: str, images: List[bytes], source: str) -> None:
+        """Store images in cache."""
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             key = self._cache_key(topic)
-            filename = f"{key}.jpg"
+            filenames = []
 
-            # Decode and save raw bytes
-            img_bytes = base64.b64decode(img_b64)
-            file_path = self.cache_dir / filename
-            with open(file_path, "wb") as f:
-                f.write(img_bytes)
+            for i, img_bytes in enumerate(images):
+                filename = f"{key}_{i}.jpg"
+                file_path = self.cache_dir / filename
+                with open(file_path, "wb") as f:
+                    f.write(img_bytes)
+                filenames.append(filename)
 
             self._index[key] = {
                 "topic": topic[:100],
-                "filename": filename,
+                "filenames": filenames,
                 "source": source,
-                "url": url[:500],
                 "cached_at": time.time(),
             }
             self._save_index()
         except Exception as e:
-            logger.debug(f"Failed to cache image: {e}")
+            logger.debug(f"Failed to cache images: {e}")
 
     def delete(self, topic: str) -> None:
-        """Remove a topic from cache."""
         key = self._cache_key(topic)
         entry = self._index.pop(key, None)
         if entry:
-            try:
-                file_path = self.cache_dir / entry.get("filename", "")
-                if file_path.exists():
-                    file_path.unlink()
-            except Exception:
-                pass
+            for filename in entry.get("filenames", []):
+                try:
+                    file_path = self.cache_dir / filename
+                    if file_path.exists():
+                        file_path.unlink()
+                except Exception:
+                    pass
             self._save_index()
 
 
@@ -184,238 +188,305 @@ def _is_junk_url(url: str) -> bool:
     """Check if a URL is a junk/tracking/icon image."""
     url_lower = url.lower()
     parsed = urlparse(url_lower)
-
-    # Check junk domains
     hostname = parsed.hostname or ""
+
     for junk in JUNK_DOMAINS:
         if junk in hostname:
             return True
 
-    # Check junk patterns
+    for kw in JUNK_KEYWORDS:
+        if kw in url_lower:
+            return True
+
     for pattern in JUNK_PATTERNS:
         if re.search(pattern, url_lower):
             return True
 
-    # Check junk extensions
     path = parsed.path.lower()
     for ext in JUNK_EXTENSIONS:
         if path.endswith(ext):
             return True
 
+    # Skip URLs with very small size indicators
+    size_pattern = re.compile(r'[/=_x](\d{1,3})x(\d{1,3})[/._]')
+    size_match = size_pattern.search(url_lower)
+    if size_match:
+        w, h = int(size_match.group(1)), int(size_match.group(2))
+        if w < 100 or h < 100:
+            return True
+
     return False
 
 
-async def _validate_image(
+def _is_content_image(image_data: bytes) -> bool:
+    """Validate that image data represents a proper content photo."""
+    if len(image_data) < IMAGE_MIN_SIZE_BYTES:
+        return False
+
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_data))
+        width, height = img.size
+
+        if width < IMAGE_MIN_WIDTH or height < IMAGE_MIN_HEIGHT:
+            return False
+        if width / max(height, 1) > 3.0:
+            return False
+        if height / max(width, 1) > 3.0:
+            return False
+        if width * height < 120000:
+            return False
+        return True
+    except ImportError:
+        logger.warning("PIL not available, accepting image without dimension check")
+        return True
+    except Exception:
+        return True
+
+
+async def _validate_and_download(
     client: httpx.AsyncClient,
     url: str,
-    max_size: int = IMAGE_MAX_SIZE_BYTES,
-) -> Optional[Dict[str, Any]]:
-    """Download and validate an image URL. Returns dict with b64 data or None."""
+) -> Optional[bytes]:
+    """Download and validate an image URL. Returns image bytes or None."""
+    if _is_junk_url(url):
+        return None
+
     try:
-        # Quick HEAD request to check content-type and size
+        # Quick HEAD check
         try:
             head_resp = await client.head(url, timeout=6.0, follow_redirects=True)
             content_type = head_resp.headers.get("content-type", "").lower()
             content_length = int(head_resp.headers.get("content-length", "0"))
 
-            # Only allow image types
-            if not any(ct in content_type for ct in ["image/jpeg", "image/png", "image/webp", "image/jpg"]):
-                # Some servers don't return proper content-type on HEAD, so continue anyway
-                if content_type and not content_type.startswith("image/"):
+            if content_type and not any(ct in content_type for ct in [
+                "image/jpeg", "image/png", "image/webp", "image/jpg",
+            ]):
+                if not content_type.startswith("image/"):
                     return None
 
-            # Skip obviously too small files
             if 0 < content_length < IMAGE_MIN_SIZE_BYTES:
                 return None
-
-            # Skip obviously too large files
-            if content_length > max_size:
+            if content_length > IMAGE_MAX_SIZE_BYTES:
                 return None
         except Exception:
-            pass  # HEAD failed, try GET anyway
+            pass
 
-        # Full GET request
+        # Full GET
         resp = await client.get(url, timeout=IMAGE_FETCH_TIMEOUT, follow_redirects=True)
         if resp.status_code != 200:
             return None
 
         img_bytes = resp.content
 
-        # Size checks
         if len(img_bytes) < IMAGE_MIN_SIZE_BYTES:
             return None
-        if len(img_bytes) > max_size:
+        if len(img_bytes) > IMAGE_MAX_SIZE_BYTES:
             return None
 
-        # Content-type check from GET response
+        # Content-type check
         content_type = resp.headers.get("content-type", "").lower()
         if content_type and not any(ct in content_type for ct in [
-            "image/jpeg", "image/png", "image/webp", "image/jpg", "application/octet-stream",
+            "image/jpeg", "image/png", "image/webp", "image/jpg",
+            "application/octet-stream",
         ]):
             return None
 
-        # Basic JPEG/PNG/WebP magic bytes check
+        # Skip SVG
+        if b'<svg' in img_bytes[:500] or 'svg' in content_type:
+            return None
+
+        # Magic bytes check
         is_valid_format = (
-            img_bytes[:2] == b'\xff\xd8'  # JPEG
-            or img_bytes[:8] == b'\x89PNG\r\n\x1a\n'  # PNG
-            or img_bytes[:4] == b'RIFF'  # WebP (RIFF container)
+            img_bytes[:3] == b'\xff\xd8\xff'  # JPEG
+            or img_bytes[:4] == b'\x89PNG'     # PNG
+            or img_bytes[:4] == b'RIFF'        # WebP
+            or img_bytes[:6] in (b'GIF87a', b'GIF89a')  # GIF
         )
         if not is_valid_format:
             return None
 
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-        return {
-            "image_b64": img_b64,
-            "image_url": str(resp.url),
-            "source": "fetched",
-            "size_bytes": len(img_bytes),
-        }
+        # Dimension check (PIL when available)
+        if not _is_content_image(img_bytes):
+            return None
+
+        return img_bytes
 
     except Exception as e:
-        logger.debug(f"Image validation failed for {url}: {e}")
+        logger.debug(f"Image download failed for {url[:60]}: {e}")
         return None
 
 
-# ── Strategy 1: Article page image extraction (og:image, twitter:image) ──────
+# ── Strategy 1: Article page image extraction ────────────────────────────────
 
-async def fetch_article_images(url: str) -> List[str]:
-    """Fetch original images from an article page.
-
-    Extracts images in priority order:
-    1. og:image meta tag
-    2. twitter:image meta tag
-    3. <link rel="image_src">
-    4. First large <img> in the article content area
-    """
-    image_urls: List[str] = []
+async def fetch_article_images(url: str, max_count: int = 10) -> List[bytes]:
+    """Fetch original images from an article page."""
+    images: List[bytes] = []
 
     if not url or not url.startswith(("http://", "https://")):
-        return image_urls
+        return images
 
     try:
+        _SCRAPE_HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+
         async with httpx.AsyncClient(
             timeout=ARTICLE_FETCH_TIMEOUT,
             follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
-            },
+            max_redirects=5,
         ) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, headers=_SCRAPE_HEADERS)
             if resp.status_code != 200:
-                return image_urls
+                return images
 
             html = resp.text
 
+            # Collect candidate URLs in priority order
+            candidate_urls: List[str] = []
+            seen: set = set()
+
             # 1. og:image
-            og_match = re.search(
-                r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
-                html, re.IGNORECASE,
-            )
-            if not og_match:
-                og_match = re.search(
-                    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
-                    html, re.IGNORECASE,
-                )
-            if og_match:
-                img_url = og_match.group(1).replace("&amp;", "&")
-                if not _is_junk_url(img_url):
-                    image_urls.append(img_url)
+            for pattern in [
+                r'<meta[^>]+property=["\x27]og:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]',
+                r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+property=["\x27]og:image["\x27]',
+                r'<meta[^>]+property=["\x27]og:image:url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]',
+                r'<meta[^>]+property=["\x27]og:image:secure_url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]',
+            ]:
+                for m in re.finditer(pattern, html, re.IGNORECASE):
+                    u = m.group(1).replace("&amp;", "&")
+                    if u and u not in seen and not _is_junk_url(u):
+                        seen.add(u)
+                        candidate_urls.append(u)
 
             # 2. twitter:image
-            tw_match = re.search(
-                r'<meta\s+(?:property|name)=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
-                html, re.IGNORECASE,
-            )
-            if not tw_match:
-                tw_match = re.search(
-                    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']twitter:image["\']',
-                    html, re.IGNORECASE,
-                )
-            if tw_match:
-                img_url = tw_match.group(1).replace("&amp;", "&")
-                if not _is_junk_url(img_url) and img_url not in image_urls:
-                    image_urls.append(img_url)
+            for pattern in [
+                r'<meta[^>]+name=["\x27]twitter:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]',
+                r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+name=["\x27]twitter:image["\x27]',
+            ]:
+                for m in re.finditer(pattern, html, re.IGNORECASE):
+                    u = m.group(1).replace("&amp;", "&")
+                    if u and u not in seen and not _is_junk_url(u):
+                        seen.add(u)
+                        candidate_urls.append(u)
 
-            # 3. <link rel="image_src">
-            link_match = re.search(
-                r'<link\s+[^>]*rel=["\']image_src["\'][^>]*href=["\']([^"\']+)["\']',
-                html, re.IGNORECASE,
-            )
-            if not link_match:
-                link_match = re.search(
-                    r'<link\s+[^>]*href=["\']([^"\']+)["\'][^>]*rel=["\']image_src["\']',
-                    html, re.IGNORECASE,
-                )
-            if link_match:
-                img_url = link_match.group(1).replace("&amp;", "&")
-                if not _is_junk_url(img_url) and img_url not in image_urls:
-                    image_urls.append(img_url)
+            # 3. JSON-LD structured data (schema.org)
+            jsonld_urls = _extract_jsonld_images(html)
+            for u in jsonld_urls:
+                if u not in seen and not _is_junk_url(u):
+                    seen.add(u)
+                    candidate_urls.append(u)
 
-            # 4. First large <img> in article content area
-            article_blocks = re.findall(
-                r'<(?:article|main)[^>]*>(.*?)</(?:article|main)>',
-                html, re.DOTALL | re.IGNORECASE,
-            )
-            if not article_blocks:
-                article_blocks = re.findall(
-                    r'<div[^>]*class=["\'][^"\']*(?:content|post|entry|article)[^"\']*["\'][^>]*>(.*?)</div>',
-                    html, re.DOTALL | re.IGNORECASE,
-                )
+            # 4. <picture>/<source srcset> elements
+            picture_blocks = re.findall(r'<picture[^>]*>(.*?)</picture>', html, re.IGNORECASE | re.DOTALL)
+            for block in picture_blocks:
+                srcsets = re.findall(r'srcset=["\x27]([^"\x27]+)["\x27]', block, re.IGNORECASE)
+                for srcset in srcsets:
+                    for part in srcset.split(','):
+                        u = part.strip().split()[0] if part.strip() else ''
+                        if u and u not in seen and not _is_junk_url(u):
+                            seen.add(u)
+                            candidate_urls.append(u)
 
-            for block in article_blocks[:2]:  # Check first 2 article blocks
-                img_matches = re.findall(
-                    r'<img[^>]+src=["\']([^"\']+)["\']',
-                    block, re.IGNORECASE,
-                )
-                for img_url in img_matches:
-                    img_url = img_url.replace("&amp;", "&")
-                    if not _is_junk_url(img_url) and img_url not in image_urls:
-                        image_urls.append(img_url)
+            # 5. <img> tags from article body
+            article_html = ""
+            for pattern in [
+                r'<article[^>]*>(.*?)</article>',
+                r'<main[^>]*>(.*?)</main>',
+                r'<div[^>]+class=["\x27][^"\x27]*(?:content|article|post|entry)[^"\x27]*["\x27][^>]*>(.*?)</div>',
+            ]:
+                matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                for match in matches:
+                    article_html += match + "\n"
 
-            # 5. Fallback: first <img> with width/height attributes suggesting large image
-            if not image_urls:
-                sized_imgs = re.findall(
-                    r'<img[^>]+src=["\']([^"\']+)["\'][^>]*(?:width|height)\s*=\s*["\'](\d+)["\']',
-                    html, re.IGNORECASE,
-                )
-                for img_url, dim in sized_imgs:
-                    if int(dim) >= IMAGE_MIN_WIDTH and not _is_junk_url(img_url) and img_url not in image_urls:
-                        image_urls.append(img_url)
+            search_html = article_html if article_html else html
+
+            # Lazy-loaded images first (often higher quality)
+            lazy_urls = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
+            lazy_urls += re.findall(r'<img[^>]+data-lazy-src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
+            regular_urls = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
+
+            for u in lazy_urls + regular_urls:
+                if u.startswith("//"):
+                    u = "https:" + u
+                if u and len(u) > 10 and u not in seen and not _is_junk_url(u):
+                    seen.add(u)
+                    candidate_urls.append(u)
+
+            logger.info(f"Scraped {len(candidate_urls)} candidate image URLs from {url[:60]}")
+
+            # Download and validate
+            for img_url in candidate_urls[:max_count * 3]:
+                if len(images) >= max_count:
+                    break
+                img_bytes = await _validate_and_download(client, img_url)
+                if img_bytes:
+                    images.append(img_bytes)
+                    logger.info(f"Downloaded article image: {img_url[:80]} ({len(img_bytes)} bytes)")
 
     except Exception as e:
-        logger.debug(f"Article image extraction failed for {url}: {e}")
+        logger.debug(f"Article image extraction failed for {url[:60]}: {e}")
 
-    return image_urls[:MAX_IMAGES_PER_SOURCE]
+    return images
+
+
+def _extract_jsonld_images(html: str) -> List[str]:
+    """Extract image URLs from JSON-LD structured data in HTML."""
+    images = []
+    try:
+        jsonld_blocks = re.findall(
+            r'<script[^>]+type=["\x27]application/ld\+json["\x27][^>]*>(.*?)</script>',
+            html, re.IGNORECASE | re.DOTALL,
+        )
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    img_field = item.get("image") or item.get("images")
+                    if not img_field:
+                        continue
+                    if isinstance(img_field, str):
+                        images.append(img_field)
+                    elif isinstance(img_field, dict):
+                        url = img_field.get("url") or img_field.get("contentUrl") or img_field.get("@id", "")
+                        if url:
+                            images.append(url)
+                    elif isinstance(img_field, list):
+                        for img_item in img_field:
+                            if isinstance(img_item, str):
+                                images.append(img_item)
+                            elif isinstance(img_item, dict):
+                                url = img_item.get("url") or img_item.get("contentUrl") or img_item.get("@id", "")
+                                if url:
+                                    images.append(url)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return images
 
 
 # ── Strategy 2: RSS enclosure / media:content extraction ─────────────────────
 
 def extract_rss_images(entry: Any) -> List[str]:
-    """Extract image URLs from a feedparser entry.
-
-    Checks:
-    1. <enclosure> with image type
-    2. <media:content> with image type
-    3. <media:thumbnail>
-    4. <content:encoded> <img> tags
-    5. <summary>/<description> <img> tags
-    """
+    """Extract image URLs from a feedparser entry."""
     image_urls: List[str] = []
 
-    # 1. <enclosure type="image/...">
-    enclosures = getattr(entry, "enclosures", []) or []
-    for enc in enclosures:
+    # enclosures
+    for enc in getattr(entry, "enclosures", []) or []:
         url = enc.get("href", "") or enc.get("url", "")
         enc_type = enc.get("type", "").lower()
         if url and ("image" in enc_type or any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"])):
             if not _is_junk_url(url) and url not in image_urls:
                 image_urls.append(url)
 
-    # 2. <media:content medium="image">
-    media_content = getattr(entry, "media_content", []) or []
-    for mc in media_content:
+    # media:content
+    for mc in getattr(entry, "media_content", []) or []:
         url = mc.get("url", "")
         medium = mc.get("medium", "").lower()
         mc_type = mc.get("type", "").lower()
@@ -423,74 +494,179 @@ def extract_rss_images(entry: Any) -> List[str]:
             if not _is_junk_url(url) and url not in image_urls:
                 image_urls.append(url)
 
-    # 3. <media:thumbnail>
-    media_thumbnail = getattr(entry, "media_thumbnail", []) or []
-    for mt in media_thumbnail:
+    # media:thumbnail
+    for mt in getattr(entry, "media_thumbnail", []) or []:
         url = mt.get("url", "")
         if url and not _is_junk_url(url) and url not in image_urls:
             image_urls.append(url)
 
-    # 4. <content:encoded> or <summary> with <img>
+    # <img> in content/summary
     for field_name in ("content", "summary", "description"):
         content_value = getattr(entry, field_name, None)
         if isinstance(content_value, list):
             content_value = content_value[0].get("value", "") if content_value else ""
         elif content_value is None:
             continue
+        for m in re.finditer(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', str(content_value), re.IGNORECASE):
+            url = m.group(1).replace("&amp;", "&")
+            if not _is_junk_url(url) and url not in image_urls:
+                image_urls.append(url)
 
-        img_matches = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', str(content_value), re.IGNORECASE)
-        for img_url in img_matches:
-            img_url = img_url.replace("&amp;", "&")
-            if not _is_junk_url(img_url) and img_url not in image_urls:
-                image_urls.append(img_url)
-
-    return image_urls[:MAX_IMAGES_PER_SOURCE]
+    return image_urls[:10]
 
 
 # ── Strategy 3: Image search ─────────────────────────────────────────────────
 
-async def search_images(topic: str, max_images: int = 3) -> List[str]:
-    """Search for images related to a topic using SearXNG image search."""
+async def search_images(topic: str, max_images: int = 5) -> List[str]:
+    """Search for images related to a topic using SearXNG image search.
+
+    v3.0: Smarter search queries — adapts to BMW/automotive topics.
+    Tries multiple search strategies for better image coverage.
+    """
     image_urls: List[str] = []
+    seen_urls: set = set()
 
     try:
         from bot.web_search import search_searxng
 
-        # Clean up topic for search
         clean_topic = re.sub(r'[^\w\s]', '', topic)[:80]
 
-        # Try SearXNG image search
-        results = await search_searxng(
-            f"{clean_topic} BMW",
-            max_results=8,
-            language="ru",
-            categories="images",
-        )
+        # Build smarter search queries
+        search_queries = []
 
-        for r in results:
-            if r.url:
-                url_lower = r.url.lower()
-                # Direct image URLs
-                if any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                    if not _is_junk_url(r.url):
-                        image_urls.append(r.url)
-                # Image service URLs (imgur, etc.)
-                elif any(domain in url_lower for domain in ['imgur.com', 'flickr.com', 'unsplash.com']):
-                    if not _is_junk_url(r.url):
-                        image_urls.append(r.url)
+        # Primary: topic + photo (Russian)
+        search_queries.append(f"{clean_topic} фото")
 
-        # Fallback: regular web search with image keywords
+        # Secondary: English query for international sources
+        search_queries.append(f"{clean_topic} photo")
+
+        # Try SearXNG image search with each query
+        for query in search_queries:
+            if len(image_urls) >= max_images:
+                break
+            try:
+                results = await search_searxng(
+                    query,
+                    max_results=8,
+                    language="ru",
+                    categories="images",
+                )
+                for r in results:
+                    if r.url and r.url not in seen_urls:
+                        url_lower = r.url.lower()
+                        is_image_url = any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+                        is_image_host = any(domain in url_lower for domain in [
+                            'imgur.com', 'flickr.com', 'unsplash.com',
+                            'pexels.com', 'shutterstock.com', 'istockphoto.com',
+                        ])
+                        if (is_image_url or is_image_host) and not _is_junk_url(r.url):
+                            seen_urls.add(r.url)
+                            image_urls.append(r.url)
+            except Exception as e:
+                logger.debug(f"SearXNG image search failed for query '{query[:40]}': {e}")
+
+        # Fallback: regular web search for images
         if not image_urls:
-            from bot.web_search import web_search
-            results = await web_search(f"{clean_topic} BMW photo image", max_results=5)
-            for r in results:
-                if r.url and not _is_junk_url(r.url):
-                    image_urls.append(r.url)
+            try:
+                from bot.web_search import web_search
+                results = await web_search(f"{clean_topic} фото image", max_results=5)
+                for r in results:
+                    url = r.get("url", "") if isinstance(r, dict) else getattr(r, "url", "")
+                    if url and url not in seen_urls and not _is_junk_url(url):
+                        seen_urls.add(url)
+                        image_urls.append(url)
+            except Exception as e:
+                logger.debug(f"Web search image fallback failed for '{topic[:40]}': {e}")
 
     except Exception as e:
         logger.debug(f"Image search failed for '{topic}': {e}")
 
+    logger.info(f"Image search found {len(image_urls)} URLs for '{topic[:50]}'")
     return image_urls[:max_images]
+
+
+# ── Image deduplication ──────────────────────────────────────────────────────
+
+def _image_hash(img_bytes: bytes) -> str:
+    """Compute SHA256 hash of image bytes for deduplication."""
+    return hashlib.sha256(img_bytes).hexdigest()
+
+
+def _images_are_similar(img1: bytes, img2: bytes) -> bool:
+    """Check if two images are identical or near-identical.
+
+    Uses SHA256 hash for exact match. For near-duplicates (resized/compressed
+    versions of the same photo), uses a simple pixel sampling heuristic.
+    """
+    if img1 == img2:
+        return True
+
+    h1, h2 = _image_hash(img1), _image_hash(img2)
+    if h1 == h2:
+        return True
+
+    # Size-based quick reject
+    ratio = len(img1) / max(len(img2), 1)
+    if ratio < 0.3 or ratio > 3.3:
+        return False
+
+    # PIL-based comparison for near-duplicates
+    try:
+        from PIL import Image
+
+        pil1 = Image.open(io.BytesIO(img1))
+        pil2 = Image.open(io.BytesIO(img2))
+
+        w1, h1_dim = pil1.size
+        w2, h2_dim = pil2.size
+        if abs(w1 - w2) > max(w1, w2) * 0.3 or abs(h1_dim - h2_dim) > max(h1_dim, h2_dim) * 0.3:
+            return False
+
+        thumb_size = (16, 16)
+        t1 = pil1.convert("L").resize(thumb_size)
+        t2 = pil2.convert("L").resize(thumb_size)
+
+        pixels1 = list(t1.getdata())
+        pixels2 = list(t2.getdata())
+
+        total_diff = sum(abs(p1 - p2) for p1, p2 in zip(pixels1, pixels2))
+        avg_diff = total_diff / len(pixels1)
+
+        if avg_diff < 15:
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def deduplicate_images(images: List[bytes]) -> List[bytes]:
+    """Remove duplicate and near-duplicate images from a list.
+
+    Uses both exact SHA256 hash matching and PIL-based perceptual comparison
+    to catch resized/compressed versions of the same photo.
+    """
+    if not images:
+        return images
+
+    unique: List[bytes] = []
+    for img in images:
+        is_dup = False
+        for existing in unique:
+            if _images_are_similar(img, existing):
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(img)
+        else:
+            logger.debug(f"Dedup: removed duplicate image ({len(img)} bytes)")
+
+    removed = len(images) - len(unique)
+    if removed > 0:
+        logger.info(f"Image dedup: {len(images)} -> {len(unique)} (removed {removed} duplicates)")
+
+    return unique
 
 
 # ── Main fetcher class ───────────────────────────────────────────────────────
@@ -498,19 +674,23 @@ async def search_images(topic: str, max_images: int = 3) -> List[str]:
 class ImageFetcher:
     """Smart image fetcher with original-first priority pipeline.
 
+    v3.0: Returns image BYTES (not base64) for compatibility with channel.py.
+    Includes image deduplication by hash + perceptual comparison.
+
     Usage:
         fetcher = ImageFetcher()
-        result = await fetcher.fetch(
+        images = await fetcher.fetch(
             topic="BMW M5 G90 debut",
             article_url="https://bmwblog.com/...",
             rss_entry=feed_entry,
         )
-        # result = {"image_b64": ..., "source": "og:image", "url": ...}
+        # images = [bytes, bytes, ...] or []
     """
 
     def __init__(self) -> None:
         self.cache = ImageCache()
         self._client: Optional[httpx.AsyncClient] = None
+        self._seen_hashes: set = set()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -524,133 +704,138 @@ class ImageFetcher:
             )
         return self._client
 
+    def _add_unique(self, img_bytes: bytes) -> bool:
+        """Add image to list only if it's not a duplicate. Returns True if added."""
+        img_hash = _image_hash(img_bytes)
+        if img_hash in self._seen_hashes:
+            logger.debug(f"Skipping exact duplicate image (hash={img_hash[:12]}...)")
+            return False
+        self._seen_hashes.add(img_hash)
+        return True
+
     async def fetch(
         self,
         topic: str,
         article_url: str = "",
         rss_entry: Any = None,
-        content_type: str = "news+reaction",
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch an image using the priority pipeline.
+        image_urls: List[str] = None,
+        max_images: int = MAX_IMAGES_PER_POST,
+    ) -> Tuple[List[bytes], str]:
+        """Fetch images using the priority pipeline with deduplication.
 
-        Returns dict with keys: image_b64, source, url
-        Or None if no suitable image found (caller should fall back to AI generation).
+        Returns (image_list: List[bytes], source: str)
+        source is 'rss', 'article', 'search', or 'cache' for logging.
+        Images are deduplicated by hash to prevent duplicates in posts.
         """
+        # Reset seen hashes for this fetch call
+        self._seen_hashes = set()
+
         # ── Step 0: Check cache ───────────────────────────────────────────
         cached = self.cache.get(topic)
         if cached:
-            logger.info(f"Image cache HIT for '{topic[:50]}'")
-            cached["source"] = f"cache:{cached.get('source', 'unknown')}"
-            return cached
+            deduped = deduplicate_images(cached)
+            if deduped:
+                logger.info(f"Image cache HIT for '{topic[:50]}' — {len(deduped)} images (after dedup)")
+                return deduped, "cache"
+            else:
+                logger.warning(f"Image cache had only duplicates for '{topic[:50]}', re-fetching")
+                self.cache.delete(topic)
 
-        client = self._get_client()
-        all_candidates: List[Tuple[str, str]] = []  # (url, source_label)
+        all_images: List[bytes] = []
+        source = "none"
 
-        # ── Step 1: RSS enclosures / media:content ────────────────────────
-        if rss_entry is not None:
-            rss_urls = extract_rss_images(rss_entry)
-            for url in rss_urls:
-                all_candidates.append((url, "rss_enclosure"))
-            if rss_urls:
-                logger.info(f"RSS images: {len(rss_urls)} found for '{topic[:50]}'")
+        # ── Step 1: RSS image URLs ────────────────────────────────────────
+        if image_urls:
+            client = self._get_client()
+            for url in image_urls[:max_images * 3]:
+                if len(all_images) >= max_images:
+                    break
+                img_bytes = await _validate_and_download(client, url)
+                if img_bytes and self._add_unique(img_bytes):
+                    all_images.append(img_bytes)
+            if all_images:
+                source = "rss"
+                logger.info(f"Got {len(all_images)} unique images from RSS for '{topic[:50]}'")
 
-        # ── Step 2: Article page og:image / twitter:image ─────────────────
-        if article_url:
-            article_urls = await fetch_article_images(article_url)
-            for url in article_urls:
-                if url not in [u for u, _ in all_candidates]:
-                    all_candidates.append((url, "og:image"))
-            if article_urls:
-                logger.info(f"Article images: {len(article_urls)} found for '{article_url[:60]}'")
+        # ── Step 2: RSS entry enclosures ──────────────────────────────────
+        if rss_entry is not None and len(all_images) < max_images:
+            entry_urls = extract_rss_images(rss_entry)
+            if entry_urls:
+                client = self._get_client()
+                for url in entry_urls:
+                    if len(all_images) >= max_images:
+                        break
+                    if url not in (image_urls or []):
+                        img_bytes = await _validate_and_download(client, url)
+                        if img_bytes and self._add_unique(img_bytes):
+                            all_images.append(img_bytes)
+                if all_images and source == "none":
+                    source = "rss"
 
-        # ── Step 3: Image search ──────────────────────────────────────────
-        if not all_candidates:
-            search_urls = await search_images(topic)
-            for url in search_urls:
-                if url not in [u for u, _ in all_candidates]:
-                    all_candidates.append((url, "image_search"))
+        # ── Step 3: Article page images ───────────────────────────────────
+        if article_url and len(all_images) < max_images:
+            article_images = await fetch_article_images(article_url, max_count=max_images - len(all_images) + 2)
+            if article_images:
+                added = 0
+                for img in article_images:
+                    if len(all_images) >= max_images:
+                        break
+                    if self._add_unique(img):
+                        all_images.append(img)
+                        added += 1
+                if added:
+                    source = "article" if source == "none" else source + "+article"
+                    logger.info(f"Scraped {added} unique article images for '{topic[:50]}'")
+
+        # ── Step 4: Image search ──────────────────────────────────────────
+        if len(all_images) < 2:
+            search_urls = await search_images(topic, max_images=max(3, max_images - len(all_images)))
             if search_urls:
-                logger.info(f"Search images: {len(search_urls)} found for '{topic[:50]}'")
+                client = self._get_client()
+                for url in search_urls:
+                    if len(all_images) >= max_images:
+                        break
+                    img_bytes = await _validate_and_download(client, url)
+                    if img_bytes and self._add_unique(img_bytes):
+                        all_images.append(img_bytes)
+                if all_images and source == "none":
+                    source = "search"
+                elif all_images:
+                    source += "+search"
 
-        # ── Step 4: Validate and pick the best ────────────────────────────
-        for url, source_label in all_candidates:
-            result = await _validate_image(client, url)
-            if result:
-                result["source"] = source_label
-                # Cache the result
-                self.cache.put(topic, result["image_b64"], source=source_label, url=url)
-                logger.info(f"Image fetched via {source_label}: {url[:80]} ({result.get('size_bytes', 0)} bytes)")
-                return result
+        # ── Final deduplication pass ──────────────────────────────────────
+        all_images = deduplicate_images(all_images)
 
-        # ── All strategies failed ─────────────────────────────────────────
-        logger.info(f"No real image found for '{topic[:50]}' — AI generation will be used as fallback")
-        return None
+        # ── Cache result ──────────────────────────────────────────────────
+        if all_images:
+            self.cache.put(topic, all_images, source=source)
+            logger.info(f"ImageFetcher: {len(all_images)} unique images for '{topic[:50]}' (source={source})")
+        else:
+            logger.info(f"No real images found for '{topic[:50]}' — AI generation will be fallback")
 
-    async def fetch_multiple(
-        self,
-        topic: str,
-        article_url: str = "",
-        rss_entry: Any = None,
-        max_images: int = 3,
-    ) -> List[Dict[str, Any]]:
-        """Fetch multiple images for a post (e.g., for mediagroup).
-
-        Returns list of dicts with image_b64, source, url.
-        """
-        client = self._get_client()
-        all_candidates: List[Tuple[str, str]] = []
-
-        # Collect all candidate URLs from all sources
-        if rss_entry is not None:
-            for url in extract_rss_images(rss_entry):
-                all_candidates.append((url, "rss_enclosure"))
-
-        if article_url:
-            for url in await fetch_article_images(article_url):
-                if url not in [u for u, _ in all_candidates]:
-                    all_candidates.append((url, "og:image"))
-
-        if len(all_candidates) < max_images:
-            for url in await search_images(topic, max_images=max_images):
-                if url not in [u for u, _ in all_candidates]:
-                    all_candidates.append((url, "image_search"))
-
-        # Validate and collect
-        results: List[Dict[str, Any]] = []
-        for url, source_label in all_candidates:
-            if len(results) >= max_images:
-                break
-            result = await _validate_image(client, url)
-            if result:
-                result["source"] = source_label
-                results.append(result)
-
-        if results:
-            logger.info(f"Fetched {len(results)} images for '{topic[:50]}'")
-
-        return results
+        return all_images, source
 
     async def close(self) -> None:
-        """Clean up resources."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
 
 
-# ── Convenience function ─────────────────────────────────────────────────────
+# ── Module-level convenience ─────────────────────────────────────────────────
 
 _fetcher: Optional[ImageFetcher] = None
 
 
-async def fetch_image_for_post(
+async def fetch_images_for_post(
     topic: str,
     article_url: str = "",
     rss_entry: Any = None,
-    content_type: str = "news+reaction",
-) -> Optional[Dict[str, Any]]:
-    """Module-level convenience function to fetch an image for a post.
+    image_urls: List[str] = None,
+    max_images: int = MAX_IMAGES_PER_POST,
+) -> Tuple[List[bytes], str]:
+    """Module-level convenience function to fetch images for a post.
 
-    Uses a module-level ImageFetcher instance (lazily initialized).
+    Images are automatically deduplicated by hash to prevent duplicates.
     """
     global _fetcher
     if _fetcher is None:
@@ -659,5 +844,34 @@ async def fetch_image_for_post(
         topic=topic,
         article_url=article_url,
         rss_entry=rss_entry,
-        content_type=content_type,
+        image_urls=image_urls,
+        max_images=max_images,
     )
+
+
+# ── Backward compatibility: old API returns dict with base64 ─────────────────
+
+async def fetch_image_for_post(
+    topic: str,
+    article_url: str = "",
+    rss_entry: Any = None,
+    content_type: str = "news+reaction",
+) -> Optional[Dict[str, Any]]:
+    """Backward-compatible function that returns dict with image_b64.
+
+    Prefer fetch_images_for_post() which returns bytes directly.
+    """
+    images, source = await fetch_images_for_post(
+        topic=topic,
+        article_url=article_url,
+        rss_entry=rss_entry,
+        max_images=1,
+    )
+    if images:
+        img_b64 = base64.b64encode(images[0]).decode("utf-8")
+        return {
+            "image_b64": img_b64,
+            "source": source,
+            "url": article_url,
+        }
+    return None

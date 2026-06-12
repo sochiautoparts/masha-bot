@@ -209,7 +209,7 @@ class ContentPipeline:
         article_url = content_item.get("url", "")
         rss_entry = content_item.get("rss_entry")
 
-        # ── Steps 1-3: Try to get ORIGINAL image via ImageFetcher ─────────
+        # ── Steps 1-3: Try to get ORIGINAL images via ImageFetcher ─────────
         try:
             real_images, real_source = await self.image_fetcher.fetch(
                 topic=topic,
@@ -218,6 +218,7 @@ class ContentPipeline:
             )
             if real_images:
                 import base64
+                # v5.0: Support multiple images (up to 10)
                 img_b64 = base64.b64encode(real_images[0]).decode("utf-8")
                 logger.info(
                     "Using ORIGINAL image for post (source=%s): %d images found",
@@ -225,11 +226,18 @@ class ContentPipeline:
                     len(real_images),
                 )
                 # Normalize format for pipeline compatibility
-                return {
+                result = {
                     "image_b64": img_b64,
                     "image_url": article_url,
                     "source": real_source,
                 }
+                # Include extra images if available
+                if len(real_images) > 1:
+                    result["extra_images"] = [
+                        base64.b64encode(img).decode("utf-8")
+                        for img in real_images[1:10]  # Max 10 total
+                    ]
+                return result
         except Exception as exc:
             logger.warning("ImageFetcher failed: %s", exc)
 

@@ -1336,6 +1336,8 @@ class ChannelManager:
             response = await get_ai_router().generate_channel_post(
                 topic=title,
                 context=full_context,
+                has_media=True,  # v5.0: Always assume media — we search aggressively
+                media_count=1,   # At least 1 photo expected
             )
 
             if response.error or not response.text:
@@ -1399,94 +1401,114 @@ class ChannelManager:
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
 
-            # Get images — prioritize REAL photos from news, AI generation as LAST resort
+            # Get images — prioritize REAL photos from news
+            # v5.0: AGGRESSIVE image search — tries 6+ search engines
             image_data_list, image_source = await self._get_post_images(news_item)
             has_media = len(image_data_list) > 0
             media_count = len(image_data_list) if has_media else 0
 
-            # ── SMART MEDIA DECISION ──
+            # ── SMART MEDIA DECISION v5.0 ──
             #
             # RULES (Telegram limits: caption=1024, text-only=4096):
-            #   1. Post with photo — ALWAYS preferred.
-            #   2. Post without photo — only when no image is available at all.
+            #   1. Post with photo(s) — ALWAYS preferred, up to 10 photos.
+            #   2. Post without photo — ONLY for exceptionally valuable content
+            #      where no image could be found despite aggressive search.
             #      Channel silence is WORSE than a post without photo.
+            #   3. If has photos, compress text to fit 1024 caption limit.
+            #   4. If text is too valuable to compress and no photo — use 4096 limit.
             #
             _CAPTION_LIMIT = config.TELEGRAM_CAPTION_LIMIT   # 1024
             _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
 
-            if not has_media and len(post_text) <= _CAPTION_LIMIT:
-                # No media + short text — search for REAL images (NO AI generation!)
+            if not has_media:
+                # ── NO MEDIA: Try HARDER to find real images ──
+                # The ImageFetcher already tried 6+ search engines, but let's do
+                # one more attempt with a broader query
                 logger.warning(
-                    f"Post has NO media and text is {len(post_text)} chars. "
-                    f"Searching for real images. AI generation is DISABLED."
+                    f"Post has NO media after initial search. "
+                    f"Trying broader image search for: {news_item.get('title', '')[:60]}"
                 )
-
-                # Try: Search for real images
-                real_image_found = False
                 try:
                     from bot.sources.image_fetcher import ImageFetcher, deduplicate_images
                     if not hasattr(self, '_image_fetcher'):
                         self._image_fetcher = ImageFetcher()
 
+                    # Try with broader BMW query
                     search_topic = news_item.get("title", "")
+                    bmw_model = "BMW"
+                    topic_lower = search_topic.lower()
+                    for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7",
+                                   "i7", "i5", "i4", "iX", "Z4", "Alpina",
+                                   "3 Series", "5 Series", "7 Series"]:
+                        if model.lower() in topic_lower:
+                            bmw_model = f"BMW {model}"
+                            break
+
                     if search_topic:
                         search_images, search_src = await self._image_fetcher.fetch(
-                            topic=search_topic,
-                            article_url=news_item.get("url", ""),
-                            rss_entry=news_item.get("rss_entry"),
-                            image_urls=news_item.get("image_urls", []),
-                            max_images=2,
+                            topic=f"{bmw_model} 2025 2026",
+                            max_images=5,
                         )
                         if search_images:
-                            search_images = deduplicate_images(search_images)[:2]
+                            search_images = deduplicate_images(search_images)[:5]
                             image_data_list = search_images
                             has_media = True
-                            real_image_found = True
                             image_source = search_src
-                            logger.info(f"Found {len(search_images)} REAL images via search for text-only post (source={search_src})")
+                            media_count = len(search_images)
+                            logger.info(f"Found {len(search_images)} REAL images via broader search (source={search_src})")
                 except Exception as e:
-                    logger.debug(f"Real image search for text-only post failed: {e}")
-
-                # NO AI generation — only real photos!
-                # If no real images found, publish as text-only (better than fake AI photos)
+                    logger.debug(f"Broader image search failed: {e}")
 
                 if not has_media:
-                    # PUBLISH TEXT-ONLY — better than channel silence or fake AI photos
-                    logger.warning(
-                        f"POSTING TEXT-ONLY: No real images found for post "
-                        f"({len(post_text)} chars). AI generation DISABLED per user request."
-                    )
-
-            elif has_media and len(post_text) > _CAPTION_LIMIT:
-                # Has media + text too long — compress to keep media
-                logger.info(
-                    f"Post text {len(post_text)} chars > caption limit {_CAPTION_LIMIT}. "
-                    f"Compressing text to preserve media attachment."
-                )
-                compressed = _enforce_char_limit(post_text, has_media=True)
-                if len(compressed) <= _CAPTION_LIMIT and len(compressed) >= 400:
-                    post_text = compressed
-                else:
-                    # Check if content is interesting enough for text-only
+                    # FINAL: No real images found — check if content is valuable enough for text-only
                     interest_score = _score_interest(
                         news_item.get("title", ""),
                         news_item.get("summary", "")
                     )
-                    if interest_score >= 0.5 and len(post_text) <= _TEXT_LIMIT:
+                    if interest_score >= 0.6:
+                        # Valuable content — publish text-only with 4096 limit
+                        logger.info(
+                            f"POSTING TEXT-ONLY: No images but high interest ({interest_score:.2f}). "
+                            f"Using 4096 char limit for valuable content."
+                        )
+                    elif len(post_text) <= _CAPTION_LIMIT:
+                        # Short post without photo — still publish (silence is worse)
+                        logger.warning(
+                            f"POSTING TEXT-ONLY: Short post without images ({len(post_text)} chars). "
+                            f"Consider adding images manually."
+                        )
+                    else:
+                        # Not interesting enough + no photo — skip
+                        logger.info(
+                            f"SKIPPING: No images + low interest ({interest_score:.2f}) + too long. "
+                            f"Better to wait for next cycle."
+                        )
+                        return False
+
+            if has_media and len(post_text) > _CAPTION_LIMIT:
+                # Has media + text too long — compress to keep media (preferred)
+                logger.info(
+                    f"Post text {len(post_text)} chars > caption limit {_CAPTION_LIMIT}. "
+                    f"Compressing text to preserve {media_count} media attachment(s)."
+                )
+                compressed = _enforce_char_limit(post_text, has_media=True)
+                if len(compressed) <= _CAPTION_LIMIT and len(compressed) >= 200:
+                    post_text = compressed
+                else:
+                    # Compression failed — check if text-only is better
+                    interest_score = _score_interest(
+                        news_item.get("title", ""),
+                        news_item.get("summary", "")
+                    )
+                    if interest_score >= 0.7 and len(post_text) <= _TEXT_LIMIT:
+                        # Very valuable content — drop media, use full text
                         has_media = False
                         image_data_list = []
-                        logger.info(f"Text too long for caption, interest={interest_score:.2f}. Publishing text-only.")
+                        media_count = 0
+                        logger.info(f"Text too long for caption, high interest ({interest_score:.2f}). Publishing text-only.")
                     else:
+                        # Force compress to keep media
                         post_text = _enforce_char_limit(post_text, has_media=True)
-
-            elif not has_media and len(post_text) > _CAPTION_LIMIT:
-                # No media + long text — check if interesting enough for text-only
-                interest_score = _score_interest(
-                    news_item.get("title", ""),
-                    news_item.get("summary", "")
-                )
-                if interest_score < 0.5 or len(post_text) > _TEXT_LIMIT:
-                    post_text = _enforce_char_limit(post_text, has_media=False)
 
             # Ensure footer and char limit
             post_text = _ensure_footer(post_text)

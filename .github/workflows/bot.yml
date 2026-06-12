@@ -1,4 +1,4 @@
-name: Masha Bot — v4.0 — Маша + Редакция — REAL PHOTOS ONLY
+name: Masha Bot — v5.0 — Маша + Редакция — AGGRESSIVE REAL PHOTOS
 
 on:
   schedule:
@@ -72,7 +72,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
           # Install llama-cpp-python with CPU optimizations (OpenBLAS for fast inference)
           CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" pip install llama-cpp-python>=0.3.0 --no-cache-dir
-          # Install remaining dependencies
+          # Install remaining dependencies (includes beautifulsoup4, lxml, Pillow)
           pip install -r requirements.txt
 
       - name: Cache local model
@@ -160,24 +160,35 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v4.0 — REAL PHOTOS ONLY ==="
-          echo "ARCHITECTURE: 4-Level Failover + Real-Photo Pipeline"
+          echo "=== Starting Masha Bot v5.0 — AGGRESSIVE REAL PHOTOS ==="
+          echo "ARCHITECTURE: 4-Level Failover + Aggressive Real-Photo Pipeline"
           echo "  Level 0: LOCAL Qwen3-4B (4B params, Q4_K_M, CPU, n_ctx=16384) — chat & comments"
           echo "  Level 1: Pollinations (key) — all routes, 60+ models"
           echo "  Level 2: Pollinations FREE — fallback, no auth"
           echo "  Level 3: Cloudflare Workers AI — Mistral Small 3.1, 20K req/day"
+          echo "  Level 3.5: HuggingFace Spaces — unlimited free inference"
           echo "  Last resort: Static fallback"
           echo ""
-          echo "IMAGE PIPELINE v4.0:"
-          echo "  1. RSS enclosures + content:encoded (BeautifulSoup parsed)"
-          echo "  2. Article scraping (BeautifulSoup + lxml — 3-5x more reliable)"
-          echo "  3. AI-powered SearXNG search (BMW-specific smart queries)"
-          echo "  4. AI IMAGE GENERATION: DISABLED (ENABLE_AI_IMAGE_GEN=false)"
-          echo "  5. No images -> text-only post (better than fake AI photos)"
+          echo "IMAGE PIPELINE v5.0 — AGGRESSIVE MULTI-ENGINE SEARCH:"
+          echo "  1. Direct URLs from news data (RSS image_urls)"
+          echo "  2. RSS enclosures + content:encoded (BeautifulSoup parsed)"
+          echo "  3. Article scraping (BeautifulSoup + lxml — og:image, twitter:image, JSON-LD)"
+          echo "  4. SearXNG IMAGE search (category=images, multiple instances)"
+          echo "  5. Bing Image Search (direct scraping, photo filter)"
+          echo "  6. Google News RSS (images from news articles)"
+          echo "  7. Unsplash (real photos by real photographers)"
+          echo "  8. Wikimedia Commons (real automotive photos)"
+          echo "  9. Pexels + Pixabay (stock photos, fallback)"
+          echo "  AI IMAGE GENERATION: DISABLED (ENABLE_AI_IMAGE_GEN=false)"
+          echo "  No images after all engines -> broader BMW model search -> text-only last resort"
+          echo ""
+          echo "TELEGRAM LIMITS v5.0:"
+          echo "  Photo caption: 1024 chars (post with photos)"
+          echo "  Text-only: 4096 chars (exceptional valuable posts only)"
+          echo "  Up to 10 photos per post (media group)"
+          echo "  Smart truncation: preserves footer, cuts at sentence boundary"
           echo ""
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
-          echo "CONTENT: BMW-first, RSS + web search, multi-strategy image sourcing"
-          echo "FORMATS: 6 content types for diverse schedule"
           echo "SCHEDULE: 30 min intervals, 3 posts/cycle + partner posts"
           echo ""
 

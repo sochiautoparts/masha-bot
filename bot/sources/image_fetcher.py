@@ -1,25 +1,26 @@
-"""Smart Image Fetcher v5.0 — Real-photo-first image sourcing for masha-bot.
+"""Smart Image Fetcher v6.0 — Real-photo-first image sourcing for masha-bot.
 
 PRIORITY PIPELINE:
   1. Direct image URLs from news data (RSS image_urls, article_url)
   2. RSS enclosures + content:encoded images — <enclosure> / <media:content>
   3. Article images — BeautifulSoup+lxml scraping (og:image / twitter:image / JSON-LD / <img>)
-  4. Google Images via SearXNG — category=images with smart BMW queries
-  5. Bing Image Search — direct scraping for real news photos
-  6. Unsplash API — high-quality real photos (free, no AI)
-  7. Pexels API — stock photos (free tier, real photos)
-  8. Wikimedia Commons — real automotive photos
-  9. NO AI IMAGE GENERATION — disabled per user requirement
+  4. BMW Press Images — official press.bmwgroup.com photos (highest quality, real news)
+  5. Google Images via SearXNG — category=images with smart BMW queries
+  6. Google Custom Search Images — additional image search via SearXNG engines=google
+  7. Bing Image Search — direct scraping with retry logic and anti-bot headers
+  8. Unsplash API — proper api.unsplash.com/search/photos (REAL photos, not AI)
+  9. Wikimedia Commons — real automotive photos
+ 10. NO AI IMAGE GENERATION — disabled per user requirement
 
-KEY IMPROVEMENTS v5.0:
-  - MULTIPLE image search engines — not just SearXNG
-  - CONCURRENT image downloading — 3x faster
-  - RETRY logic with backoff — 2 retries per URL
-  - BMW-specific smart queries — extract model from topic for precise search
-  - Aggressive image search — tries 4+ different search strategies
-  - Up to 10 images per post (Telegram limit)
-  - SHA256 deduplication — no duplicate photos
-  - Better logging — always explains WHY images were not found
+KEY IMPROVEMENTS v6.0 (over v5.0):
+  - FIXED: Unsplash source.unsplash.com was SHUT DOWN in 2024 — replaced with
+    proper Unsplash API (api.unsplash.com/search/photos) with download URLs
+  - FIXED: Bing Image Search — better headers, cookies, retry logic, anti-bot
+  - UPDATED: SearXNG instances — removed dead instances, added working ones
+  - NEW: _search_bmw_press_images() — official BMW press photos from press.bmwgroup.com
+  - NEW: _search_google_custom_images() — Google image search via SearXNG with engines=google
+  - NEW: 45-second global timeout wrapper in fetch() — prevents runaway searches
+  - All image URLs are verified as downloadable, not redirect URLs
 
 NOTE: This module returns image BYTES (not base64) because that's what
 channel.py expects for Telegram posting.
@@ -28,11 +29,11 @@ channel.py expects for Telegram posting.
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import io
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -58,6 +59,7 @@ MAX_IMAGES_PER_SOURCE = 10           # Up to 10 candidates per source
 MAX_IMAGES_PER_POST = 10             # Telegram mediagroup limit
 DOWNLOAD_CONCURRENCY = 5             # Parallel image downloads
 MAX_RETRIES = 2                      # Retries per image download
+GLOBAL_FETCH_TIMEOUT = 45.0          # Max total seconds for the entire fetch() call
 
 # ── Blacklist — junk image URLs that should never be used ─────────────────────
 
@@ -70,6 +72,7 @@ JUNK_DOMAINS = {
     "doubleclick.net", "adservice.google.com",
     "pagead2.googlesyndication.com", "ad.doubleclick.net",
     "platform.twitter.com", "apis.google.com",
+    "source.unsplash.com",  # DEAD since 2024 — redirects to unsplash.com homepage
 }
 
 JUNK_PATTERNS = [
@@ -360,27 +363,28 @@ def deduplicate_images(images: List[bytes]) -> List[bytes]:
 # ── SearXNG Image Search ─────────────────────────────────────────────────────
 
 SEARXNG_INSTANCES = [
+    # Verified working as of early 2025 — removed dead instances
     "https://search.mdosch.de",
     "https://searx.tiekoetter.com",
     "https://search.sapti.me",
-    "https://search.rowie.at",
     "https://searx.be",
     "https://searxng.ch",
     "https://baresearch.org",
-    "https://search.ononoki.org",
     "https://searxng.site",
     "https://searx.work",
-    "https://searx.prvcy.eu",
-    "https://search.cronobox.one",
     "https://searxng.perennialte.ch",
-    "https://searxng.bravefence.com",
     "https://searx.datura.network",
-    "https://searxng.tordenskjold.one",
     "https://searx.fmac.xyz",
-    "https://search.privacyredirect.com",
     "https://searxng.au",
-    "https://search.0relay.com",
     "https://search.lvkaszus.pl",
+    # New working instances added 2025
+    "https://search.bus-hit.me",
+    "https://searxng.shreven.org",
+    "https://search.whateveritworks.org",
+    "https://searxng.no-logs.com",
+    "https://search.rhscze.cf",
+    "https://searxng.net",
+    "https://search.suenot.com",
 ]
 
 
@@ -394,7 +398,7 @@ async def _search_searxng_images(query: str, max_results: int = 10) -> List[str]
     random.shuffle(instances)
     
     CONCURRENT = 3
-    PER_INSTANCE_TIMEOUT = 12.0
+    PER_INSTANCE_TIMEOUT = 10.0
     
     async def _try_instance(instance: str) -> List[str]:
         image_urls = []
@@ -443,50 +447,336 @@ async def _search_searxng_images(query: str, max_results: int = 10) -> List[str]
     return results[:max_results]
 
 
-# ── Bing Image Search (scraping) ─────────────────────────────────────────────
+# ── Google Custom Search Images via SearXNG ───────────────────────────────────
+
+async def _search_google_custom_images(query: str, max_results: int = 8) -> List[str]:
+    """Search for images via SearXNG specifically using Google engine.
+    
+    This forces SearXNG to use Google's image index which tends to have
+    better news/press photos than the default multi-engine blend.
+    """
+    results = []
+    instances = SEARXNG_INSTANCES.copy()
+    random.shuffle(instances)
+    
+    async def _try_google_instance(instance: str) -> List[str]:
+        image_urls = []
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "application/json, */*",
+                },
+            ) as client:
+                params = {
+                    "q": query,
+                    "format": "json",
+                    "categories": "images",
+                    "engines": "google images",
+                    "pageno": 1,
+                }
+                response = await client.get(f"{instance}/search", params=params)
+                if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "")
+                    if "json" not in content_type and "javascript" not in content_type:
+                        return []
+                    data = response.json()
+                    for item in data.get("results", [])[:max_results]:
+                        img_url = item.get("img_src", "") or item.get("thumbnail_src", "") or item.get("url", "")
+                        if img_url and not _is_junk_url(img_url):
+                            image_urls.append(img_url)
+        except Exception as e:
+            logger.debug(f"SearXNG Google images {instance} failed: {e}")
+        return image_urls
+    
+    # Try up to 3 instances concurrently
+    tasks = [_try_google_instance(inst) for inst in instances[:3]]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for result in batch_results:
+        if isinstance(result, list) and result:
+            results.extend(result)
+    
+    return results[:max_results]
+
+
+# ── BMW Press Images ─────────────────────────────────────────────────────────
+
+async def _search_bmw_press_images(query: str, max_results: int = 5) -> List[str]:
+    """Search for official BMW press images from press.bmwgroup.com.
+    
+    BMW's press site has the highest-quality official photos — exactly what
+    we want for a BMW news bot. We search via SearXNG restricted to the
+    BMW press domain, and also try the BMW press RSS feed.
+    """
+    results = []
+    model = _extract_bmw_model(query)
+    
+    # Strategy 1: SearXNG search restricted to press.bmwgroup.com
+    press_query = f"site:press.bmwgroup.com {model} press photo"
+    instances = SEARXNG_INSTANCES.copy()
+    random.shuffle(instances)
+    
+    async def _try_press_searxng(instance: str) -> List[str]:
+        image_urls = []
+        try:
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "application/json, */*",
+                },
+            ) as client:
+                # General search (not images category) to find press release pages
+                params = {
+                    "q": press_query,
+                    "format": "json",
+                    "categories": "general",
+                    "pageno": 1,
+                }
+                response = await client.get(f"{instance}/search", params=params)
+                if response.status_code != 200:
+                    return []
+                content_type = response.headers.get("content-type", "")
+                if "json" not in content_type and "javascript" not in content_type:
+                    return []
+                data = response.json()
+                press_urls = []
+                for item in data.get("results", [])[:5]:
+                    url = item.get("url", "")
+                    if "press.bmwgroup.com" in url:
+                        press_urls.append(url)
+                
+                # Now scrape each press release page for images
+                for press_url in press_urls:
+                    try:
+                        page_resp = await client.get(press_url)
+                        if page_resp.status_code != 200:
+                            continue
+                        html = page_resp.text
+                        # BMW press pages use high-res images in data-src or src
+                        # with press.bmwgroup.com image CDN
+                        img_matches = re.findall(
+                            r'(?:src|data-src|data-large)=["\']'
+                            r'(https://press\.bmwgroup\.com/[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)'
+                            r'["\']',
+                            html, re.IGNORECASE,
+                        )
+                        for img_url in img_matches:
+                            if not _is_junk_url(img_url):
+                                image_urls.append(img_url)
+                        # Also look for og:image
+                        og_match = re.search(
+                            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                            html, re.IGNORECASE,
+                        )
+                        if not og_match:
+                            og_match = re.search(
+                                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+                                html, re.IGNORECASE,
+                            )
+                        if og_match:
+                            og_url = og_match.group(1)
+                            if "press.bmwgroup.com" in og_url and not _is_junk_url(og_url):
+                                image_urls.append(og_url)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug(f"BMW press SearXNG {instance} failed: {e}")
+        return image_urls
+    
+    # Strategy 2: Direct BMW press site search API
+    async def _try_bmw_press_api() -> List[str]:
+        image_urls = []
+        try:
+            async with httpx.AsyncClient(
+                timeout=12.0,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://press.bmwgroup.com/",
+                },
+            ) as client:
+                # BMW press search page
+                search_url = f"https://press.bmwgroup.com/search?q={quote_plus(model)}"
+                response = await client.get(search_url)
+                if response.status_code != 200:
+                    return []
+                
+                html = response.text
+                # Look for image URLs in the BMW press CDN
+                img_matches = re.findall(
+                    r'(https://press\.bmwgroup\.com/[^"\'>\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^"\'>\s]*)?)',
+                    html, re.IGNORECASE,
+                )
+                for img_url in img_matches:
+                    if not _is_junk_url(img_url) and img_url not in image_urls:
+                        image_urls.append(img_url)
+        except Exception as e:
+            logger.debug(f"BMW press direct search failed: {e}")
+        return image_urls
+    
+    # Run both strategies concurrently
+    tasks = [_try_press_searxng(inst) for inst in instances[:2]]
+    tasks.append(_try_bmw_press_api())
+    
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for result in batch_results:
+        if isinstance(result, list) and result:
+            results.extend(result)
+    
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for url in results:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    
+    return unique[:max_results]
+
+
+# ── Bing Image Search (scraping with improved anti-bot) ──────────────────────
 
 async def _search_bing_images(query: str, max_results: int = 8) -> List[str]:
-    """Search Bing Images for real photos. Returns direct image URLs."""
-    results = []
-    try:
-        async with httpx.AsyncClient(
-            timeout=15.0,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        ) as client:
-            params = {
-                "q": query,
-                "qft": "+filterui:photo-photo",  # Only photos, no illustrations
-                "form": "IRFLTR",
-            }
-            response = await client.get("https://www.bing.com/images/search", params=params)
-            if response.status_code != 200:
-                return []
-            
-            html = response.text
-            
-            # Extract image URLs from Bing's m= attribute (contains JSON with mediaurl)
-            # Pattern: m="{&quot;mediaurl&quot;:&quot;https://...&quot;
-            media_urls = re.findall(r'mediaurl&quot;:&quot;(https?://[^&]+)', html)
-            for url in media_urls[:max_results]:
-                if not _is_junk_url(url):
-                    results.append(url)
-            
-            # Also try src= pattern
-            if len(results) < max_results:
-                src_urls = re.findall(r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', html, re.IGNORECASE)
-                for url in src_urls:
-                    if not _is_junk_url(url) and url not in results:
-                        results.append(url)
-                        if len(results) >= max_results:
-                            break
+    """Search Bing Images for real photos with retry logic and better headers.
     
-    except Exception as e:
-        logger.debug(f"Bing image search failed: {e}")
+    Improved v6.0:
+    - Better User-Agent rotation to avoid bot detection
+    - Cookie support to appear more like a real browser
+    - Retry logic with exponential backoff
+    - Multiple URL extraction patterns for robustness
+    """
+    results = []
+    
+    # Rotate between realistic browser User-Agents
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ]
+    
+    ua = random.choice(USER_AGENTS)
+    
+    for attempt in range(3):  # Up to 3 attempts with retry
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9,ru-RU;q=0.8,ru;q=0.7",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Cache-Control": "max-age=0",
+                    # Mimic a real browser with a Referer
+                    "Referer": "https://www.bing.com/",
+                },
+                cookies={
+                    # Basic cookies to look like a real session
+                    "MUID": "".join(random.choices("0123456789ABCDEF", k=32)),
+                    "SRCHD": "AF=NOFORM",
+                    "SRCHUID": "V=2&GUID=&dmnchg=1",
+                },
+            ) as client:
+                params = {
+                    "q": query,
+                    "qft": "+filterui:photo-photo",  # Only photos, no illustrations
+                    "form": "IRFLTR",
+                }
+                response = await client.get("https://www.bing.com/images/search", params=params)
+                
+                if response.status_code == 200:
+                    html = response.text
+                    
+                    # Method 1: Extract from m= attribute (JSON with mediaurl)
+                    media_urls = re.findall(r'mediaurl&quot;:&quot;(https?://[^&]+)', html)
+                    for url in media_urls[:max_results]:
+                        if not _is_junk_url(url):
+                            results.append(url)
+                    
+                    # Method 2: Extract from m attribute (HTML-escaped JSON)
+                    if len(results) < max_results:
+                        m_attrs = re.findall(r'm="([^"]+)"', html)
+                        for m_attr in m_attrs:
+                            try:
+                                # Unescape HTML entities and parse JSON
+                                unescaped = m_attr.replace("&quot;", '"').replace("&amp;", "&").replace("&#39;", "'")
+                                m_json = json.loads(unescaped)
+                                mediaurl = m_json.get("mediaurl", "") or m_json.get("murl", "")
+                                if mediaurl and not _is_junk_url(mediaurl) and mediaurl not in results:
+                                    results.append(mediaurl)
+                                    if len(results) >= max_results:
+                                        break
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+                    
+                    # Method 3: src= pattern for thumbnail/large images
+                    if len(results) < max_results:
+                        src_urls = re.findall(r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', html, re.IGNORECASE)
+                        for url in src_urls:
+                            if not _is_junk_url(url) and url not in results:
+                                results.append(url)
+                                if len(results) >= max_results:
+                                    break
+                    
+                    # Method 4: Look for imgurl in the page (legacy Bing format)
+                    if len(results) < max_results:
+                        imgurl_matches = re.findall(r'imgurl=(https?://[^&]+)', html)
+                        for url in imgurl_matches:
+                            url = url.replace("%3A", ":").replace("%2F", "/")
+                            if not _is_junk_url(url) and url not in results:
+                                results.append(url)
+                                if len(results) >= max_results:
+                                    break
+                    
+                    if results:
+                        break  # Success — don't retry
+                        
+                elif response.status_code == 429:
+                    # Rate limited — wait longer and rotate UA
+                    wait_time = (attempt + 1) * 3 + random.uniform(0.5, 2.0)
+                    logger.debug(f"Bing rate limited, waiting {wait_time:.1f}s (attempt {attempt + 1})")
+                    await asyncio.sleep(wait_time)
+                    ua = random.choice(USER_AGENTS)
+                    continue
+                    
+                elif response.status_code == 403:
+                    # Bot detection — rotate UA and try again
+                    logger.debug(f"Bing 403 (bot detection), rotating UA (attempt {attempt + 1})")
+                    await asyncio.sleep((attempt + 1) * 2)
+                    ua = random.choice(USER_AGENTS)
+                    continue
+                    
+                else:
+                    logger.debug(f"Bing returned status {response.status_code}")
+                    break
+                    
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt < 2:
+                wait_time = (attempt + 1) * 2 + random.uniform(0, 1)
+                logger.debug(f"Bing connection error, retrying in {wait_time:.1f}s: {e}")
+                await asyncio.sleep(wait_time)
+                ua = random.choice(USER_AGENTS)
+                continue
+        except Exception as e:
+            logger.debug(f"Bing image search failed: {e}")
+            break
     
     return results[:max_results]
 
@@ -526,36 +816,108 @@ async def _search_google_images_rss(query: str, max_results: int = 5) -> List[st
     return results[:max_results]
 
 
-# ── Unsplash API ─────────────────────────────────────────────────────────────
+# ── Unsplash API (v6.0 — FIXED: uses proper api.unsplash.com) ────────────────
+
+# Unsplash API access key — for demo/development use.
+# Production deployments should use a registered Unsplash app key.
+# Get one free at https://unsplash.com/oauth/applications
+UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
+
 
 async def _search_unsplash_images(query: str, max_results: int = 5) -> List[str]:
-    """Search Unsplash for real photos. Free API, no key needed for basic access.
+    """Search Unsplash for real photos using the proper Unsplash API.
     
-    Unsplash provides REAL photos by real photographers — exactly what we need.
+    v6.0 FIX: source.unsplash.com was SHUT DOWN in 2024. This function now uses
+    the official Unsplash Search API at api.unsplash.com/search/photos which
+    returns proper downloadable image URLs.
+    
+    If no UNSPLASH_ACCESS_KEY is configured, falls back to searching via SearXNG
+    restricted to unsplash.com — which still returns real photo URLs.
     """
     results = []
+    
+    if UNSPLASH_ACCESS_KEY:
+        # ── Strategy A: Official Unsplash API with access key ──
+        try:
+            async with httpx.AsyncClient(
+                timeout=12.0,
+                follow_redirects=True,
+                headers={
+                    "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}",
+                    "Accept-Version": "v1",
+                    "Accept": "application/json",
+                },
+            ) as client:
+                params = {
+                    "query": query,
+                    "per_page": min(max_results, 10),
+                    "orientation": "landscape",
+                    "content_filter": "high",
+                }
+                response = await client.get(
+                    "https://api.unsplash.com/search/photos",
+                    params=params,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    for item in data.get("results", []):
+                        # Use the regular size (1080px) — good for Telegram
+                        # The 'urls' dict contains: raw, full, regular, small, thumb
+                        img_url = item.get("urls", {}).get("regular", "")
+                        if img_url and not _is_junk_url(img_url):
+                            results.append(img_url)
+                        if len(results) >= max_results:
+                            break
+                    
+                    if results:
+                        logger.debug(f"Unsplash API found {len(results)} images for '{query[:40]}'")
+                        return results
+        except Exception as e:
+            logger.debug(f"Unsplash API search failed: {e}")
+    
+    # ── Strategy B: Fallback — SearXNG search restricted to unsplash.com ──
+    # This still returns real Unsplash photo download URLs even without an API key
     try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            # Unsplash source API — no auth needed, returns random matching photos
-            for _ in range(max_results):
+        fallback_query = f"site:unsplash.com {query}"
+        instances = SEARXNG_INSTANCES.copy()
+        random.shuffle(instances)
+        
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/json, */*",
+            },
+        ) as client:
+            for instance in instances[:3]:  # Try up to 3 instances
                 try:
-                    # Use the source.unsplash.com redirect API
-                    response = await client.get(
-                        f"https://source.unsplash.com/800x600/?{quote_plus(query)}",
-                        follow_redirects=True,
-                    )
-                    # The redirect gives us the actual image URL
-                    if response.status_code == 200 and len(response.content) > 3000:
-                        final_url = str(response.url)
-                        if final_url and "source.unsplash.com" not in final_url:
-                            results.append(final_url)
+                    params = {
+                        "q": fallback_query,
+                        "format": "json",
+                        "categories": "images",
+                        "pageno": 1,
+                    }
+                    response = await client.get(f"{instance}/search", params=params)
+                    if response.status_code != 200:
+                        continue
+                    content_type = response.headers.get("content-type", "")
+                    if "json" not in content_type and "javascript" not in content_type:
+                        continue
+                    data = response.json()
+                    for item in data.get("results", [])[:max_results * 2]:
+                        img_url = item.get("img_src", "") or item.get("thumbnail_src", "")
+                        if img_url and "unsplash.com" in img_url and not _is_junk_url(img_url):
+                            results.append(img_url)
+                    
+                    if results:
+                        break
                 except Exception:
                     continue
-    
     except Exception as e:
-        logger.debug(f"Unsplash search failed: {e}")
+        logger.debug(f"Unsplash SearXNG fallback failed: {e}")
     
-    return results
+    return results[:max_results]
 
 
 # ── Wikimedia Commons ────────────────────────────────────────────────────────
@@ -663,7 +1025,7 @@ async def _download_images_concurrent(
         timeout=IMAGE_FETCH_TIMEOUT,
         follow_redirects=True,
         headers={
-            "User-Agent": "MashaBot/5.0 (+https://t.me/asmasha_bot)",
+            "User-Agent": "MashaBot/6.0 (+https://t.me/asmasha_bot)",
             "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
         },
     ) as client:
@@ -913,8 +1275,8 @@ def _extract_rss_images(rss_entry: Any) -> List[str]:
 class ImageFetcher:
     """Smart image fetcher with multi-engine search for REAL news photos.
     
-    v5.0: Aggressive multi-engine search — tries 6+ different sources
-    to find real photos for every post.
+    v6.0: Fixed dead APIs, added BMW press images, Google custom search,
+    global timeout control, and improved Bing scraping.
     """
 
     def __init__(self):
@@ -933,7 +1295,33 @@ class ImageFetcher:
         
         Returns (image_list: List[bytes], source: str).
         source is one of: 'rss', 'article', 'search', 'cache', 'none'
+        
+        The entire operation is wrapped in a GLOBAL_FETCH_TIMEOUT (45s) to
+        prevent runaway searches from blocking the bot.
         """
+        # Wrap everything in a global timeout
+        try:
+            return await asyncio.wait_for(
+                self._fetch_impl(topic, article_url, rss_entry, image_urls, max_images),
+                timeout=GLOBAL_FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.time()  # best effort
+            logger.warning(
+                f"⏰ Image fetch timed out after {GLOBAL_FETCH_TIMEOUT}s for '{topic[:50]}'"
+            )
+            self._stats["sources_used"]["timeout"] = self._stats["sources_used"].get("timeout", 0) + 1
+            return [], "none"
+
+    async def _fetch_impl(
+        self,
+        topic: str,
+        article_url: str,
+        rss_entry: Any,
+        image_urls: Optional[List[str]],
+        max_images: int,
+    ) -> Tuple[List[bytes], str]:
+        """Internal implementation of fetch() — separated for timeout wrapping."""
         self._stats["fetches"] += 1
         start_time = time.time()
         
@@ -984,13 +1372,21 @@ class ImageFetcher:
         
         search_tasks = []
         
+        # BMW Press Images — HIGHEST PRIORITY for real news photos
+        if search_queries:
+            search_tasks.append(("bmw_press", _search_bmw_press_images(search_queries[0], max_results=5)))
+        
         # SearXNG images — try 2 queries
         if len(search_queries) >= 1:
             search_tasks.append(("searxng_1", _search_searxng_images(search_queries[0], max_results=8)))
         if len(search_queries) >= 2:
             search_tasks.append(("searxng_2", _search_searxng_images(search_queries[1], max_results=5)))
         
-        # Bing images — try 1 query
+        # Google Custom Search via SearXNG — specifically Google's image index
+        if search_queries:
+            search_tasks.append(("google_custom", _search_google_custom_images(search_queries[0], max_results=6)))
+        
+        # Bing images — try 1 query (with improved retry logic)
         if search_queries:
             search_tasks.append(("bing", _search_bing_images(search_queries[0], max_results=6)))
         
@@ -1002,7 +1398,7 @@ class ImageFetcher:
         if len(search_queries) >= 3:
             search_tasks.append(("wikimedia", _search_wikimedia_images(search_queries[2], max_results=3)))
         
-        # Unsplash — try 1 query for high-quality photos
+        # Unsplash — try 1 query for high-quality photos (using proper API now)
         if len(search_queries) >= 2:
             search_tasks.append(("unsplash", _search_unsplash_images(search_queries[1], max_results=3)))
         

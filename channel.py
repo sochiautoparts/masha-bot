@@ -4,11 +4,12 @@ Handles news posts, partner posts, scheduled content, reactions,
 media, polls, and internet news search.
 Properly enforces Telegram character limits: 1024 with media, 4096 without.
 
-v2.0 KEY CHANGES:
+v3.0 KEY CHANGES:
 - PRIORITIZE real photos from news sources (up to 10 per post)
 - Enhanced article scraping (og:image + twitter:image + article body <img>)
-- Web search image enrichment BEFORE AI generation
-- Allow text-only posts as last resort (channel silence is worse)
+- Web search image enrichment (SearXNG, Pexels, Pixabay, Wikimedia)
+- AI-GENERATED IMAGES ARE FORBIDDEN — real photos only
+- Text-only posts ONLY for exceptionally valuable content (interest_score >= 0.6)
 - Strip "🔥 Мнение Маши" banned headings from post text
 - Support up to 10 media files per Telegram post
 """
@@ -21,7 +22,6 @@ import tempfile
 import os
 import re
 import hashlib
-from urllib.parse import quote
 import httpx
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
@@ -485,7 +485,6 @@ class ChannelManager:
         "openai-large", "mistral-large", "deepseek",
         "openai", "llama", "mistral", "deepseek-r1",
         "qwen-coder", "llama-scale",
-        # REMOVED: "searchgpt" — invalid on gen.pollinations.ai (400 errors)
     ]
 
     def set_bot(self, bot: Bot) -> None:
@@ -784,145 +783,16 @@ class ChannelManager:
             logger.debug(f"Wikimedia image fetch error: {e}")
         return images
 
-    async def _fetch_stock_bmw_images(self) -> List[bytes]:
-        """Fetch a BMW stock photo from reliable public URLs as ultimate fallback."""
-        images = []
-        
-        bmw_prompts = [
-            "BMW M5 F90 Competition, front three-quarter view, professional automotive photography, dramatic lighting, 4k, no text",
-            "BMW M3 G80, side profile, studio lighting, M Performance, no text",
-            "BMW X5 M Competition, dynamic shot, professional car photography, no text",
-        ]
-        prompt = random.choice(bmw_prompts)
-        seed = random.randint(1, 999999)
-        
-        try:
-            encoded_prompt = quote(prompt, safe="")
-            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            params = {
-                "width": 1024,
-                "height": 768,
-                "model": "flux",
-                "nologo": "true",
-                "enhance": "true",
-                "seed": seed,
-            }
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                response = await client.get(url, params=params)
-                if response.status_code == 200 and len(response.content) > 5000:
-                    if self._is_content_image(response.content):
-                        images.append(response.content)
-                        logger.info(f"Stock BMW image from Pollinations: seed={seed} ({len(response.content)} bytes)")
-                        return images
-        except Exception as e:
-            logger.debug(f"Stock Pollinations image failed: {e}")
-        
-        # Public BMW press images
-        stock_urls = [
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/automotive-life/bmw-m-1000-xr/bmw-m-1000-xr-stage-teaser-hd.jpg",
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m3-cs-stage-teaser-hd.jpg",
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m5-stage-teaser-hd.jpg",
-        ]
-        
-        for url in stock_urls:
-            try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    response = await client.get(url, headers={
-                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
-                    })
-                    if response.status_code == 200 and len(response.content) > 5000:
-                        if self._is_content_image(response.content):
-                            images.append(response.content)
-                            logger.info(f"Stock BMW image downloaded from URL ({len(response.content)} bytes)")
-                            return images
-            except Exception:
-                continue
-        
-        return images
+    # ── AI IMAGE GENERATION METHODS — REMOVED ───────────────────────────
+    # _fetch_stock_bmw_images()  — REMOVED: used Pollinations AI (FORBIDDEN)
+    # _ai_response_to_bytes()    — REMOVED: only used by AI image generation
+    # _generate_post_images()    — REMOVED: generated AI images (FORBIDDEN)
+    #
+    # User requirement: NO AI-GENERATED PHOTOS. Real photos only.
+    # If no real images are found, posts will be published text-only
+    # (only for high-interest content, interest_score >= 0.6).
 
-    @staticmethod
-    def _ai_response_to_bytes(response) -> Optional[bytes]:
-        """Convert AIResponse from generate_image to raw bytes.
-        
-        generate_image() returns AIResponse with image_b64 (base64) or image_url,
-        NOT raw bytes. This helper extracts the actual image bytes.
-        """
-        if response is None:
-            return None
-        # If it's already bytes, return as-is
-        if isinstance(response, bytes):
-            return response
-        # AIResponse object — extract image data
-        try:
-            from ai.providers.base import AIResponse
-            if isinstance(response, AIResponse):
-                if response.image_b64:
-                    import base64
-                    return base64.b64decode(response.image_b64)
-                if response.image_url:
-                    # Download the image from URL
-                    import httpx
-                    try:
-                        r = httpx.get(response.image_url, timeout=30.0, follow_redirects=True)
-                        if r.status_code == 200 and len(r.content) > 1000:
-                            return r.content
-                    except Exception:
-                        pass
-                return None
-        except ImportError:
-            pass
-        # Fallback: if it has image_b64 attribute
-        if hasattr(response, 'image_b64') and response.image_b64:
-            import base64
-            return base64.b64decode(response.image_b64)
-        return None
 
-    async def _generate_post_images(self, news_title: str, count: int = 1) -> List[bytes]:
-        """Generate images for a news post using AI with full fallback chain.
-
-        Tries Pollinations (gen→legacy→retry) then Cloudflare Workers AI (SDXL).
-        Returns list of image BYTES (may be empty if all fail).
-        LIMITED to max 2 model attempts to avoid timeout/OOM on GitHub Actions.
-        """
-        images = []
-        prompts = [
-            f"BMW M5 F90 professional automotive photography: {news_title}. "
-            f"Front three-quarter view, vibrant colors, high quality, dramatic lighting, no text.",
-            f"BMW automotive news illustration: {news_title}. "
-            f"Side profile shot, studio lighting, sleek design, M Power styling, no text.",
-        ]
-        selected_prompts = prompts[:min(count, len(prompts))]
-
-        _IMAGE_MODELS = ["flux", "flux-pro"]
-        attempts = 0
-        max_attempts = 2
-
-        for i, prompt in enumerate(selected_prompts):
-            for img_model in _IMAGE_MODELS:
-                attempts += 1
-                if attempts > max_attempts:
-                    break
-                try:
-                    ai_response = await asyncio.wait_for(
-                        get_ai_router()._primary.generate_image(prompt, model=img_model),
-                        timeout=60.0
-                    )
-                    img_bytes = self._ai_response_to_bytes(ai_response)
-                    if img_bytes:
-                        images.append(img_bytes)
-                        break
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.debug(f"Image gen #{i+1} with {img_model} failed: {e}")
-                    continue
-            if images:
-                break
-            if attempts >= max_attempts:
-                break
-
-        logger.info(f"Generated {len(images)}/{count} AI images for post ({attempts} attempts)")
-        return images
 
     async def _scrape_article_images(self, article_url: str, max_count: int = 10) -> List[bytes]:
         """Scrape images from a news article page.
@@ -1068,17 +938,16 @@ class ChannelManager:
         return images
 
     async def _get_post_images(self, news_item: Dict) -> tuple:
-        """Get images for a news post — REAL photos from news, DEDUPLICATED.
+        """Get images for a news post — REAL photos only, DEDUPLICATED.
 
-        v3.0: Uses ImageFetcher with hash-based deduplication pipeline:
-        1. RSS image URLs — DEDUPLICATED by hash
-        2. RSS enclosures — DEDUPLICATED by hash
-        3. Article page images — DEDUPLICATED
-        4. Image search (SearXNG) — DEDUPLICATED
-        5. AI generation — VERY LAST RESORT, only 1 image
+        v4.0: Real photos only — NO AI-GENERATED IMAGES (user requirement).
+        Pipeline:
+        1. ImageFetcher (RSS, article scraping, SearXNG) — DEDUPLICATED by hash
+        2. Legacy fallback: RSS → article scraping → web search → Pexels/Pixabay/Wikimedia
+        3. If no real images found → return empty list (text-only post)
 
         Returns (image_list: List[bytes], source: str)
-        source is 'rss', 'article', 'search', 'cache', or 'ai' for logging.
+        source is 'rss', 'article', 'search', 'cache', 'pexels', etc.
         Images are deduplicated by SHA256 hash to prevent duplicate photos.
         """
         title = news_item.get("title", "")
@@ -1263,25 +1132,12 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Wikimedia image fetch error: {e}")
 
-        # 7. AI generation — DISABLED by default (user requirement: NO AI-generated photos)
-        # Only enable if ENABLE_AI_IMAGE_GEN env var is explicitly set to "true"
-        _enable_ai_gen = os.environ.get("ENABLE_AI_IMAGE_GEN", "false").lower() == "true"
-        if not image_list and _enable_ai_gen:
-            try:
-                ai_images = await self._generate_post_images(title, count=1)
-                if ai_images:
-                    image_list.extend(ai_images)
-                    source = "ai"
-                    logger.info(f"Generated 1 AI image (ENABLE_AI_IMAGE_GEN=true, no real images for '{title[:50]}')")
-            except Exception as e:
-                logger.warning(f"AI image generation skipped: {e}")
-        elif not image_list:
-            logger.info(f"No real images found for '{title[:50]}' — AI generation DISABLED, post will be text-only")
-
-        # 8. Stock BMW photo fallback — ALSO uses AI generation (Pollinations), so DISABLED
-        # Stock photos that are AI-generated are not real news photos
+        # NO AI IMAGE GENERATION — user requirement: NO AI-generated photos
+        # _generate_post_images() and _fetch_stock_bmw_images() have been removed.
+        # If no real images found, the post will be published as text-only
+        # (only for high-interest content, interest_score >= 0.6).
         if not image_list:
-            logger.info(f"Stock BMW image fallback skipped (AI-generated, not real news photo)")
+            logger.info(f"No real images found for '{title[:50]}' — post will be text-only (AI generation FORBIDDEN)")
 
         # HARD LIMIT: never more than MAX_IMAGES_PER_POST
         image_list = image_list[:MAX_IMAGES_PER_POST]
@@ -1460,7 +1316,8 @@ class ChannelManager:
                     logger.debug(f"Broader image search failed: {e}")
 
                 if not has_media:
-                    # FINAL: No real images found — check if content is valuable enough for text-only
+                    # FINAL: No real images found — ONLY publish text-only for
+                    # exceptionally valuable content (interest_score >= 0.6)
                     interest_score = _score_interest(
                         news_item.get("title", ""),
                         news_item.get("summary", "")
@@ -1471,17 +1328,11 @@ class ChannelManager:
                             f"POSTING TEXT-ONLY: No images but high interest ({interest_score:.2f}). "
                             f"Using 4096 char limit for valuable content."
                         )
-                    elif len(post_text) <= _CAPTION_LIMIT:
-                        # Short post without photo — still publish (silence is worse)
-                        logger.warning(
-                            f"POSTING TEXT-ONLY: Short post without images ({len(post_text)} chars). "
-                            f"Consider adding images manually."
-                        )
                     else:
                         # Not interesting enough + no photo — skip
                         logger.info(
-                            f"SKIPPING: No images + low interest ({interest_score:.2f}) + too long. "
-                            f"Better to wait for next cycle."
+                            f"SKIPPING: No images + low interest ({interest_score:.2f}). "
+                            f"Only posts with interest_score >= 0.6 are published text-only."
                         )
                         return False
 
@@ -1658,14 +1509,9 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Wikimedia fallback for partner {program.name}: {e}")
 
-        # 3. AI generation — DISABLED (user requirement: NO AI-generated photos)
-        # For partner posts, use real images only
+        # NO AI IMAGE GENERATION — user requirement: NO AI-generated photos
         if not image_data:
-            logger.info(f"No real image for partner: {program.name} — posting text-only (AI gen disabled)")
-
-        # 4. Stock BMW image — ALSO uses AI generation (Pollinations), so DISABLED
-        if not image_data:
-            logger.info(f"Stock BMW image fallback skipped for partner {program.name} (AI-generated)")
+            logger.info(f"No real image for partner: {program.name} — posting text-only (AI gen FORBIDDEN)")
 
         try:
             if image_data:

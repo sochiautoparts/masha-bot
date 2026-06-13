@@ -302,13 +302,18 @@ class NewsConfig:
         NewsSource(name="GoogleNewsBMW", url="https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", lang="en", category="bmw"),
         NewsSource(name="GoogleNewsBMWRU", url="https://news.google.com/rss/search?q=БМВ+новости&hl=ru&gl=RU&ceid=RU:ru", lang="ru", category="bmw"),
         # General auto feeds (for BMW-relevant content)
-        NewsSource(name="CarScoops", url="https://www.carscoops.com/feed/", lang="en", category="auto"),
+        # CarScoops returns 403 — replaced with MotorAuthority
+        NewsSource(name="MotorAuthority", url="https://www.motorauthority.com/rss.xml", lang="en", category="auto"),
         NewsSource(name="Autocar", url="https://www.autocar.co.uk/rss", lang="en", category="auto"),
         NewsSource(name="AutoExpress", url="https://www.autoexpress.co.uk/rss", lang="en", category="auto"),
+        NewsSource(name="CarExpert", url="https://carexpert.com.au/feed/", lang="en", category="auto"),
         NewsSource(name="Electrek", url="https://electrek.co/feed/", lang="en", category="auto"),
         NewsSource(name="InsideEVs", url="https://insideevs.com/feed/", lang="en", category="auto"),
-        # Reddit
-        NewsSource(name="RedditBMW", url="https://www.reddit.com/r/BMW/.rss", lang="en", category="reddit"),
+        # Reddit (old.reddit.com for better bot compatibility)
+        NewsSource(name="RedditBMW", url="https://old.reddit.com/r/BMW/.rss", lang="en", category="reddit"),
+        NewsSource(name="Reddcars", url="https://old.reddit.com/r/cars/.rss", lang="en", category="reddit"),
+        NewsSource(name="RedditMotorSport", url="https://old.reddit.com/r/MotorSport/.rss", lang="en", category="reddit"),
+        NewsSource(name="RedditBMWMotorrad", url="https://old.reddit.com/r/BMWMotorrad/.rss", lang="en", category="reddit"),
     ])
 
 

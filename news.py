@@ -1,10 +1,12 @@
 """News fetching, filtering, and dedup for masha-bot.
 
-v4.0: Uses BMWRSSFetcher (updated sources) as primary source.
+v5.0: Uses BMWRSSFetcher for proper concurrent fetching with Reddit stagger.
 Saves image_urls to database for use by channel posting pipeline.
 - Removed: BimmerPost (timeout), Motor1 (404), Reuters (401) — all broken
 - Added: BimmerFile, Google News BMW EN+RU, Autocar, AutoExpress, Reddit r/BMWMotorrad
 - Image URLs are now extracted and saved for every news item
+- CarScoops replaced with MotorAuthority (CarScoops returns 403)
+- Reddit feeds use old.reddit.com with 5-8s stagger to avoid 429
 """
 
 from __future__ import annotations
@@ -40,7 +42,8 @@ async def fetch_bmw_news(
 ) -> list[dict[str, Any]]:
     """Fetch BMW news from RSS sources.
 
-    Uses the same updated RSS sources as BMWRSSFetcher.
+    v5.0: Uses BMWRSSFetcher for proper Reddit rate limiting (staggered delays)
+    instead of sequential fetching which caused 429 errors.
     Returns items with image_urls extracted from RSS entries.
 
     Args:
@@ -53,16 +56,28 @@ async def fetch_bmw_news(
     """
     all_items: list[dict[str, Any]] = []
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=30),
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-    ) as session:
-        for source in BMW_RSS_SOURCES:
-            try:
-                items = await _fetch_rss_source(session, source)
-                all_items.extend(items)
-            except Exception as exc:
-                logger.warning("Failed to fetch %s: %s", source["name"], exc)
+    # Use BMWRSSFetcher for proper concurrent fetching with Reddit stagger
+    try:
+        from bot.sources.rss_fetcher import BMWRSSFetcher
+        fetcher_db = db or Database()
+        fetcher = BMWRSSFetcher(fetcher_db)
+        try:
+            all_items = await fetcher._fetch_all_sources()
+        finally:
+            await fetcher.close()
+    except Exception as exc:
+        logger.warning("BMWRSSFetcher failed, falling back to sequential: %s", exc)
+        # Fallback to sequential (old behavior) if BMWRSSFetcher fails
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
+        ) as session:
+            for source in BMW_RSS_SOURCES:
+                try:
+                    items = await _fetch_rss_source(session, source)
+                    all_items.extend(items)
+                except Exception as exc2:
+                    logger.warning("Failed to fetch %s: %s", source["name"], exc2)
 
     # Filter for BMW relevance
     filtered = []

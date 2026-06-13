@@ -728,34 +728,57 @@ async def search_auto_news() -> List[Dict]:
     return items
 
 
-async def get_best_news_item(items: List[Dict] = None) -> Optional[Dict]:
-    """Select the best news item from candidates using AI interest scoring."""
+async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str] = None) -> Optional[Dict]:
+    """Select the best news item from candidates using AI interest scoring.
+    
+    Args:
+        items: Pre-fetched items. If None, fetches fresh news.
+        exclude_titles: List of titles to exclude (already posted/tried this cycle).
+    """
     if items is None:
         items = await search_auto_news()
 
     if not items:
         return None
 
+    # Build exclusion set from titles already tried this cycle
+    exclude_set = set()
+    if exclude_titles:
+        for t in exclude_titles:
+            # Normalize: lowercase, strip
+            exclude_set.add(t.lower().strip()[:80])
+
     # Score and sort
     scored = []
     for item in items:
-        interest = _score_interest(item["title"], item.get("summary", ""))
+        title = item.get("title", "")
+        
+        # Skip items already tried this cycle (exact match on first 80 chars)
+        if title.lower().strip()[:80] in exclude_set:
+            continue
+        
+        interest = _score_interest(title, item.get("summary", ""))
         freshness = _score_freshness(item.get("published_time", 0))
         total = interest + freshness
         scored.append((total, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Pick from top 5
-    top = scored[:5]
+    if not scored:
+        return None
+
+    # Pick from top 10 (increased from 5 for more variety)
+    top = scored[:10]
     if not top:
         return None
 
-    # Check dedup for top candidates
+    # Check entity dedup for top candidates (topic registry)
+    # Other dedup (exact hash, semantic) is checked by the caller (channel.py)
     for score, item in top:
-        entity_key = _extract_entities(item["title"])
+        entity_key = _extract_entities(item.get("title", ""))
         if not _is_topic_covered(entity_key):
             return item
 
-    # If all top candidates are covered, return highest scoring anyway
+    # If all top candidates are entity-covered, return highest scoring anyway
+    # (the caller will still do its own dedup checks)
     return top[0][1] if top else None

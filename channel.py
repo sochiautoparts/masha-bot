@@ -901,19 +901,25 @@ class ChannelManager:
         if aside:
             context_parts.append(f"Редакционная шутка (используй если уместно): {aside}")
 
-        extra_context = "\n\n".join(context_parts)
+        # Add translation/uniquification hint for English sources
+        lang = news_item.get("lang", "")
+        uniquify_hint = get_translation_uniquification_hint(lang)
+        if uniquify_hint:
+            context_parts.append(uniquify_hint)
+
+        full_context = "\n\n".join(context_parts)
+
+        # Determine content type from news item category
+        content_type = news_item.get("content_type", "news+reaction")
+        if not content_type or content_type in ("auto", "bmw_official", "bmw_community", "bmw_news"):
+            content_type = "news+reaction"
 
         # Generate with AI using persona
         try:
-            full_context = ""
-            if summary:
-                full_context = f"Исходная новость: {summary[:500]}"
-            if extra_context:
-                full_context = (full_context + "\n\n" + extra_context).strip() if full_context else extra_context
-
             response = await get_ai_router().generate_channel_post(
                 topic=title,
                 context=full_context,
+                content_type=content_type,
             )
 
             if response.error or not response.text:
@@ -927,9 +933,14 @@ class ChannelManager:
 
         return text.strip() if text else None
 
-    async def run_scheduled_post(self) -> bool:
+    async def run_scheduled_post(self, exclude_titles: list = None) -> bool | dict:
         """Try to create and post content to the channel.
 
+        v3.2: Retry with different article if dedup blocks the first one.
+        Accepts exclude_titles to avoid re-selecting same article within a cycle.
+        Returns the news_item dict on success (for tracking), True for backward compat,
+        or False on failure.
+        
         v3.0: Simplified image pipeline — only article photos.
         No photo = text-only post. Better no photo than wrong photo.
         """
@@ -945,25 +956,42 @@ class ChannelManager:
                 logger.info("Hourly post limit reached")
                 return False
 
-            # Get best news item
-            news_item = await get_best_news_item()
-            if not news_item:
-                logger.info("No suitable news item found")
-                return False
+            # Build list of titles to exclude (passed in + any we try and fail)
+            tried_titles = list(exclude_titles) if exclude_titles else []
+            max_retries = 5  # Try up to 5 different articles before giving up
 
-            # Check dedup
-            if await is_duplicate_post(news_item["title"], hours=48):
-                logger.info(f"Duplicate post: {news_item['title'][:60]}")
-                return False
+            for attempt in range(max_retries):
+                # Get best news item — pass exclude_titles to avoid re-selecting
+                news_item = await get_best_news_item(exclude_titles=tried_titles)
+                if not news_item:
+                    logger.info("No suitable news item found after exclusions")
+                    return False
 
-            if _is_semantically_duplicate(news_item["title"]):
-                logger.info(f"Semantic duplicate: {news_item['title'][:60]}")
-                return False
+                title = news_item.get("title", "")
 
-            # Entity dedup
-            entity_key = _extract_entities(news_item["title"])
-            if _is_topic_covered(entity_key):
-                logger.info(f"Topic already covered: {entity_key}")
+                # Check dedup — if blocked, add to tried list and try next article
+                if await is_duplicate_post(title, hours=48):
+                    logger.info(f"Duplicate post (attempt {attempt+1}): {title[:60]}")
+                    tried_titles.append(title)
+                    continue
+
+                if _is_semantically_duplicate(title):
+                    logger.info(f"Semantic duplicate (attempt {attempt+1}): {title[:60]}")
+                    tried_titles.append(title)
+                    continue
+
+                # Entity dedup
+                entity_key = _extract_entities(title)
+                if _is_topic_covered(entity_key):
+                    logger.info(f"Topic already covered (attempt {attempt+1}): {entity_key}")
+                    tried_titles.append(title)
+                    continue
+
+                # Found a non-duplicate item! Proceed with posting.
+                break
+            else:
+                # All retries exhausted
+                logger.info(f"All {max_retries} attempts blocked by dedup")
                 return False
 
             # Generate post text
@@ -1110,7 +1138,7 @@ class ChannelManager:
                     _record_post_title(news_item["title"])
 
                     logger.info(f"✅ Post published: {news_item['title'][:60]} (images={media_count}, source={image_source})")
-                    return True
+                    return news_item  # Return news_item for cycle tracking
 
             except Exception as e:
                 logger.error(f"Error posting to channel: {e}")

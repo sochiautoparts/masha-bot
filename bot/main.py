@@ -232,6 +232,8 @@ class BackgroundTasks:
         1st post: news or partner content
         2nd post: a DIFFERENT news item (different topic)
         3rd post: another DIFFERENT news item (different topic)
+        
+        Tracks tried titles per cycle to avoid re-selecting the same article.
         """
         await asyncio.sleep(30)
         
@@ -241,12 +243,18 @@ class BackgroundTasks:
 
         while self._running:
             posts_this_cycle = 0
+            tried_titles_this_cycle = []  # Track titles tried this cycle
             logger.info(f"Channel poster: starting new cycle (consecutive_empty={consecutive_empty_cycles})")
             for post_num in range(3):
                 try:
-                    posted = await channel_manager.run_scheduled_post()
+                    posted = await channel_manager.run_scheduled_post(
+                        exclude_titles=tried_titles_this_cycle
+                    )
                     if posted:
                         posts_this_cycle += 1
+                        # Record the posted title so we don't try it again this cycle
+                        if isinstance(posted, dict) and posted.get("title"):
+                            tried_titles_this_cycle.append(posted["title"])
                         logger.info(f"Channel poster: post {post_num + 1}/3 published successfully")
                         if post_num < 2:
                             gap = random.randint(60, 120)

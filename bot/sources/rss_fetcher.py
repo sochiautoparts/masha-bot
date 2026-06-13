@@ -36,17 +36,19 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "Google News BMW", "url": "https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
     {"name": "Google News BMW RU", "url": "https://news.google.com/rss/search?q=%D0%91%D0%9C%D0%92+%D0%BD%D0%BE%D0%B2%D0%BE%D1%81%D1%82%D0%B8&hl=ru&gl=RU&ceid=RU:ru", "category": "bmw_news"},
     # ── General auto with BMW coverage ──────────────────────────────────────
-    {"name": "CarScoops", "url": "https://www.carscoops.com/feed/", "category": "general_auto"},
+    # CarScoops returns 403 — replaced with MotorAuthority (verified working)
+    {"name": "MotorAuthority", "url": "https://www.motorauthority.com/rss.xml", "category": "general_auto"},
     {"name": "Autocar", "url": "https://www.autocar.co.uk/rss", "category": "general_auto"},
     {"name": "AutoExpress", "url": "https://www.autoexpress.co.uk/rss", "category": "general_auto"},
+    {"name": "CarExpert", "url": "https://carexpert.com.au/feed/", "category": "general_auto"},
     # ── Electric / EV ──────────────────────────────────────────────────────
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
     {"name": "InsideEVs", "url": "https://insideevs.com/feed/", "category": "electric"},
-    # ── Reddit ──────────────────────────────────────────────────────────────
-    {"name": "Reddit r/BMW", "url": "https://www.reddit.com/r/BMW/.rss", "category": "reddit"},
-    {"name": "Reddit r/cars", "url": "https://www.reddit.com/r/cars/.rss", "category": "reddit"},
-    {"name": "Reddit r/MotorSport", "url": "https://www.reddit.com/r/MotorSport/.rss", "category": "reddit"},
-    {"name": "Reddit r/BMWMotorrad", "url": "https://www.reddit.com/r/BMWMotorrad/.rss", "category": "bmw_motorrad"},
+    # ── Reddit (use old.reddit.com for better bot compatibility) ──────────
+    {"name": "Reddit r/BMW", "url": "https://old.reddit.com/r/BMW/.rss", "category": "reddit"},
+    {"name": "Reddit r/cars", "url": "https://old.reddit.com/r/cars/.rss", "category": "reddit"},
+    {"name": "Reddit r/MotorSport", "url": "https://old.reddit.com/r/MotorSport/.rss", "category": "reddit"},
+    {"name": "Reddit r/BMWMotorrad", "url": "https://old.reddit.com/r/BMWMotorrad/.rss", "category": "bmw_motorrad"},
 ]
 
 # ── BMW-focused search queries ────────────────────────────────────────────────
@@ -130,7 +132,11 @@ class BMWRSSFetcher:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30),
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                },
             )
         return self._session
 
@@ -191,9 +197,9 @@ class BMWRSSFetcher:
 
         async def _safe_fetch(source: dict[str, str]) -> list[dict[str, Any]]:
             try:
-                # Reddit rate-limits concurrent requests — add 1-2s stagger
+                # Reddit aggressively rate-limits — add 5-8s stagger between requests
                 if "reddit.com" in source["url"]:
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                    await asyncio.sleep(random.uniform(5.0, 8.0))
                 return await self._fetch_rss(source)
             except Exception as exc:
                 logger.warning("Failed to fetch from %s: %s", source["name"], exc)

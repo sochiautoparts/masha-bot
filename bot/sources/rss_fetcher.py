@@ -2,6 +2,12 @@
 
 BMW-focused RSS sources and search queries for content sourcing.
 
+v3.0: Replaced all broken/404/timeout RSS sources with verified working feeds.
+- Removed: BimmerPost (timeout), BMW Motorrad (timeout), BMW Group Press (404),
+  TopSpeed BMW (404), Motor1 (404), Reuters Auto (401)
+- Fixed: CarScoops (/category/bmw/ → /feed/), InsideEVs (/rss/feed/ → /feed/)
+- Added: BimmerFile, Google News BMW (EN+RU), Autocar, AutoExpress,
+  Reddit r/BMWMotorrad
 v2.0: Now extracts image URLs from RSS enclosures, media:content,
 and article <img> tags for original-first image sourcing.
 """
@@ -24,22 +30,23 @@ logger = logging.getLogger(__name__)
 # ── BMW-focused RSS sources ───────────────────────────────────────────────────
 
 BMW_RSS_SOURCES: list[dict[str, str]] = [
-    # BMW-specific
+    # ── BMW-specific (highest priority) ─────────────────────────────────────
     {"name": "BMW Blog", "url": "https://bmwblog.com/feed/", "category": "bmw_official"},
-    {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "category": "bmw_community"},
-    {"name": "BMW Motorrad", "url": "https://www.bmw-motorrad.com/en/rss/feed.xml", "category": "bmw_motorrad"},
-    {"name": "BMW Group Press", "url": "https://www.press.bmwgroup.com/global/rss.xml", "category": "bmw_official"},
-    {"name": "CarScoops BMW", "url": "https://www.carscoops.com/category/bmw/feed/", "category": "bmw_news"},
-    {"name": "TopSpeed BMW", "url": "https://www.topspeed.com/cars/bmw/rss/", "category": "bmw_news"},
-    # General auto with BMW coverage
-    {"name": "Motor1", "url": "https://www.motor1.com/rss/feed/", "category": "general_auto"},
-    {"name": "Reuters Auto", "url": "https://www.reuters.com/rssFeed/automobilesNews", "category": "news"},
+    {"name": "BimmerFile", "url": "https://bimmerfile.com/feed/", "category": "bmw_community"},
+    {"name": "Google News BMW", "url": "https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
+    {"name": "Google News BMW RU", "url": "https://news.google.com/rss/search?q=%D0%91%D0%9C%D0%92+%D0%BD%D0%BE%D0%B2%D0%BE%D1%81%D1%82%D0%B8&hl=ru&gl=RU&ceid=RU:ru", "category": "bmw_news"},
+    # ── General auto with BMW coverage ──────────────────────────────────────
+    {"name": "CarScoops", "url": "https://www.carscoops.com/feed/", "category": "general_auto"},
+    {"name": "Autocar", "url": "https://www.autocar.co.uk/rss", "category": "general_auto"},
+    {"name": "AutoExpress", "url": "https://www.autoexpress.co.uk/rss", "category": "general_auto"},
+    # ── Electric / EV ──────────────────────────────────────────────────────
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
-    {"name": "InsideEVs", "url": "https://insideevs.com/rss/feed/", "category": "electric"},
-    # Reddit
+    {"name": "InsideEVs", "url": "https://insideevs.com/feed/", "category": "electric"},
+    # ── Reddit ──────────────────────────────────────────────────────────────
     {"name": "Reddit r/BMW", "url": "https://www.reddit.com/r/BMW/.rss", "category": "reddit"},
     {"name": "Reddit r/cars", "url": "https://www.reddit.com/r/cars/.rss", "category": "reddit"},
     {"name": "Reddit r/MotorSport", "url": "https://www.reddit.com/r/MotorSport/.rss", "category": "reddit"},
+    {"name": "Reddit r/BMWMotorrad", "url": "https://www.reddit.com/r/BMWMotorrad/.rss", "category": "bmw_motorrad"},
 ]
 
 # ── BMW-focused search queries ────────────────────────────────────────────────
@@ -173,15 +180,22 @@ class BMWRSSFetcher:
         return relevant
 
     async def _fetch_all_sources(self) -> list[dict[str, Any]]:
-        """Fetch items from all RSS sources."""
+        """Fetch items from all RSS sources concurrently."""
+        import asyncio
+
         all_items: list[dict[str, Any]] = []
 
-        for source in BMW_RSS_SOURCES:
+        async def _safe_fetch(source: dict[str, str]) -> list[dict[str, Any]]:
             try:
-                items = await self._fetch_rss(source)
-                all_items.extend(items)
+                return await self._fetch_rss(source)
             except Exception as exc:
                 logger.warning("Failed to fetch from %s: %s", source["name"], exc)
+                return []
+
+        # Fetch all sources concurrently (3x faster than sequential)
+        results = await asyncio.gather(*[_safe_fetch(s) for s in BMW_RSS_SOURCES])
+        for items in results:
+            all_items.extend(items)
 
         # Sort by date (newest first)
         all_items.sort(
@@ -193,6 +207,9 @@ class BMWRSSFetcher:
         """Fetch and parse an RSS feed."""
         url = source["url"]
         name = source["name"]
+
+        # Google News feeds have 100 entries, allow more
+        entry_limit = 30 if "news.google.com" in url else 15
 
         try:
             session = self._get_session()
@@ -206,7 +223,7 @@ class BMWRSSFetcher:
             feed = feedparser.parse(content)
             items: list[dict[str, Any]] = []
 
-            for entry in feed.entries[:15]:  # Limit entries per source
+            for entry in feed.entries[:entry_limit]:
                 title = getattr(entry, "title", "")
                 summary = getattr(entry, "summary", "")
                 link = getattr(entry, "link", "")

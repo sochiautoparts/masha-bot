@@ -28,6 +28,11 @@ JUNK_KEYWORDS = frozenset([
     'favicon', '1x1', 'pixel', 'spacer', 'blank.gif',
     'gravatar', 'analytics', 'tracker', 'beacon',
     'doubleclick', 'adservice', 'googlesyndication',
+    # v5.0: Added more junk patterns that appear in RSS feeds
+    'logo', 'icon', 'avatar', 'badge', 'button',
+    'banner', 'social', 'share', 'follow', 'subscribe',
+    '/assets/images/', '/assets/img/', '/themes/',
+    '/widgets/', '/plugins/',
 ])
 
 # v4.0: Thumbnail size patterns in URLs — these indicate small images
@@ -114,11 +119,20 @@ def _is_junk_url(url: str) -> bool:
     return False
 
 
+# Domains that NEVER contain real article photos
+_JUNK_IMAGE_DOMAINS = frozenset([
+    'gravatar.com', 'google.com', 'googlesyndication.com',
+    'facebook.com', 'twitter.com', 'instagram.com', 'youtube.com',
+    'doubleclick.net', 'adservice.google.com',
+])
+
+
 # ── RSS image extraction ───────────────────────────────────────────────────
 
 def extract_rss_images(entry: Any, max_images: int = 10) -> List[str]:
     """Extract image URLs from a feedparser entry.
 
+    v5.0: Added domain-level filtering (gravatar, social media, etc.)
     Checks:
     1. <enclosure> with image type
     2. <media:content> with image type
@@ -126,7 +140,16 @@ def extract_rss_images(entry: Any, max_images: int = 10) -> List[str]:
     4. <content:encoded> <img> tags
     5. <summary>/<description> <img> tags
     """
+    from urllib.parse import urlparse
     image_urls: List[str] = []
+
+    def _is_domain_junk(url: str) -> bool:
+        """Check if URL is from a junk domain."""
+        try:
+            domain = urlparse(url).netloc.lower()
+            return any(jd in domain for jd in _JUNK_IMAGE_DOMAINS)
+        except Exception:
+            return False
 
     # 1. <enclosure type="image/...">
     enclosures = getattr(entry, "enclosures", []) or []
@@ -134,7 +157,7 @@ def extract_rss_images(entry: Any, max_images: int = 10) -> List[str]:
         url = enc.get("href", "") or enc.get("url", "")
         enc_type = enc.get("type", "").lower()
         if url and ("image" in enc_type or any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"])):
-            if not _is_junk_url(url) and url not in image_urls:
+            if not _is_junk_url(url) and not _is_domain_junk(url) and url not in image_urls:
                 image_urls.append(url)
 
     # 2. <media:content medium="image">
@@ -144,14 +167,14 @@ def extract_rss_images(entry: Any, max_images: int = 10) -> List[str]:
         medium = mc.get("medium", "").lower()
         mc_type = mc.get("type", "").lower()
         if url and (medium == "image" or "image" in mc_type):
-            if not _is_junk_url(url) and url not in image_urls:
+            if not _is_junk_url(url) and not _is_domain_junk(url) and url not in image_urls:
                 image_urls.append(url)
 
     # 3. <media:thumbnail>
     media_thumbnail = getattr(entry, "media_thumbnail", []) or []
     for mt in media_thumbnail:
         url = mt.get("url", "")
-        if url and not _is_junk_url(url) and url not in image_urls:
+        if url and not _is_junk_url(url) and not _is_domain_junk(url) and url not in image_urls:
             image_urls.append(url)
 
     # 4. <content:encoded> or <summary> with <img>
@@ -165,7 +188,7 @@ def extract_rss_images(entry: Any, max_images: int = 10) -> List[str]:
         img_matches = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', str(content_value), re.IGNORECASE)
         for img_url in img_matches:
             img_url = img_url.replace("&amp;", "&")
-            if not _is_junk_url(img_url) and img_url not in image_urls:
+            if not _is_junk_url(img_url) and not _is_domain_junk(img_url) and img_url not in image_urls:
                 image_urls.append(img_url)
 
     return image_urls[:max_images]

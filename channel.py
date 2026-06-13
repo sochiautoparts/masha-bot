@@ -488,26 +488,65 @@ class ChannelManager:
         except Exception as e:
             logger.debug(f"Could not add reaction: {e}")
 
-    # ── IMAGE PIPELINE v3.0 — ARTICLE-ONLY ───────────────────────────────────
+    # ── IMAGE PIPELINE v5.0 — STRICT QUALITY CONTROL ──────────────────────────
     #
-    # PHILOSOPHY: Automotive news articles ALWAYS come with photos.
-    # We extract photos directly from the article page. That's it.
-    # No stock photos, no AI generation, no web search images — they're all
-    # irrelevant to the specific news. Better no photo than a wrong photo.
+    # PHILOSOPHY: Only REAL article photos — no logos, avatars, icons, banners,
+    # thumbnails, or sidebar navigation images.
+    #
+    # PRIORITY:
+    # 1. RSS image_urls — extracted from feed enclosures/media:content/summary
+    # 2. Article page scraping — og:image, twitter:image, JSON-LD ONLY
+    #    (NOT random <img> tags — they contain logos, nav icons, etc.)
+    #
+    # KEY RULE: Better NO photo than a WRONG photo (logo, icon, avatar, banner)
+
+    # Domains that NEVER contain real article photos
+    _JUNK_IMAGE_DOMAINS = frozenset([
+        'gravatar.com', 'wp.com', 'google.com', 'googlesyndication.com',
+        'facebook.com', 'twitter.com', 'instagram.com', 'youtube.com',
+        'doubleclick.net', 'adservice.google.com',
+    ])
+
+    # URL path patterns that NEVER contain real article photos
+    _JUNK_IMAGE_PATHS = frozenset([
+        'favicon', '1x1', 'pixel', 'spacer', 'blank.gif', 'gravatar',
+        'analytics', 'tracker', 'beacon', 'logo', 'icon', 'avatar',
+        'badge', 'button', 'banner', 'ad.', 'ads/', 'sponsor',
+        'social', 'share', 'follow', 'subscribe', 'newsletter',
+        'doubleclick', 'adservice', 'googlesyndication',
+        # Navigation thumbs common in BMW Blog sidebar
+        '-thumb.', '-thumb/', '/thumb/', '/thumbnail/', '/thumbs/',
+        '_thumb.', '_tiny.', '-tiny.',
+        # Common WordPress theme assets
+        '/assets/images/', '/assets/img/', '/themes/',
+        # Common widget/plugin images
+        '/widgets/', '/plugins/',
+    ])
 
     async def _download_images(self, image_urls: List[str], max_count: int = 10) -> List[bytes]:
-        """Download images from URLs with minimal validation.
+        """Download images from URLs with STRICT quality validation.
 
-        Just checks: is it a valid image? Is it big enough? That's it.
-        No complex filtering — if the URL comes from the article page, it's relevant.
+        v5.0: HEAVILY enhanced junk filtering. The previous version was too
+        permissive — it allowed logos, avatars, sidebar nav images, banners,
+        and other non-article images that look terrible in Telegram posts.
+
+        Filter layers:
+        1. URL domain check — block known junk domains (gravatar, ads, etc.)
+        2. URL path check — block logos, icons, thumbs, theme assets, etc.
+        3. File size check — 15KB min (was 10KB), 5MB max
+        4. Magic bytes check — must be JPEG/PNG/WebP
+        5. Dimension check — min 400x300, reject extreme aspect ratios
+        6. Dedup by URL — same image won't be downloaded twice
+
         Returns list of image data bytes.
         """
         images = []
+        seen_urls = set()
         if not image_urls:
             return images
 
         MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-        MIN_IMAGE_SIZE = 10_000           # 10KB — skip tiny icons, tracking pixels, and low-quality thumbnails
+        MIN_IMAGE_SIZE = 15_000           # 15KB — skip tiny icons, thumbnails, and low-quality images
 
         # Use a single client for all downloads
         async with httpx.AsyncClient(
@@ -519,18 +558,45 @@ class ChannelManager:
                 if len(images) >= max_count:
                     break
 
-                # Quick URL-level sanity check — skip OBVIOUS non-content + thumbnails
-                url_lower = url.lower()
-                if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
-                                                    'blank.gif', 'gravatar', 'analytics',
-                                                    'tracker', 'beacon']):
+                # Normalize URL
+                url = url.replace("&amp;", "&")
+                if url.startswith("//"):
+                    url = "https:" + url
+                if not url.startswith(("http://", "https://")):
                     continue
 
-                # v5.0: Skip thumbnail URLs (300x300, 150x150 etc.)
-                # Real article images are rectangular (830x553, 1600x1066), not square
+                # Dedup
+                url_stripped = url.split("?")[0].lower()  # Compare without query params
+                if url_stripped in seen_urls:
+                    continue
+                seen_urls.add(url_stripped)
+
+                # ── LAYER 1: Domain check ──
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                domain = parsed.netloc.lower()
+                if any(junk_domain in domain for junk_domain in self._JUNK_IMAGE_DOMAINS):
+                    logger.debug(f"Skipping junk domain: {domain}")
+                    continue
+
+                # ── LAYER 2: Path/pattern check ──
+                url_lower = url.lower()
+                if any(kw in url_lower for kw in self._JUNK_IMAGE_PATHS):
+                    logger.debug(f"Skipping junk path: {url[:80]}")
+                    continue
+
+                # Skip thumbnail URLs (dimension patterns in URL)
                 from bot.sources.image_fetcher import _is_thumbnail_url
                 if _is_thumbnail_url(url):
                     logger.debug(f"Skipping thumbnail URL: {url[:80]}")
+                    continue
+
+                # Skip SVG — always icons/logos
+                if url_lower.endswith('.svg') or '.svg?' in url_lower:
+                    continue
+
+                # Skip data: URIs
+                if url.startswith('data:'):
                     continue
 
                 try:
@@ -553,16 +619,20 @@ class ChannelManager:
                     if not is_valid:
                         continue
 
-                    # Dimension check with PIL if available — skip tiny/banners
+                    # Dimension check with PIL if available — STRICT minimums
                     try:
                         from PIL import Image
                         import io
                         img = Image.open(io.BytesIO(content))
                         w, h = img.size
-                        if w < 300 or h < 200:
+                        # v5.0: Raised minimums — 400x300 (was 300x200)
+                        # Thumbnails are typically 150-300px. Real photos are 800+
+                        if w < 400 or h < 300:
+                            logger.debug(f"Skipping small image: {w}x{h} from {url[:60]}")
                             continue
                         # Skip extreme aspect ratios (banners/ads)
                         if w / max(h, 1) > 4.0 or h / max(w, 1) > 4.0:
+                            logger.debug(f"Skipping extreme aspect: {w}x{h} from {url[:60]}")
                             continue
                     except ImportError:
                         pass  # No PIL — trust the size + magic bytes check
@@ -583,18 +653,21 @@ class ChannelManager:
     async def _scrape_article_images(self, article_url: str, max_count: int = 10) -> List[bytes]:
         """Scrape images from a news article page.
 
-        Extracts images from multiple sources in priority order:
-        1. og:image meta tags (usually the main article image)
-        2. twitter:image meta tags
-        3. JSON-LD structured data (schema.org image field)
-        4. <img> tags from article body areas (src + data-src for lazy loading)
-        5. <picture>/<source srcset> elements
+        v5.0: COMPLETELY REWRITTEN — strict quality control.
+        Previous version scraped ALL <img> tags from the page, which resulted
+        in logos, avatars, sidebar navigation, icons, and banners appearing
+        in Telegram posts.
+
+        NEW STRATEGY — metadata-first:
+        1. og:image / twitter:image — the site's own curated article image
+        2. JSON-LD schema.org image — structured data, very reliable
+        3. <img> from <article> body ONLY if metadata yields nothing
+        4. NEVER scrape all-page <img> — it's always full of junk
 
         Returns list of image data bytes (up to max_count).
         """
         images = []
         try:
-            # Use a realistic browser User-Agent — many news sites block bot-like UAs
             _SCRAPE_HEADERS = {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -617,94 +690,90 @@ class ChannelManager:
                 seen = set()
 
                 def _add_url(url: str):
-                    """Add a URL to candidates if not seen and not obviously junk."""
+                    """Add a URL to candidates — STRICT filtering."""
                     if not url or len(url) < 10 or url in seen:
                         return
-                    # Normalize protocol-relative URLs
                     if url.startswith("//"):
                         url = "https:" + url
-                    # Quick junk filter
+                    if not url.startswith(("http://", "https://")):
+                        return
+                    url = url.replace("&amp;", "&")
+                    # Domain check
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    domain = parsed.netloc.lower()
+                    if any(jd in domain for jd in self._JUNK_IMAGE_DOMAINS):
+                        return
+                    # Path check
                     url_lower = url.lower()
-                    if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
-                                                        'blank.gif', 'gravatar', 'analytics',
-                                                        'tracker', 'beacon', 'logo', 'icon',
-                                                        'avatar', 'badge', 'button']):
+                    if any(kw in url_lower for kw in self._JUNK_IMAGE_PATHS):
                         return
-                    # v5.0: Skip thumbnail URLs
-                    from bot.sources.image_fetcher import _is_thumbnail_url
-                    if _is_thumbnail_url(url):
+                    if _is_thumbnail_url_check(url):
                         return
-                    # Skip data: URIs
+                    if url_lower.endswith('.svg') or '.svg?' in url_lower:
+                        return
                     if url.startswith('data:'):
                         return
                     seen.add(url)
                     candidate_urls.append(url)
 
-                # 1. og:image (usually the main article image — HIGHEST priority)
+                def _is_thumbnail_url_check(url: str) -> bool:
+                    """Inline thumbnail check to avoid circular import."""
+                    from bot.sources.image_fetcher import _is_thumbnail_url
+                    return _is_thumbnail_url(url)
+
+                # ── STEP 1: og:image (HIGHEST priority — curated by the site) ──
                 og_images = re.findall(r'<meta[^>]+property=["\x27]og:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 og_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+property=["\x27]og:image["\x27]', html, re.IGNORECASE)
                 og_images += re.findall(r'<meta[^>]+property=["\x27]og:image:url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 og_images += re.findall(r'<meta[^>]+property=["\x27]og:image:secure_url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 for url in og_images:
-                    _add_url(url.replace("&amp;", "&"))
+                    _add_url(url)
 
-                # 2. twitter:image
+                # ── STEP 2: twitter:image ──
                 tw_images = re.findall(r'<meta[^>]+name=["\x27]twitter:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 tw_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+name=["\x27]twitter:image["\x27]', html, re.IGNORECASE)
                 for url in tw_images:
-                    _add_url(url.replace("&amp;", "&"))
+                    _add_url(url)
 
-                # 3. JSON-LD structured data (schema.org)
+                # ── STEP 3: JSON-LD structured data (schema.org) ──
                 jsonld_images = self._extract_jsonld_images(html)
                 for url in jsonld_images:
                     _add_url(url)
 
-                # 4. <img> tags from article body areas (THE MOST IMPORTANT for multi-photo articles)
-                # Automotive articles typically have 5-10 photos in the article body
-                article_html = ""
-                for pattern in [r'<article[^>]*>(.*?)</article>',
-                                r'<main[^>]*>(.*?)</main>',
-                                r'<div[^>]+class=["\x27][^"\x27]*(?:content|article|post|entry|gallery)[^"\x27]*["\x27][^>]*>(.*?)</div>']:
-                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-                    for match in matches:
-                        article_html += match + "\n"
+                # ── STEP 4 (FALLBACK): <img> from <article> body ONLY ──
+                # Only try this if metadata (og:image, twitter:image, JSON-LD) yielded nothing
+                if not candidate_urls:
+                    logger.info(f"No metadata images found for {article_url[:60]}, trying <article> body")
 
-                # If article body found, extract images from there
-                if article_html:
-                    # data-src (lazy loading — often higher quality)
-                    lazy_urls = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
-                    lazy_urls += re.findall(r'<img[^>]+data-lazy-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
-                    for url in lazy_urls:
-                        _add_url(url.replace("&amp;", "&"))
+                    article_html = ""
+                    # Try <article> tag first — most reliable for article content
+                    for pattern in [r'<article[^>]*>(.*?)</article>']:
+                        matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                        for match in matches:
+                            article_html += match + "\n"
 
-                    # Regular src
-                    src_urls = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
-                    for url in src_urls:
-                        _add_url(url.replace("&amp;", "&"))
+                    # If no <article>, try entry-content div
+                    if not article_html:
+                        for pattern in [
+                            r'<div[^>]+class=["\x27][^"\x27]*(?:entry-content|article-body|post-content|single-content)[^"\x27]*["\x27][^>]*>(.*?)</div>',
+                        ]:
+                            matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                            for match in matches:
+                                article_html += match + "\n"
 
-                    # srcset (responsive images)
-                    srcset_matches = re.findall(r'srcset=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
-                    for srcset in srcset_matches:
-                        for part in srcset.split(','):
-                            url = part.strip().split()[0] if part.strip() else ''
+                    if article_html:
+                        # data-src first (lazy loaded — often higher quality)
+                        for url in re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE):
                             _add_url(url)
-                else:
-                    # No article body found — try all <img> in the page as last resort
-                    all_img = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
-                    lazy_all = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
-                    for url in lazy_all:
-                        _add_url(url.replace("&amp;", "&"))
-                    for url in all_img:
-                        _add_url(url.replace("&amp;", "&"))
-
-                # 5. <picture>/<source srcset> elements
-                picture_blocks = re.findall(r'<picture[^>]*>(.*?)</picture>', html, re.IGNORECASE | re.DOTALL)
-                for block in picture_blocks:
-                    srcsets = re.findall(r'srcset=["\x27]([^"\x27]+)["\x27]', block, re.IGNORECASE)
-                    for srcset in srcsets:
-                        for part in srcset.split(','):
-                            url = part.strip().split()[0] if part.strip() else ''
+                        for url in re.findall(r'<img[^>]+data-lazy-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE):
                             _add_url(url)
+                        # Regular src
+                        for url in re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE):
+                            _add_url(url)
+                    # NOTE: We NEVER fall back to all-page <img> tags.
+                    # If neither metadata nor <article> body has images, we give up.
+                    # Better no photo than a logo/avatar/sidebar image.
 
                 logger.info(f"Scraped {len(candidate_urls)} candidate image URLs from {article_url[:60]}")
 

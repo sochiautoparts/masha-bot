@@ -1,12 +1,12 @@
 """Content orchestration pipeline for masha-bot.
 
-Coordinates the flow: source → generate → fetch image → validate → publish.
+NOTE: This module is DEPRECATED — channel.py handles the active posting pipeline.
+Kept for reference only. The ChannelManager in channel.py is the live code.
 
-v2.0: ORIGINAL-FIRST IMAGE PIPELINE
-  Priority 1: Real photos from article (og:image, twitter:image)
-  Priority 2: RSS enclosures / media:content
-  Priority 3: Image search (SearXNG)
-  Priority 4: AI generation (Pollinations) — LAST RESORT ONLY
+v3.0: DEAD CODE — Updated imports to prevent crashes if accidentally imported.
+  - Removed: ImageFetcher (class deleted in v3.0 image pipeline simplification)
+  - Removed: ImageGenerator (AI image gen removed from posting flow)
+  - All posting now goes through channel.py → ChannelManager
 """
 
 from __future__ import annotations
@@ -21,8 +21,7 @@ from ..core.config import get_config, get_persona
 from ..generation.persona import PersonaManager
 from ..generation.writer import ContentWriter
 from ..generation.fact_checker import BMWFactChecker
-from ..generation.image_gen import ImageGenerator
-from ..sources.image_fetcher import ImageFetcher
+from ..sources.image_fetcher import extract_rss_images, fetch_article_image_urls
 from ..publishing.telegram import ChannelManager
 from ..publishing.formatter import PostFormatter
 from ..sources.rss_fetcher import BMWRSSFetcher
@@ -54,8 +53,8 @@ class ContentPipeline:
         self.persona_manager = PersonaManager()
         self.writer = ContentWriter()
         self.fact_checker = BMWFactChecker()
-        self.image_gen = ImageGenerator()
-        self.image_fetcher = ImageFetcher()  # NEW: original-first image fetcher
+        # NOTE: ImageFetcher and ImageGenerator removed in v3.0
+        # Image pipeline now handled by channel.py ChannelManager
         self.formatter = PostFormatter()
         self.channel = ChannelManager(db=db)
         self.partners = PartnerManager(db=db)
@@ -188,66 +187,39 @@ class ContentPipeline:
     async def _fetch_image(
         self, content_item: dict[str, Any], post_data: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Fetch image using ORIGINAL-FIRST priority pipeline.
+        """Fetch image — DEPRECATED: image pipeline now in channel.py.
 
-        Priority:
-        1. Real photos from article (og:image, twitter:image) via ImageFetcher
-        2. RSS enclosures / media:content via ImageFetcher
-        3. Image search (SearXNG) via ImageFetcher
-        4. AI generation (Pollinations) — LAST RESORT ONLY
+        This method is kept for API compatibility but delegates to
+        image_fetcher functions. The active pipeline is in channel.py.
         """
         content_type = content_item.get("content_type", "news+reaction")
 
-        # Only fetch images for content types that need them
         if content_type not in ("news+reaction", "lore/history", "garage stories", "partner"):
             return None
 
         if not self.config.enable_images:
             return None
 
-        topic = content_item.get("topic", post_data.get("topic", ""))
+        # Try article image URLs first
         article_url = content_item.get("url", "")
-        rss_entry = content_item.get("rss_entry")
+        if article_url:
+            try:
+                image_urls = await fetch_article_image_urls(article_url, max_images=1)
+                if image_urls:
+                    import httpx
+                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                        resp = await client.get(image_urls[0])
+                        if resp.status_code == 200 and len(resp.content) > 1000:
+                            import base64
+                            return {
+                                "image_b64": base64.b64encode(resp.content).decode(),
+                                "image_url": image_urls[0],
+                                "source": "article",
+                            }
+            except Exception as exc:
+                logger.debug("Article image fetch failed: %s", exc)
 
-        # ── Steps 1-3: Try to get ORIGINAL image via ImageFetcher ─────────
-        try:
-            real_image = await self.image_fetcher.fetch(
-                topic=topic,
-                article_url=article_url,
-                rss_entry=rss_entry,
-                content_type=content_type,
-            )
-            if real_image:
-                source = real_image.get("source", "unknown")
-                logger.info(
-                    "Using ORIGINAL image for post (source=%s): %s",
-                    source,
-                    real_image.get("image_url", "")[:80],
-                )
-                # Normalize format for pipeline compatibility
-                return {
-                    "image_b64": real_image["image_b64"],
-                    "image_url": real_image.get("image_url", ""),
-                    "source": source,
-                }
-        except Exception as exc:
-            logger.warning("ImageFetcher failed, will try AI generation: %s", exc)
-
-        # ── Step 4: AI generation — LAST RESORT ───────────────────────────
-        logger.info("No real image found — falling back to AI generation for '%s'", topic[:50])
-        try:
-            ai_image = await self.image_gen.generate(
-                topic=topic,
-                content_type=content_type,
-            )
-            if ai_image:
-                ai_image["source"] = "ai_generated"
-                logger.info("Using AI-generated image for post")
-                return ai_image
-        except Exception as exc:
-            logger.warning("AI image generation also failed: %s", exc)
-
-        # No image at all — post without image
+        # No image available
         logger.info("No image available — posting without image")
         return None
 

@@ -109,10 +109,16 @@ _BMW_CORE_WORDS = frozenset([
 def _is_semantically_duplicate(title: str) -> bool:
     """Check if a title is semantically duplicate of recently posted titles.
 
-    v4.0: RADICALLY RELAXED — was blocking 2/3 of posts in a cycle.
-    Now requires 7+ significant word matches (was 5) AND 4+ core BMW word
-    matches (was 3). In a BMW channel, BMW/M3/M5/etc. are in almost every
-    title, so low thresholds = false positives = only 1 post per cycle.
+    v5.0: COMPLETELY REWRITTEN — was still blocking too many posts.
+    Old approach: count word overlaps → too many false positives in a BMW channel
+    where every title contains "BMW", "M3", etc.
+
+    New approach: Jaccard similarity on significant words.
+    - Computes intersection/union ratio between current and recent titles
+    - Only flags as duplicate if similarity > 0.6 (60% of words overlap)
+    - This means titles must share MOST of their meaningful words to be blocked
+    - BMW/M3/etc. appearing in both titles won't trigger it unless the
+      REST of the title is also nearly identical
     """
     global _recent_post_keywords
 
@@ -122,18 +128,25 @@ def _is_semantically_duplicate(title: str) -> bool:
     if len(significant) < 3:
         return False
 
-    core_words = [w for w in significant if w in _BMW_CORE_WORDS]
+    current_set = set(significant)
 
     for recent_words in _recent_post_keywords:
-        matches = sum(1 for w in significant if w in recent_words)
-        if matches >= 7:  # v4.0: Raised from 5 — was too aggressive, blocked diverse posts
-            return True
+        recent_set = set(recent_words)
+        if not recent_set:
+            continue
 
-        if len(core_words) >= 4:  # v4.0: Raised from 3 — BMW terms are in every title
-            recent_core = [w for w in recent_words if w in _BMW_CORE_WORDS]
-            core_matches = sum(1 for w in core_words if w in recent_core)
-            if core_matches >= 4:  # v4.0: Raised from 3 — need near-identical BMW topic
-                return True
+        # Jaccard similarity: |intersection| / |union|
+        intersection = current_set & recent_set
+        union = current_set | recent_set
+
+        if not union:
+            continue
+
+        similarity = len(intersection) / len(union)
+
+        # High similarity = near-identical title → duplicate
+        if similarity > 0.6:
+            return True
 
     return False
 
@@ -369,8 +382,8 @@ def _ensure_footer(text: str) -> str:
 def _enforce_char_limit(text: str, has_media: bool) -> str:
     """Smart character limit enforcement — always preserves footer.
 
-    v4.0: Instead of blunt truncation with "...", trims at the last
-    complete paragraph/sentence to keep the text readable.
+    v5.0: FIXED — ensures the FINAL text (content + footer) fits within the limit.
+    Previous version could exceed the limit after smart truncation + footer append.
     """
     footer = "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
     char_limit = config.TELEGRAM_CAPTION_LIMIT if has_media else config.TELEGRAM_TEXT_LIMIT
@@ -390,7 +403,7 @@ def _enforce_char_limit(text: str, has_media: bool) -> str:
     if len(content) <= max_content:
         return content + footer
 
-    # v4.0: Smart truncation — cut at last paragraph break, then sentence
+    # Smart truncation — cut at last paragraph break, then sentence
     trimmed = content[:max_content]
 
     # Try cutting at last paragraph break (\n\n)
@@ -406,7 +419,24 @@ def _enforce_char_limit(text: str, has_media: bool) -> str:
             # Fallback: simple truncation
             trimmed = trimmed.rstrip() + "..."
 
-    return trimmed.rstrip() + footer
+    result = trimmed.rstrip() + footer
+
+    # FINAL SAFETY: if still over limit, hard-truncate the content part
+    if len(result) > char_limit:
+        overhead = len(result) - char_limit
+        # Trim the content part (before footer) to make it fit
+        content_only = trimmed.rstrip()
+        if len(content_only) > overhead:
+            content_only = content_only[:len(content_only) - overhead].rstrip()
+            # Re-trim at sentence boundary if possible
+            last_sent = max(content_only.rfind('. '), content_only.rfind('! '), content_only.rfind('? '))
+            if last_sent > len(content_only) * 0.5:
+                content_only = content_only[:last_sent + 1]
+            result = content_only.rstrip() + footer
+        else:
+            result = footer.lstrip('\n')
+
+    return result
 
 
 class ChannelManager:
@@ -477,7 +507,7 @@ class ChannelManager:
             return images
 
         MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-        MIN_IMAGE_SIZE = 5_000            # 5KB — skip tracking pixels and tiny icons
+        MIN_IMAGE_SIZE = 10_000           # 10KB — skip tiny icons, tracking pixels, and low-quality thumbnails
 
         # Use a single client for all downloads
         async with httpx.AsyncClient(
@@ -597,7 +627,15 @@ class ChannelManager:
                     url_lower = url.lower()
                     if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
                                                         'blank.gif', 'gravatar', 'analytics',
-                                                        'tracker', 'beacon']):
+                                                        'tracker', 'beacon', 'logo', 'icon',
+                                                        'avatar', 'badge', 'button']):
+                        return
+                    # v5.0: Skip thumbnail URLs
+                    from bot.sources.image_fetcher import _is_thumbnail_url
+                    if _is_thumbnail_url(url):
+                        return
+                    # Skip data: URIs
+                    if url.startswith('data:'):
                         return
                     seen.add(url)
                     candidate_urls.append(url)
@@ -840,17 +878,16 @@ class ChannelManager:
         logger.warning(f"Could not resolve Google News URL: {url[:60]}")
         return url
 
-    async def _get_post_images(self, news_item: Dict) -> tuple:
+    async def _get_post_images(self, news_item: Dict, resolved_url: str = "") -> tuple:
         """Get images for a news post — ONLY from the article page.
 
-        v3.1: Improved URL resolution.
+        v5.0: Accepts pre-resolved URL to avoid double resolution.
         Automotive news articles ALWAYS come with photos.
         We extract them directly from the article. That's it.
 
         Steps:
-        1. Resolve URL (Google News redirects → direct article URL)
-        2. Download RSS image URLs if available (fast, no scraping needed)
-        3. Scrape the article page for MORE images (up to 10 total)
+        1. Download RSS image URLs if available (fast, no scraping needed)
+        2. Scrape the article page for MORE images (up to 10 total)
 
         No fallbacks to stock photos, AI generation, or web search images.
         If the article has no photos = text-only post. Better than wrong photos.
@@ -861,9 +898,9 @@ class ChannelManager:
         source = "none"
         title = news_item.get("title", "")
 
-        # Step 0: Resolve Google News redirect URLs to direct article URLs
-        article_url = news_item.get("url", "")
-        if article_url:
+        # Use pre-resolved URL if available, otherwise resolve now
+        article_url = resolved_url or news_item.get("url", "")
+        if article_url and not resolved_url:
             article_url = await self._resolve_article_url(article_url, title=title)
 
         # Step 1: Download RSS image URLs FIRST — these are the fastest
@@ -905,27 +942,31 @@ class ChannelManager:
 
         return image_list, source
 
-    async def _generate_post_text(self, news_item: Dict, has_media: bool = False, media_count: int = 0) -> Optional[str]:
+    async def _generate_post_text(self, news_item: Dict, has_media: bool = False, media_count: int = 0, resolved_url: str = "") -> Optional[str]:
         """Generate post text for a news item using AI.
 
-        v4.0: MAJOR REWORK — now scrapes FULL article text instead of using
+        v5.0: Accepts pre-resolved URL to avoid double resolution.
+        Now scrapes FULL article text instead of using
         truncated RSS summaries. The AI gets complete facts and writes a
         unique post in Russian, translating if needed.
 
         Flow:
-        1. Resolve article URL (Google News redirects → direct URL)
+        1. Use pre-resolved URL (or resolve if not provided)
         2. Scrape full article text from the page
         3. Fall back to RSS summary if scraping fails
         4. Pass full text + translation/uniquification instructions to AI
         """
         title = news_item.get("title", "")
         summary = news_item.get("summary", "")
-        source_url = news_item.get("url", "")
 
-        # ── Step 1: Resolve Google News redirect URLs ──
-        article_url = source_url
-        if article_url:
-            article_url = await self._resolve_article_url(article_url, title=title)
+        # ── Step 1: Use pre-resolved URL if available ──
+        if resolved_url:
+            article_url = resolved_url
+        else:
+            source_url = news_item.get("url", "")
+            article_url = source_url
+            if article_url:
+                article_url = await self._resolve_article_url(article_url, title=title)
 
         # ── Step 2: Scrape FULL article text ──
         full_article_text = ""
@@ -1078,14 +1119,23 @@ class ChannelManager:
                 logger.info(f"All {max_retries} attempts blocked by dedup")
                 return False
 
+            # v5.0: Resolve URL ONCE — pass to both image fetcher and text generator
+            # This avoids double resolution of Google News URLs (was causing 2x HTTP requests)
+            source_url = news_item.get("url", "")
+            resolved_url = ""
+            if source_url:
+                resolved_url = await self._resolve_article_url(source_url, title=title)
+                # Cache the resolved URL in the news_item so other code can use it
+                news_item["_resolved_url"] = resolved_url
+
             # v4.0: Get images FIRST so AI knows the char limit (1024 with media, 4096 without)
-            image_data_list, image_source = await self._get_post_images(news_item)
+            image_data_list, image_source = await self._get_post_images(news_item, resolved_url=resolved_url)
             has_media = len(image_data_list) > 0
             media_count = len(image_data_list) if has_media else 0
 
-            # Generate post text — now knows about media attachment
+            # Generate post text — now knows about media attachment, uses pre-resolved URL
             post_text = await self._generate_post_text(
-                news_item, has_media=has_media, media_count=media_count
+                news_item, has_media=has_media, media_count=media_count, resolved_url=resolved_url
             )
             if not post_text:
                 return False
@@ -1106,17 +1156,14 @@ class ChannelManager:
             _CAPTION_LIMIT = config.TELEGRAM_CAPTION_LIMIT   # 1024
             _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
 
+            # v5.0: SIMPLIFIED — single enforcement path instead of multiple
             if has_media and len(post_text) > _CAPTION_LIMIT:
-                # Has media + text too long — compress to keep media
-                logger.info(
-                    f"Post text {len(post_text)} chars > caption limit {_CAPTION_LIMIT}. "
-                    f"Compressing text to preserve media attachment."
-                )
+                # Has media + text too long — try compressing to keep media
                 compressed = _enforce_char_limit(post_text, has_media=True)
-                if len(compressed) <= _CAPTION_LIMIT and len(compressed) >= 400:
+                if len(compressed) >= 300:
                     post_text = compressed
                 else:
-                    # Check if content is interesting enough for text-only
+                    # Compression made text too short — check if text-only is better
                     interest_score = _score_interest(
                         news_item.get("title", ""),
                         news_item.get("summary", "")
@@ -1126,20 +1173,15 @@ class ChannelManager:
                         image_data_list = []
                         logger.info(f"Text too long for caption, interest={interest_score:.2f}. Publishing text-only.")
                     else:
-                        post_text = _enforce_char_limit(post_text, has_media=True)
+                        # Force compress even if short — media is important
+                        post_text = compressed
 
-            elif not has_media and len(post_text) > _CAPTION_LIMIT:
-                # No media + long text — check if interesting enough for text-only
-                interest_score = _score_interest(
-                    news_item.get("title", ""),
-                    news_item.get("summary", "")
-                )
-                if interest_score < 0.5 or len(post_text) > _TEXT_LIMIT:
-                    post_text = _enforce_char_limit(post_text, has_media=False)
-
-            # Ensure footer and char limit
+            # Ensure footer and final char limit (this is the ONLY enforcement point)
             post_text = _ensure_footer(post_text)
             post_text = _enforce_char_limit(post_text, has_media)
+
+            # FINAL SIZE LOG
+            logger.info(f"Final post: {len(post_text)} chars, has_media={has_media}, images={len(image_data_list) if has_media else 0}")
 
             # HARD SAFETY CHECK: never more than MAX_IMAGES_PER_POST images
             if has_media and len(image_data_list) > MAX_IMAGES_PER_POST:
@@ -1150,11 +1192,9 @@ class ChannelManager:
             sent_message = None
             try:
                 if has_media and image_data_list:
-                    # SAFETY: Enforce caption limit before sending
-                    if len(post_text) > _CAPTION_LIMIT:
-                        post_text = _enforce_char_limit(post_text, has_media=True)
-                        logger.warning(f"Caption still over limit after enforcement, truncating to {_CAPTION_LIMIT}")
-                    
+                    # v5.0: _enforce_char_limit already ensured text fits caption limit
+                    # No need for redundant [:1024] truncation here
+
                     # Save images to temp files
                     tmp_paths = []
                     for i, img_data in enumerate(image_data_list[:MAX_IMAGES_PER_POST]):
@@ -1169,7 +1209,7 @@ class ChannelManager:
                         sent_message = await self._bot.send_photo(
                             chat_id=config.CHANNEL_ID,
                             photo=photo,
-                            caption=post_text[:1024],
+                            caption=post_text,
                             parse_mode=ParseMode.HTML,
                         )
                     else:
@@ -1180,7 +1220,7 @@ class ChannelManager:
                             if i == 0:
                                 media_group.append(InputMediaPhoto(
                                     media=photo_file,
-                                    caption=post_text[:1024],
+                                    caption=post_text,
                                     parse_mode=ParseMode.HTML,
                                 ))
                             else:
@@ -1283,7 +1323,9 @@ class ChannelManager:
 
         try:
             if image_data:
-                # Post with image
+                # Post with image — v5.0: enforce caption limit
+                if len(post_content) > 1024:
+                    post_content = _enforce_char_limit(post_content, has_media=True)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp.write(image_data)
                     tmp_path = tmp.name
@@ -1302,6 +1344,9 @@ class ChannelManager:
                         pass
             else:
                 # No image available — post text-only (partner posts should not be skipped)
+                # v5.0: enforce text limit
+                if len(post_content) > 4096:
+                    post_content = _enforce_char_limit(post_content, has_media=False)
                 logger.warning(f"Partner post without image: {program.name}")
                 sent = await self._bot.send_message(
                     chat_id=config.CHANNEL_ID,

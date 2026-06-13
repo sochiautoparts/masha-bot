@@ -45,9 +45,12 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
     {"name": "InsideEVs", "url": "https://insideevs.com/feed/", "category": "electric"},
     # ── Replacing Reddit (429 errors) with working sources ────────────────
-    # v5.0: Reddit r/BMW and r/cars consistently return 429 — replaced
     {"name": "Jalopnik", "url": "https://jalopnik.com/rss", "category": "general_auto"},
     {"name": "Google News BMW M", "url": "https://news.google.com/rss/search?q=BMW+M+Power+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
+    # ── v5.0: New sources with good image support ─────────────────────────
+    {"name": "Motor1", "url": "https://www.motor1.com/rss/feed/articles/", "category": "general_auto"},
+    {"name": "TopGear", "url": "https://www.topgear.com/rss.xml", "category": "general_auto"},
+    {"name": "The Drive", "url": "https://www.thedrive.com/feed", "category": "general_auto"},
 ]
 
 # ── BMW-focused search queries ────────────────────────────────────────────────

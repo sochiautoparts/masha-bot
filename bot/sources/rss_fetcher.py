@@ -36,7 +36,6 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "Google News BMW", "url": "https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
     {"name": "Google News BMW RU", "url": "https://news.google.com/rss/search?q=%D0%91%D0%9C%D0%92+%D0%BD%D0%BE%D0%B2%D0%BE%D1%81%D1%82%D0%B8&hl=ru&gl=RU&ceid=RU:ru", "category": "bmw_news"},
     # ── General auto with BMW coverage ──────────────────────────────────────
-    # v4.0: MotorAuthority returns 403 — replaced with CarScoops (HTTP 200, BMW content, images)
     {"name": "CarScoops", "url": "https://www.carscoops.com/feed/", "category": "general_auto"},
     {"name": "CarAndDriver", "url": "https://www.caranddriver.com/rss/all.xml", "category": "general_auto"},
     {"name": "Autocar", "url": "https://www.autocar.co.uk/rss", "category": "general_auto"},
@@ -45,11 +44,10 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     # ── Electric / EV ──────────────────────────────────────────────────────
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
     {"name": "InsideEVs", "url": "https://insideevs.com/feed/", "category": "electric"},
-    # ── Reddit (use old.reddit.com for better bot compatibility) ──────────
-    # v4.0: Removed r/MotorSport (429) and r/BMWMotorrad (429) — replaced with Jalopnik
-    {"name": "Reddit r/BMW", "url": "https://old.reddit.com/r/BMW/.rss", "category": "reddit"},
-    {"name": "Reddit r/cars", "url": "https://old.reddit.com/r/cars/.rss", "category": "reddit"},
+    # ── Replacing Reddit (429 errors) with working sources ────────────────
+    # v5.0: Reddit r/BMW and r/cars consistently return 429 — replaced
     {"name": "Jalopnik", "url": "https://jalopnik.com/rss", "category": "general_auto"},
+    {"name": "Google News BMW M", "url": "https://news.google.com/rss/search?q=BMW+M+Power+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
 ]
 
 # ── BMW-focused search queries ────────────────────────────────────────────────
@@ -187,26 +185,19 @@ class BMWRSSFetcher:
         return relevant
 
     async def _fetch_all_sources(self) -> list[dict[str, Any]]:
-        """Fetch items from all RSS sources concurrently.
-        
-        Reddit sources are staggered with delays to avoid 429 rate limits.
-        All other sources are fetched concurrently for speed.
-        """
+        """Fetch items from all RSS sources concurrently."""
         import asyncio
 
         all_items: list[dict[str, Any]] = []
 
         async def _safe_fetch(source: dict[str, str]) -> list[dict[str, Any]]:
             try:
-                # Reddit aggressively rate-limits — add 5-8s stagger between requests
-                if "reddit.com" in source["url"]:
-                    await asyncio.sleep(random.uniform(5.0, 8.0))
                 return await self._fetch_rss(source)
             except Exception as exc:
                 logger.warning("Failed to fetch from %s: %s", source["name"], exc)
                 return []
 
-        # Fetch all sources concurrently (Reddit staggered, others in parallel)
+        # Fetch all sources concurrently
         results = await asyncio.gather(*[_safe_fetch(s) for s in BMW_RSS_SOURCES])
         for items in results:
             all_items.extend(items)

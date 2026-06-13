@@ -1,12 +1,9 @@
 """News fetching, filtering, and dedup for masha-bot.
 
-v5.0: Uses BMWRSSFetcher for proper concurrent fetching with Reddit stagger.
-Saves image_urls to database for use by channel posting pipeline.
-- Removed: BimmerPost (timeout), Motor1 (404), Reuters (401) — all broken
-- Added: BimmerFile, Google News BMW EN+RU, Autocar, AutoExpress, Reddit r/BMWMotorrad
+v6.0: Replaced Reddit feeds (429 errors) with TopGear. Saves image_urls to DB.
+- Removed: Reddit r/BMW, Reddit r/cars (persistent 429 errors)
+- Added: TopGear RSS
 - Image URLs are now extracted and saved for every news item
-- CarScoops replaced with MotorAuthority (CarScoops returns 403)
-- Reddit feeds use old.reddit.com with 5-8s stagger to avoid 429
 """
 
 from __future__ import annotations
@@ -59,7 +56,8 @@ async def fetch_bmw_news(
     # Use BMWRSSFetcher for proper concurrent fetching with Reddit stagger
     try:
         from bot.sources.rss_fetcher import BMWRSSFetcher
-        fetcher_db = db or Database()
+        from bot.database import Database as _Database
+        fetcher_db = db or _Database()
         fetcher = BMWRSSFetcher(fetcher_db)
         try:
             all_items = await fetcher._fetch_all_sources()

@@ -748,7 +748,7 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
             # Normalize: lowercase, strip
             exclude_set.add(t.lower().strip()[:80])
 
-    # Score and sort
+    # Score and sort — v5.0: bonus for items with images (more engaging posts)
     scored = []
     for item in items:
         title = item.get("title", "")
@@ -760,6 +760,12 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
         interest = _score_interest(title, item.get("summary", ""))
         freshness = _score_freshness(item.get("published_time", 0))
         total = interest + freshness
+        
+        # v5.0: Bonus for items with image_urls — posts with photos get 3x more views
+        image_urls = item.get("image_urls", [])
+        if image_urls and len(image_urls) > 0:
+            total += 0.3  # Significant bonus for having photos
+        
         scored.append((total, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)

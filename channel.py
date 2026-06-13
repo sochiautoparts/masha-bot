@@ -489,11 +489,18 @@ class ChannelManager:
                 if len(images) >= max_count:
                     break
 
-                # Quick URL-level sanity check — only skip OBVIOUS non-content
+                # Quick URL-level sanity check — skip OBVIOUS non-content + thumbnails
                 url_lower = url.lower()
                 if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
                                                     'blank.gif', 'gravatar', 'analytics',
                                                     'tracker', 'beacon']):
+                    continue
+
+                # v5.0: Skip thumbnail URLs (300x300, 150x150 etc.)
+                # Real article images are rectangular (830x553, 1600x1066), not square
+                from bot.sources.image_fetcher import _is_thumbnail_url
+                if _is_thumbnail_url(url):
+                    logger.debug(f"Skipping thumbnail URL: {url[:80]}")
                     continue
 
                 try:
@@ -1143,6 +1150,11 @@ class ChannelManager:
             sent_message = None
             try:
                 if has_media and image_data_list:
+                    # SAFETY: Enforce caption limit before sending
+                    if len(post_text) > _CAPTION_LIMIT:
+                        post_text = _enforce_char_limit(post_text, has_media=True)
+                        logger.warning(f"Caption still over limit after enforcement, truncating to {_CAPTION_LIMIT}")
+                    
                     # Save images to temp files
                     tmp_paths = []
                     for i, img_data in enumerate(image_data_list[:MAX_IMAGES_PER_POST]):
@@ -1200,12 +1212,17 @@ class ChannelManager:
                     # Add reaction
                     await self._add_reaction(config.CHANNEL_ID, sent_message.message_id)
 
-                    # Save to DB
+                    # Save to DB — v5.0: pass has_image and image_url for stats
+                    first_image_url = ""
+                    if has_media and news_item.get("image_urls"):
+                        first_image_url = news_item["image_urls"][0] if isinstance(news_item["image_urls"], list) else ""
                     await add_channel_post(
                         content=post_text,
                         message_id=sent_message.message_id,
                         post_type="news",
                         source_url=news_item.get("url", ""),
+                        has_image=has_media,
+                        image_url=first_image_url,
                     )
 
                     # Mark news as posted

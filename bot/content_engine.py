@@ -679,21 +679,6 @@ async def search_auto_news() -> List[Dict]:
     return items
 
 
-async def enrich_with_search_images(title: str, max_images: int = 3) -> List[str]:
-    """Search for images related to a news topic — now uses ImageFetcher.
-
-    v2.0: Delegates to bot.sources.image_fetcher which implements
-    the ORIGINAL-FIRST pipeline: article images → RSS enclosures →
-    image search → AI generation.
-    """
-    try:
-        from bot.sources.image_fetcher import search_images
-        return await search_images(title, max_images=max_images)
-    except Exception as e:
-        logger.debug(f"Image search failed: {e}")
-        return []
-
-
 async def get_best_news_item(items: List[Dict] = None) -> Optional[Dict]:
     """Select the best news item from candidates using AI interest scoring."""
     if items is None:

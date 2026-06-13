@@ -4,12 +4,12 @@ Handles news posts, partner posts, scheduled content, reactions,
 media, polls, and internet news search.
 Properly enforces Telegram character limits: 1024 with media, 4096 without.
 
-v2.0 KEY CHANGES:
-- PRIORITIZE real photos from news sources (up to 10 per post)
-- Enhanced article scraping (og:image + twitter:image + article body <img>)
-- Web search image enrichment BEFORE AI generation
-- Allow text-only posts as last resort (channel silence is worse)
-- Strip "🔥 Мнение Маши" banned headings from post text
+v3.0 KEY CHANGES:
+- RADICALLY SIMPLIFIED image pipeline: ONLY photos from the article page
+- Automotive news ALWAYS comes with photos — we just extract them
+- Removed: Pexels, Pixabay, Wikimedia, AI generation, stock BMW, web search images
+  (all of those return IRRELEVANT photos that have nothing to do with the news)
+- No photo = text-only post. Better no photo than a wrong photo.
 - Support up to 10 media files per Telegram post
 """
 
@@ -44,7 +44,7 @@ from ai.router import get_ai_router
 from bot.partners import partner_manager
 from bot.web_search import web_search, search_news, SearchResult
 from bot.content_engine import (
-    get_best_news_item, enrich_with_search_images, get_date_context,
+    get_best_news_item, get_date_context,
     _is_topic_covered, _extract_entities, _score_interest,
     _register_topic, get_editorial_aside, get_translation_uniquification_hint,
 )
@@ -57,13 +57,7 @@ POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///
 
 # ── How many images per news post ───────────────────────────────────────────
 # Telegram allows up to 10 media per post.
-# We aim for rich visual posts with multiple relevant images from news sources.
-NEWS_IMAGES_MIN = 2
-NEWS_IMAGES_MAX = 10
 MAX_IMAGES_PER_POST = 10
-MAX_RSS_IMAGES = 10
-MAX_SCRAPE_IMAGES = 10
-MAX_SEARCH_IMAGES = 5
 
 # ── Poll topics for channel engagement — BMW-themed ──────────────────────────
 
@@ -438,12 +432,18 @@ class ChannelManager:
         except Exception as e:
             logger.debug(f"Could not add reaction: {e}")
 
-    async def _download_news_images(self, image_urls: List[str], max_count: int = 3) -> List[bytes]:
-        """Download real images from news source URLs.
-        
-        Tries each URL, downloads only valid content images.
-        Filters out: icons, logos, banners, buttons, social media, tracking pixels,
-        and images with abnormal dimensions (too wide/narrow = banners/ads).
+    # ── IMAGE PIPELINE v3.0 — ARTICLE-ONLY ───────────────────────────────────
+    #
+    # PHILOSOPHY: Automotive news articles ALWAYS come with photos.
+    # We extract photos directly from the article page. That's it.
+    # No stock photos, no AI generation, no web search images — they're all
+    # irrelevant to the specific news. Better no photo than a wrong photo.
+
+    async def _download_images(self, image_urls: List[str], max_count: int = 10) -> List[bytes]:
+        """Download images from URLs with minimal validation.
+
+        Just checks: is it a valid image? Is it big enough? That's it.
+        No complex filtering — if the URL comes from the article page, it's relevant.
         Returns list of image data bytes.
         """
         images = []
@@ -451,409 +451,82 @@ class ChannelManager:
             return images
 
         MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+        MIN_IMAGE_SIZE = 5_000            # 5KB — skip tracking pixels and tiny icons
 
-        for url in image_urls[:max_count * 3]:
-            if len(images) >= max_count:
-                break
+        # Use a single client for all downloads
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        ) as client:
+            for url in image_urls:
+                if len(images) >= max_count:
+                    break
 
-            if self._is_junk_image_url(url):
-                continue
+                # Quick URL-level sanity check — only skip OBVIOUS non-content
+                url_lower = url.lower()
+                if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
+                                                    'blank.gif', 'gravatar', 'analytics',
+                                                    'tracker', 'beacon']):
+                    continue
 
-            try:
-                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-                    response = await client.get(url, headers={
-                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
-                    })
+                try:
+                    response = await client.get(url)
                     if response.status_code != 200:
                         continue
 
                     content = response.content
-                    content_type = response.headers.get("content-type", "")
 
-                    # Validate: must be an image and at least 3KB
-                    if len(content) < 3000:
+                    # Size check
+                    if len(content) < MIN_IMAGE_SIZE or len(content) > MAX_IMAGE_SIZE:
                         continue
 
-                    if len(content) > MAX_IMAGE_SIZE:
+                    # Must be an actual image: check magic bytes (JPEG, PNG, WebP)
+                    is_valid = (
+                        content[:2] == b'\xff\xd8'               # JPEG
+                        or content[:8] == b'\x89PNG\r\n\x1a\n'   # PNG
+                        or content[:4] == b'RIFF'                 # WebP
+                    )
+                    if not is_valid:
                         continue
 
-                    # Skip SVG
-                    if b'<svg' in content[:500] or 'svg' in content_type:
-                        continue
-
-                    if not any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]):
-                        if content[:3] == b'\xff\xd8\xff' or content[:4] == b'\x89PNG':
-                            pass
-                        elif content[:4] == b'RIFF' and content[8:12] == b'WEBP':
-                            pass
-                        elif content[:6] in (b'GIF87a', b'GIF89a'):
-                            pass
-                        else:
+                    # Dimension check with PIL if available — skip tiny/banners
+                    try:
+                        from PIL import Image
+                        import io
+                        img = Image.open(io.BytesIO(content))
+                        w, h = img.size
+                        if w < 300 or h < 200:
                             continue
-
-                    if not self._is_content_image(content):
-                        continue
-
-                    images.append(content)
-                    logger.info(f"Downloaded news image: {url[:80]} ({len(content)} bytes)")
-
-            except Exception as e:
-                logger.debug(f"Failed to download image {url[:50]}: {e}")
-                continue
-
-        logger.info(f"Downloaded {len(images)} real images from news")
-        return images
-
-    @staticmethod
-    def _is_junk_image_url(url: str) -> bool:
-        """Check if an image URL is likely non-content.
-        
-        NOTE: Intentionally NOT filtering 'crop', 'resize', 'scaled', 'preview'
-        because WordPress and other CMS use these in URLs for full-size images too.
-        """
-        url_lower = url.lower()
-        junk_keywords = [
-            "icon", "logo", "favicon", "avatar", "badge", "button", "btn",
-            "spinner", "loading", "placeholder", "pixel", "tracker",
-            "analytics", "share", "facebook", "twitter", "vk.",
-            "telegram", "whatsapp", "instagram", "youtube", "tiktok",
-            "ad.", "ads/", "advert", "sponsor",
-            "emoji", "smileys", "captcha", "recaptcha",
-            "1x1", "spacer", "blank", "transparent", "dot.",
-            "watermark",
-        ]
-        for kw in junk_keywords:
-            if kw in url_lower:
-                return True
-
-        # Skip URLs with very small size indicators
-        size_pattern = re.compile(r'[/=_x](\d{1,3})x(\d{1,3})[/._]')
-        size_match = size_pattern.search(url_lower)
-        if size_match:
-            w, h = int(size_match.group(1)), int(size_match.group(2))
-            if w < 100 or h < 100:
-                return True
-
-        return False
-
-    @staticmethod
-    def _is_content_image(image_data: bytes) -> bool:
-        """Validate that image data represents a proper content photo.
-        
-        If PIL (Pillow) is available, checks dimensions and aspect ratio.
-        If PIL is not installed (e.g. GitHub Actions), falls back to minimum
-        file size check (3KB) as a reasonable proxy for content images.
-        """
-        if len(image_data) < 3000:
-            return False
-        try:
-            from PIL import Image
-            import io
-            img = Image.open(io.BytesIO(image_data))
-            width, height = img.size
-            if width < 400 or height < 300:
-                return False
-            if width / max(height, 1) > 3.0:
-                return False
-            if height / max(width, 1) > 3.0:
-                return False
-            if width * height < 120000:
-                return False
-            return True
-        except ImportError:
-            # PIL not available — fall back to file size check only
-            logger.debug("PIL not available, using file-size fallback for image validation")
-            return len(image_data) >= 3072  # 3KB minimum
-        except Exception:
-            return True
-
-    async def _fetch_pexels_images(self, query: str, max_count: int = 2) -> List[bytes]:
-        """Fetch images from Pexels API (free, 200 req/hour). Requires PEXELS_API_KEY."""
-        images = []
-        api_key = os.environ.get("PEXELS_API_KEY", "")
-        if not api_key:
-            return images
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(
-                    "https://api.pexels.com/v1/search",
-                    params={"query": query, "per_page": max_count, "locale": "ru-RU"},
-                    headers={"Authorization": api_key},
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    for photo in data.get("photos", [])[:max_count]:
-                        img_url = photo.get("src", {}).get("large", "")
-                        if not img_url:
-                            img_url = photo.get("src", {}).get("medium", "")
-                        if img_url:
-                            img_resp = await client.get(img_url)
-                            if img_resp.status_code == 200 and len(img_resp.content) > 3000:
-                                if self._is_content_image(img_resp.content):
-                                    images.append(img_resp.content)
-                                    logger.info(f"Pexels image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
-        except Exception as e:
-            logger.debug(f"Pexels image fetch error: {e}")
-        return images
-
-    async def _fetch_pixabay_images(self, query: str, max_count: int = 2) -> List[bytes]:
-        """Fetch images from Pixabay API (free, 5000 req/hour). Requires PIXABAY_API_KEY."""
-        images = []
-        api_key = os.environ.get("PIXABAY_API_KEY", "")
-        if not api_key:
-            return images
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(
-                    "https://pixabay.com/api/",
-                    params={
-                        "key": api_key,
-                        "q": query,
-                        "image_type": "photo",
-                        "per_page": max_count,
-                        "category": "transportation",
-                        "min_width": 800,
-                        "min_height": 600,
-                        "safesearch": "true",
-                    },
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    for hit in data.get("hits", [])[:max_count]:
-                        img_url = hit.get("largeImageURL", "") or hit.get("webformatURL", "")
-                        if img_url:
-                            img_resp = await client.get(img_url)
-                            if img_resp.status_code == 200 and len(img_resp.content) > 3000:
-                                if self._is_content_image(img_resp.content):
-                                    images.append(img_resp.content)
-                                    logger.info(f"Pixabay image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
-        except Exception as e:
-            logger.debug(f"Pixabay image fetch error: {e}")
-        return images
-
-    async def _fetch_wikimedia_images(self, query: str, max_count: int = 2) -> List[bytes]:
-        """Fetch images from Wikimedia Commons (free, no API key needed)."""
-        images = []
-        try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                search_resp = await client.get(
-                    "https://commons.wikimedia.org/w/api.php",
-                    params={
-                        "action": "query",
-                        "list": "search",
-                        "srsearch": query,
-                        "srnamespace": "6",
-                        "format": "json",
-                        "srlimit": max_count * 3,
-                    },
-                )
-                if search_resp.status_code != 200:
-                    return images
-
-                search_data = search_resp.json()
-                titles = []
-                for item in search_data.get("query", {}).get("search", []):
-                    title = item.get("title", "")
-                    if title and "File:" in title:
-                        titles.append(title)
-
-                if not titles:
-                    return images
-
-                image_info_resp = await client.get(
-                    "https://commons.wikimedia.org/w/api.php",
-                    params={
-                        "action": "query",
-                        "titles": "|".join(titles[:5]),
-                        "prop": "imageinfo",
-                        "iiprop": "url|size",
-                        "iiurlwidth": 1200,
-                        "format": "json",
-                    },
-                )
-                if image_info_resp.status_code != 200:
-                    return images
-
-                info_data = image_info_resp.json()
-                pages = info_data.get("query", {}).get("pages", {})
-                image_urls = []
-                for page_id, page_data in pages.items():
-                    if page_id == "-1":
-                        continue
-                    image_info = page_data.get("imageinfo", [])
-                    for info in image_info:
-                        url = info.get("thumburl", "") or info.get("url", "")
-                        width = info.get("width", 0)
-                        height = info.get("height", 0)
-                        if url and width >= 600 and height >= 400 and "svg" not in url.lower():
-                            image_urls.append(url)
-
-                for img_url in image_urls[:max_count]:
-                    try:
-                        img_resp = await client.get(img_url)
-                        if img_resp.status_code == 200 and len(img_resp.content) > 5000:
-                            if self._is_content_image(img_resp.content):
-                                images.append(img_resp.content)
-                                logger.info(f"Wikimedia image downloaded: {img_url[:60]} ({len(img_resp.content)} bytes)")
-                    except Exception:
-                        continue
-
-        except Exception as e:
-            logger.debug(f"Wikimedia image fetch error: {e}")
-        return images
-
-    async def _fetch_stock_bmw_images(self) -> List[bytes]:
-        """Fetch a BMW stock photo from reliable public URLs as ultimate fallback."""
-        images = []
-        
-        bmw_prompts = [
-            "BMW M5 F90 Competition, front three-quarter view, professional automotive photography, dramatic lighting, 4k, no text",
-            "BMW M3 G80, side profile, studio lighting, M Performance, no text",
-            "BMW X5 M Competition, dynamic shot, professional car photography, no text",
-        ]
-        prompt = random.choice(bmw_prompts)
-        seed = random.randint(1, 999999)
-        
-        try:
-            encoded_prompt = quote(prompt, safe="")
-            url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            params = {
-                "width": 1024,
-                "height": 768,
-                "model": "flux",
-                "nologo": "true",
-                "enhance": "true",
-                "seed": seed,
-            }
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                response = await client.get(url, params=params)
-                if response.status_code == 200 and len(response.content) > 5000:
-                    if self._is_content_image(response.content):
-                        images.append(response.content)
-                        logger.info(f"Stock BMW image from Pollinations: seed={seed} ({len(response.content)} bytes)")
-                        return images
-        except Exception as e:
-            logger.debug(f"Stock Pollinations image failed: {e}")
-        
-        # Public BMW press images
-        stock_urls = [
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/automotive-life/bmw-m-1000-xr/bmw-m-1000-xr-stage-teaser-hd.jpg",
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m3-cs-stage-teaser-hd.jpg",
-            "https://www.bmw.com/content/dam/bmw/marketBMWCOM/bmw_com/categories/m/m-automobiles/bmw-m5-stage-teaser-hd.jpg",
-        ]
-        
-        for url in stock_urls:
-            try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    response = await client.get(url, headers={
-                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
-                    })
-                    if response.status_code == 200 and len(response.content) > 5000:
-                        if self._is_content_image(response.content):
-                            images.append(response.content)
-                            logger.info(f"Stock BMW image downloaded from URL ({len(response.content)} bytes)")
-                            return images
-            except Exception:
-                continue
-        
-        return images
-
-    @staticmethod
-    def _ai_response_to_bytes(response) -> Optional[bytes]:
-        """Convert AIResponse from generate_image to raw bytes.
-        
-        generate_image() returns AIResponse with image_b64 (base64) or image_url,
-        NOT raw bytes. This helper extracts the actual image bytes.
-        """
-        if response is None:
-            return None
-        # If it's already bytes, return as-is
-        if isinstance(response, bytes):
-            return response
-        # AIResponse object — extract image data
-        try:
-            from ai.providers.base import AIResponse
-            if isinstance(response, AIResponse):
-                if response.image_b64:
-                    import base64
-                    return base64.b64decode(response.image_b64)
-                if response.image_url:
-                    # Download the image from URL
-                    import httpx
-                    try:
-                        r = httpx.get(response.image_url, timeout=30.0, follow_redirects=True)
-                        if r.status_code == 200 and len(r.content) > 1000:
-                            return r.content
+                        # Skip extreme aspect ratios (banners/ads)
+                        if w / max(h, 1) > 4.0 or h / max(w, 1) > 4.0:
+                            continue
+                    except ImportError:
+                        pass  # No PIL — trust the size + magic bytes check
                     except Exception:
                         pass
-                return None
-        except ImportError:
-            pass
-        # Fallback: if it has image_b64 attribute
-        if hasattr(response, 'image_b64') and response.image_b64:
-            import base64
-            return base64.b64decode(response.image_b64)
-        return None
 
-    async def _generate_post_images(self, news_title: str, count: int = 1) -> List[bytes]:
-        """Generate images for a news post using AI with full fallback chain.
+                    images.append(content)
+                    logger.info(f"Downloaded image: {url[:80]} ({len(content)} bytes)")
 
-        Tries Pollinations (gen→legacy→retry) then Cloudflare Workers AI (SDXL).
-        Returns list of image BYTES (may be empty if all fail).
-        LIMITED to max 2 model attempts to avoid timeout/OOM on GitHub Actions.
-        """
-        images = []
-        prompts = [
-            f"BMW M5 F90 professional automotive photography: {news_title}. "
-            f"Front three-quarter view, vibrant colors, high quality, dramatic lighting, no text.",
-            f"BMW automotive news illustration: {news_title}. "
-            f"Side profile shot, studio lighting, sleek design, M Power styling, no text.",
-        ]
-        selected_prompts = prompts[:min(count, len(prompts))]
-
-        _IMAGE_MODELS = ["flux", "flux-pro"]
-        attempts = 0
-        max_attempts = 2
-
-        for i, prompt in enumerate(selected_prompts):
-            for img_model in _IMAGE_MODELS:
-                attempts += 1
-                if attempts > max_attempts:
-                    break
-                try:
-                    ai_response = await asyncio.wait_for(
-                        get_ai_router()._primary.generate_image(prompt, model=img_model),
-                        timeout=60.0
-                    )
-                    img_bytes = self._ai_response_to_bytes(ai_response)
-                    if img_bytes:
-                        images.append(img_bytes)
-                        break
-                except asyncio.TimeoutError:
+                except (httpx.TimeoutException, httpx.HTTPError):
                     continue
-                except Exception as e:
-                    logger.debug(f"Image gen #{i+1} with {img_model} failed: {e}")
+                except Exception:
                     continue
-            if images:
-                break
-            if attempts >= max_attempts:
-                break
 
-        logger.info(f"Generated {len(images)}/{count} AI images for post ({attempts} attempts)")
+        logger.info(f"Downloaded {len(images)}/{len(image_urls)} images")
         return images
 
     async def _scrape_article_images(self, article_url: str, max_count: int = 10) -> List[bytes]:
         """Scrape images from a news article page.
-        
+
         Extracts images from multiple sources in priority order:
         1. og:image meta tags (usually the main article image)
         2. twitter:image meta tags
         3. JSON-LD structured data (schema.org image field)
-        4. <picture>/<source srcset> elements
-        5. <img> tags from article body areas (src + data-src for lazy loading)
-        
+        4. <img> tags from article body areas (src + data-src for lazy loading)
+        5. <picture>/<source srcset> elements
+
         Returns list of image data bytes (up to max_count).
         """
         images = []
@@ -875,80 +548,115 @@ class ChannelManager:
                     return images
 
                 html = response.text
-                
-                # 1. Extract og:image first (usually the main article image)
+
+                # Collect candidate URLs in priority order
+                candidate_urls = []
+                seen = set()
+
+                def _add_url(url: str):
+                    """Add a URL to candidates if not seen and not obviously junk."""
+                    if not url or len(url) < 10 or url in seen:
+                        return
+                    # Normalize protocol-relative URLs
+                    if url.startswith("//"):
+                        url = "https:" + url
+                    # Quick junk filter
+                    url_lower = url.lower()
+                    if any(kw in url_lower for kw in ['favicon', '1x1', 'pixel', 'spacer',
+                                                        'blank.gif', 'gravatar', 'analytics',
+                                                        'tracker', 'beacon']):
+                        return
+                    seen.add(url)
+                    candidate_urls.append(url)
+
+                # 1. og:image (usually the main article image — HIGHEST priority)
                 og_images = re.findall(r'<meta[^>]+property=["\x27]og:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 og_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+property=["\x27]og:image["\x27]', html, re.IGNORECASE)
-                # Also og:image:url and og:image:secure_url
                 og_images += re.findall(r'<meta[^>]+property=["\x27]og:image:url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 og_images += re.findall(r'<meta[^>]+property=["\x27]og:image:secure_url["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
-                
-                # 2. Extract twitter:image
+                for url in og_images:
+                    _add_url(url.replace("&amp;", "&"))
+
+                # 2. twitter:image
                 tw_images = re.findall(r'<meta[^>]+name=["\x27]twitter:image["\x27][^>]+content=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
                 tw_images += re.findall(r'<meta[^>]+content=["\x27]([^"\x27]+)["\x27][^>]+name=["\x27]twitter:image["\x27]', html, re.IGNORECASE)
-                
-                # 3. Extract images from JSON-LD structured data (schema.org)
+                for url in tw_images:
+                    _add_url(url.replace("&amp;", "&"))
+
+                # 3. JSON-LD structured data (schema.org)
                 jsonld_images = self._extract_jsonld_images(html)
-                
-                # 4. Extract from <picture>/<source srcset> elements
-                srcset_images = []
-                # Find <picture> blocks and their <source srcset="...">
+                for url in jsonld_images:
+                    _add_url(url)
+
+                # 4. <img> tags from article body areas (THE MOST IMPORTANT for multi-photo articles)
+                # Automotive articles typically have 5-10 photos in the article body
+                article_html = ""
+                for pattern in [r'<article[^>]*>(.*?)</article>',
+                                r'<main[^>]*>(.*?)</main>',
+                                r'<div[^>]+class=["\x27][^"\x27]*(?:content|article|post|entry|gallery)[^"\x27]*["\x27][^>]*>(.*?)</div>']:
+                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+                    for match in matches:
+                        article_html += match + "\n"
+
+                # If article body found, extract images from there
+                if article_html:
+                    # data-src (lazy loading — often higher quality)
+                    lazy_urls = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
+                    lazy_urls += re.findall(r'<img[^>]+data-lazy-src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
+                    for url in lazy_urls:
+                        _add_url(url.replace("&amp;", "&"))
+
+                    # Regular src
+                    src_urls = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
+                    for url in src_urls:
+                        _add_url(url.replace("&amp;", "&"))
+
+                    # srcset (responsive images)
+                    srcset_matches = re.findall(r'srcset=["\x27]([^"\x27]+)["\x27]', article_html, re.IGNORECASE)
+                    for srcset in srcset_matches:
+                        for part in srcset.split(','):
+                            url = part.strip().split()[0] if part.strip() else ''
+                            _add_url(url)
+                else:
+                    # No article body found — try all <img> in the page as last resort
+                    all_img = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
+                    lazy_all = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE)
+                    for url in lazy_all:
+                        _add_url(url.replace("&amp;", "&"))
+                    for url in all_img:
+                        _add_url(url.replace("&amp;", "&"))
+
+                # 5. <picture>/<source srcset> elements
                 picture_blocks = re.findall(r'<picture[^>]*>(.*?)</picture>', html, re.IGNORECASE | re.DOTALL)
                 for block in picture_blocks:
                     srcsets = re.findall(r'srcset=["\x27]([^"\x27]+)["\x27]', block, re.IGNORECASE)
                     for srcset in srcsets:
-                        # srcset can have multiple URLs with descriptors: "url1 1x, url2 2x"
                         for part in srcset.split(','):
                             url = part.strip().split()[0] if part.strip() else ''
-                            if url:
-                                srcset_images.append(url)
-                
-                # 5. Extract <img> tags — from article body areas
-                article_html = ""
-                for pattern in [r'<article[^>]*>(.*?)</article>', r'<main[^>]*>(.*?)</main>', r'<div[^>]+class=["\x27][^"\x27]*(?:content|article|post|entry)[^"\x27]*["\x27][^>]*>(.*?)</div>']:
-                    matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-                    for match in matches:
-                        article_html += match + "\n"
-                
-                # If no article body found, try all <img> tags as fallback
-                search_html = article_html if article_html else html
-                all_img_urls = re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
-                # Also check data-src for lazy-loaded images
-                lazy_img_urls = re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
-                # And data-lazy-src
-                lazy_img_urls += re.findall(r'<img[^>]+data-lazy-src=["\x27]([^"\x27]+)["\x27]', search_html, re.IGNORECASE)
-                all_img_urls = lazy_img_urls + all_img_urls  # Lazy images first (often higher quality)
-                
-                # Prioritize: og:image > twitter:image > JSON-LD > srcset > article body images
-                candidate_urls = []
-                seen = set()
-                for url_list in [og_images, tw_images, jsonld_images, srcset_images, all_img_urls]:
-                    for url in url_list:
-                        if url and url not in seen and len(url) > 10:
-                            if url.startswith("//"):
-                                url = "https:" + url
-                            if not self._is_junk_image_url(url):
-                                seen.add(url)
-                                candidate_urls.append(url)
-                
+                            _add_url(url)
+
                 logger.info(f"Scraped {len(candidate_urls)} candidate image URLs from {article_url[:60]}")
-                images = await self._download_news_images(candidate_urls, max_count=max_count)
+
+                # Download and validate the candidates
+                if candidate_urls:
+                    images = await self._download_images(candidate_urls, max_count=max_count)
 
         except Exception as e:
             logger.debug(f"Article scraping failed: {e}")
 
         return images
-    
+
     @staticmethod
     def _extract_jsonld_images(html: str) -> List[str]:
         """Extract image URLs from JSON-LD structured data in HTML.
-        
+
         Many modern news sites use schema.org JSON-LD with 'image' field
         that contains high-quality article images. This is often the best
         source for article images, even better than og:image.
         """
         images = []
         try:
+            import json
             # Find all JSON-LD blocks
             jsonld_blocks = re.findall(
                 r'<script[^>]+type=["\x27]application/ld\+json["\x27][^>]*>(.*?)</script>',
@@ -956,7 +664,6 @@ class ChannelManager:
             )
             for block in jsonld_blocks:
                 try:
-                    import json
                     data = json.loads(block)
                     # Handle both single objects and arrays
                     items = data if isinstance(data, list) else [data]
@@ -988,22 +695,18 @@ class ChannelManager:
         return images
 
     async def _get_post_images(self, news_item: Dict) -> tuple:
-        """Get images for a news post — PRIORITIZE real photos from news sources.
-        
-        KEY CHANGE: Real photos from the actual news article are FAR more valuable
-        than AI-generated images. We now aggressively fetch up to MAX_IMAGES_PER_POST (10)
-        real photos from RSS feeds, article scraping, and web search BEFORE falling
-        back to AI generation.
+        """Get images for a news post — ONLY from the article page.
 
-        Priority:
-        1. RSS images (from news source) — up to MAX_RSS_IMAGES
-        2. Article page scraping (og:image, twitter:image, article body) — up to MAX_SCRAPE_IMAGES
-        3. Web search enrichment (find images for this specific news) — up to MAX_SEARCH_IMAGES
-        4. Pexels API (free car photos, needs key)
-        5. Pixabay API (free car photos, needs key)
-        6. Wikimedia Commons (free, no key needed)
-        7. AI generation — LAST RESORT
-        8. Stock BMW photo fallback — ABSOLUTE LAST RESORT
+        v3.0: RADICALLY SIMPLIFIED.
+        Automotive news articles ALWAYS come with photos.
+        We extract them directly from the article. That's it.
+
+        Steps:
+        1. Scrape the article page for images (og:image, JSON-LD, article body <img>)
+        2. If RSS provided image URLs, download those too (same source, different path)
+
+        That's it. No fallbacks to stock photos, AI generation, or web search.
+        If the article has no photos = text-only post. Better than wrong photos.
 
         Returns (image_list: List[bytes], source: str)
         """
@@ -1011,140 +714,46 @@ class ChannelManager:
         source = "none"
         title = news_item.get("title", "")
 
-        # Extract BMW model for better image search
-        bmw_query = "BMW car"
-        title_lower = title.lower()
-        for model in ["M5", "M3", "M4", "M2", "M8", "X5", "X3", "X6", "X7", "X4", "X1",
-                       "i7", "i5", "i4", "iX", "Z4", "Alpina"]:
-            if model.lower() in title_lower:
-                bmw_query = f"BMW {model}"
-                break
-
-        # 1. Try RSS images — download up to MAX_RSS_IMAGES real photos
-        rss_image_urls = news_item.get("image_urls", [])
-        if rss_image_urls:
-            try:
-                rss_images = await self._download_news_images(
-                    rss_image_urls,
-                    max_count=MAX_RSS_IMAGES
-                )
-                if rss_images:
-                    image_list.extend(rss_images)
-                    source = "real"
-                    logger.info(f"Using {len(rss_images)} real images from RSS for: {title[:50]}")
-            except Exception as e:
-                logger.warning(f"Failed to download RSS images: {e}")
-
-        # 2. Try scraping article page for images — ALWAYS try if URL exists
-        if news_item.get("url") and len(image_list) < MAX_IMAGES_PER_POST:
+        # Step 1: Scrape article page — the PRIMARY and most reliable source
+        # Automotive articles ALWAYS have photos embedded in the page
+        article_url = news_item.get("url", "")
+        if article_url:
             try:
                 scraped = await self._scrape_article_images(
-                    news_item["url"],
-                    max_count=MAX_SCRAPE_IMAGES
+                    article_url,
+                    max_count=MAX_IMAGES_PER_POST
                 )
                 if scraped:
-                    for img in scraped:
-                        if len(image_list) >= MAX_IMAGES_PER_POST:
-                            break
-                        image_list.append(img)
-                    source = "scraped" if source == "none" else source + "+scraped"
-                    logger.info(f"Scraped {len(scraped)} images for: {title[:50]}")
+                    image_list.extend(scraped)
+                    source = "article"
+                    logger.info(f"Scraped {len(scraped)} images from article: {title[:50]}")
             except Exception as e:
-                logger.debug(f"Article scraping skipped: {e}")
+                logger.debug(f"Article scraping failed: {e}")
 
-        # 3. Web search enrichment — find MORE images for this specific news
-        if len(image_list) < NEWS_IMAGES_MIN and title:
+        # Step 2: Add RSS image URLs if available (these come from the same source,
+        # just via RSS enclosures/media:content instead of HTML scraping)
+        rss_image_urls = news_item.get("image_urls", [])
+        if rss_image_urls and len(image_list) < MAX_IMAGES_PER_POST:
             try:
-                search_image_urls = await enrich_with_search_images(title, max_images=5)
-                if search_image_urls:
-                    searched = await self._download_news_images(search_image_urls, max_count=MAX_SEARCH_IMAGES)
-                    if searched:
-                        for img in searched:
-                            if len(image_list) >= MAX_IMAGES_PER_POST:
-                                break
-                            image_list.append(img)
-                        source = "search" if source == "none" else source + "+search"
-                        logger.info(f"Found {len(searched)} images via web search for: {title[:50]}")
+                # Filter out URLs we already have from scraping
+                existing_urls = set()
+                # We can't easily compare by URL since we've already downloaded,
+                # but we can still try to get more images
+                remaining = MAX_IMAGES_PER_POST - len(image_list)
+                rss_images = await self._download_images(rss_image_urls, max_count=remaining)
+                if rss_images:
+                    image_list.extend(rss_images)
+                    source = "article+rss" if source == "article" else "rss"
+                    logger.info(f"Added {len(rss_images)} RSS images: {title[:50]}")
             except Exception as e:
-                logger.debug(f"Web search image enrichment skipped: {e}")
+                logger.debug(f"RSS image download failed: {e}")
 
-        # 4. Try Pexels API (free, high-quality car photos)
-        if len(image_list) < 2:
-            try:
-                pexels_images = await self._fetch_pexels_images(bmw_query, max_count=2)
-                if pexels_images:
-                    image_list.extend(pexels_images)
-                    source = "pexels" if source == "none" else source + "+pexels"
-            except Exception as e:
-                logger.debug(f"Pexels image fetch error: {e}")
-
-        # 5. Try Pixabay API (free, large collection)
-        if len(image_list) < 2:
-            try:
-                pixabay_images = await self._fetch_pixabay_images(bmw_query, max_count=2)
-                if pixabay_images:
-                    image_list.extend(pixabay_images)
-                    source = "pixabay" if source == "none" else source + "+pixabay"
-            except Exception as e:
-                logger.debug(f"Pixabay image fetch error: {e}")
-
-        # 6. Try Wikimedia Commons (free, no API key needed)
-        if len(image_list) < 2:
-            try:
-                wiki_images = await self._fetch_wikimedia_images(bmw_query, max_count=2)
-                if wiki_images:
-                    image_list.extend(wiki_images)
-                    source = "wikimedia" if source == "none" else source + "+wikimedia"
-            except Exception as e:
-                logger.debug(f"Wikimedia image fetch error: {e}")
-
-        # 7. AI generation fallback — LAST RESORT (all real sources failed)
-        if not image_list:
-            try:
-                ai_images = await self._generate_post_images(title, count=1)
-                if ai_images:
-                    image_list.extend(ai_images)
-                    source = "ai"
-                    logger.info(f"Generated {len(ai_images)} AI images (no real images found)")
-                else:
-                    # Specific prompts failed — try ONE generic prompt
-                    try:
-                        ai_resp = await asyncio.wait_for(
-                            get_ai_router()._primary.generate_image(
-                                "Beautiful BMW car on a scenic road, professional automotive "
-                                "photography, golden hour, no text.",
-                                model="flux",
-                            ),
-                            timeout=60.0,
-                        )
-                        img_bytes = self._ai_response_to_bytes(ai_resp)
-                        if img_bytes:
-                            image_list = [img_bytes]
-                            source = "ai-generic"
-                            logger.info("Generated generic AI BMW image")
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"Generic image generation failed: {e}")
-            except Exception as e:
-                logger.warning(f"AI image generation skipped: {e}")
-
-        # 8. Stock BMW photo fallback (absolute last resort)
-        if not image_list:
-            try:
-                stock_images = await self._fetch_stock_bmw_images()
-                if stock_images:
-                    image_list.extend(stock_images)
-                    source = "stock"
-                    logger.info("Using stock BMW photo as last resort")
-            except Exception as e:
-                logger.debug(f"Stock BMW image fallback error: {e}")
-
-        # HARD LIMIT: never more than MAX_IMAGES_PER_POST (10 max — Telegram limit)
+        # Hard limit
         image_list = image_list[:MAX_IMAGES_PER_POST]
 
         if not image_list:
-            logger.warning(
-                f"No images found for post: {title[:60]}. "
-                f"All image sources failed (RSS, scrape, Pexels, Pixabay, Wikimedia, search, AI, stock). "
+            logger.info(
+                f"No images from article for: {title[:60]}. "
                 f"Post will be published as text-only."
             )
 
@@ -1196,20 +805,20 @@ class ChannelManager:
 
             if response.error or not response.text:
                 logger.warning(f"AI post generation failed: {response.error_message}")
-                return None
 
-            return response.text
+            text = response.text or ""
 
         except Exception as e:
-            logger.error(f"Post text generation error: {e}")
+            logger.error(f"AI generation error: {e}")
             return None
+
+        return text.strip() if text else None
 
     async def run_scheduled_post(self) -> bool:
         """Try to create and post content to the channel.
 
-        v2.0: Posts are published WITH images whenever possible.
-        If no images are available, text-only is allowed as a last resort
-        (channel silence is worse than a post without a photo).
+        v3.0: Simplified image pipeline — only article photos.
+        No photo = text-only post. Better no photo than wrong photo.
         """
         try:
             # Check posting limits
@@ -1255,47 +864,22 @@ class ChannelManager:
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
 
-            # Get images — prioritize REAL photos from news, AI generation as LAST resort
+            # Get images — ONLY from article page
             image_data_list, image_source = await self._get_post_images(news_item)
             has_media = len(image_data_list) > 0
             media_count = len(image_data_list) if has_media else 0
 
-            # ── SMART MEDIA DECISION ──
+            # ── MEDIA DECISION ──
             #
             # RULES (Telegram limits: caption=1024, text-only=4096):
             #   1. Post with photo — ALWAYS preferred.
-            #   2. Post without photo — only when no image is available at all.
-            #      Channel silence is WORSE than a post without photo.
+            #   2. Post without photo — when article has no images.
+            #      Better no photo than a wrong (irrelevant) photo.
             #
             _CAPTION_LIMIT = config.TELEGRAM_CAPTION_LIMIT   # 1024
             _TEXT_LIMIT = config.TELEGRAM_TEXT_LIMIT          # 4096
 
-            if not has_media and len(post_text) <= _CAPTION_LIMIT:
-                # No media + short text — try one more image generation attempt
-                logger.warning(
-                    f"Post has NO media and text is {len(post_text)} chars. "
-                    f"Attempting last-resort image generation..."
-                )
-                try:
-                    last_resort = await self._generate_post_images(
-                        news_item.get("title", ""), count=1
-                    )
-                    if last_resort:
-                        image_data_list = last_resort
-                        has_media = True
-                        image_source = "ai-last-resort"
-                        logger.info("Last-resort AI image gen succeeded")
-                except Exception as e:
-                    logger.debug(f"Last-resort image gen failed: {e}")
-
-                if not has_media:
-                    # PUBLISH TEXT-ONLY as last resort — better than channel silence
-                    logger.warning(
-                        f"POSTING TEXT-ONLY (last resort): No images available, text is "
-                        f"{len(post_text)} chars. Channel silence is worse than no-photo post."
-                    )
-
-            elif has_media and len(post_text) > _CAPTION_LIMIT:
+            if has_media and len(post_text) > _CAPTION_LIMIT:
                 # Has media + text too long — compress to keep media
                 logger.info(
                     f"Post text {len(post_text)} chars > caption limit {_CAPTION_LIMIT}. "
@@ -1383,11 +967,12 @@ class ChannelManager:
                             os.unlink(tmp_path)
                         except Exception:
                             pass
+
                 else:
-                    # Text-only post (no images available)
+                    # Text-only post — no images available from article
                     sent_message = await self._bot.send_message(
                         chat_id=config.CHANNEL_ID,
-                        text=post_text,
+                        text=post_text[:4096],
                         parse_mode=ParseMode.HTML,
                     )
 
@@ -1423,12 +1008,10 @@ class ChannelManager:
             return False
 
     async def post_partner_content(self) -> bool:
-        """Post partner content to the channel with partner logo image.
+        """Post partner content to the channel.
 
-        Partner posts ALWAYS have an image:
-        1. Try downloading the partner's logo from image_url
-        2. Fallback: try Wikimedia/AI generation
-        3. Post as text-only only if absolutely no image is available
+        Partner posts try to get an image from the partner's logo URL.
+        If no image available, post as text-only.
         """
         if not partner_manager.should_post_partner():
             return False
@@ -1445,7 +1028,7 @@ class ChannelManager:
         # Try to get an image for the partner post
         image_data = None
 
-        # 1. Try downloading the partner's logo/image
+        # Try downloading the partner's logo/image
         logo_url = getattr(program, 'image_url', '') or getattr(program, 'logo_url', '') or getattr(program, 'image', '')
         if logo_url:
             try:
@@ -1460,38 +1043,6 @@ class ChannelManager:
                             logger.info(f"Partner logo downloaded: {program.name} ({len(resp.content)} bytes)")
             except Exception as e:
                 logger.debug(f"Partner logo download failed for {program.name}: {e}")
-
-        # 2. Try Wikimedia with partner name
-        if not image_data:
-            try:
-                wiki_images = await self._fetch_wikimedia_images(program.name, max_count=1)
-                if wiki_images:
-                    image_data = wiki_images[0]
-                    logger.info(f"Wikimedia fallback image for partner: {program.name}")
-            except Exception as e:
-                logger.debug(f"Wikimedia fallback for partner {program.name}: {e}")
-
-        # 3. Try AI generation
-        if not image_data:
-            try:
-                ai_images = await self._generate_post_images(
-                    f"professional logo design for {program.name}", count=1
-                )
-                if ai_images:
-                    image_data = ai_images[0]
-                    logger.info(f"AI-generated image for partner: {program.name}")
-            except Exception as e:
-                logger.debug(f"AI image gen for partner {program.name}: {e}")
-
-        # 4. Try stock BMW image as last resort
-        if not image_data:
-            try:
-                stock_images = await self._fetch_stock_bmw_images()
-                if stock_images:
-                    image_data = stock_images[0]
-                    logger.info(f"Stock BMW image for partner post: {program.name}")
-            except Exception as e:
-                logger.debug(f"Stock image for partner {program.name}: {e}")
 
         try:
             if image_data:

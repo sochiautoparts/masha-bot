@@ -128,7 +128,12 @@ _EVENT_KEYWORDS = [
 
 
 def _extract_entities(title: str) -> str:
-    """Extract key entities from a news title for dedup — BMW-focused."""
+    """Extract key entities from a news title for dedup — BMW-focused.
+    
+    IMPORTANT: If we have a BMW brand but NO model, we must also have
+    an engine or specific person to create a useful key. Brand+event only
+    (like "bmw_debut") is TOO BROAD and blocks all BMW launch news.
+    """
     title_lower = title.lower()
 
     # Extract brand
@@ -175,6 +180,14 @@ def _extract_entities(title: str) -> str:
 
     parts = [p for p in [brand, bmw_model, bmw_engine, person, team, event] if p]
     entity_key = "_".join(parts) if parts else ""
+    
+    # ── GUARD: Skip overly broad keys ──
+    # "bmw_debut", "bmw_launch", "bmw_recall" etc. are too broad for
+    # a BMW-focused channel — they block ALL BMW debut/launch/recall news.
+    # Require at least a model or engine or person to make the key specific.
+    if entity_key and brand and not bmw_model and not bmw_engine and not person and not team:
+        # Only brand + event (like "bmw_debut") — too broad, return empty
+        return ""
 
     return entity_key
 

@@ -34,11 +34,16 @@ TOKEN LIMITS (route-aware, enforced by ProviderManager):
 import logging
 import os
 import time
+import threading
 from typing import Optional, List, Dict
 
 from .base import BaseAIProvider, AIResponse
 
 logger = logging.getLogger("masha.ai.local")
+
+# ── Thread lock for llama-cpp-python — NOT thread-safe! ──
+# Multiple concurrent calls to self._llm() cause segfaults.
+_llama_lock = threading.Lock()
 
 # ── Qwen3 chat template ──
 # Qwen3 uses ChatML format with special tokens
@@ -451,8 +456,24 @@ class LocalProvider(BaseAIProvider):
             )
 
     def _generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
-        """Synchronous generation call (runs in thread pool)."""
+        """Synchronous generation call (runs in thread pool).
+
+        CRITICAL: llama-cpp-python is NOT thread-safe — concurrent calls
+        cause segfaults (exit code 139). We use a global lock to ensure
+        only one generation runs at a time.
+        """
+        acquired = _llama_lock.acquire(timeout=120)  # Wait up to 2 min
+        if not acquired:
+            logger.error("Local model: could not acquire lock (timeout 120s)")
+            return ""
+
         try:
+            # Reset KV cache before each call to prevent stale state
+            try:
+                self._llm.reset()
+            except Exception:
+                pass
+
             result = self._llm(
                 prompt,
                 max_tokens=max_tokens,
@@ -469,6 +490,8 @@ class LocalProvider(BaseAIProvider):
             self._consecutive_errors += 1
             self._last_error_time = time.time()
             return ""
+        finally:
+            _llama_lock.release()
 
         # Extract text from result
         if isinstance(result, dict):

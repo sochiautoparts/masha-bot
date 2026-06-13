@@ -180,19 +180,26 @@ class BMWRSSFetcher:
         return relevant
 
     async def _fetch_all_sources(self) -> list[dict[str, Any]]:
-        """Fetch items from all RSS sources concurrently."""
+        """Fetch items from all RSS sources concurrently.
+        
+        Reddit sources are staggered with delays to avoid 429 rate limits.
+        All other sources are fetched concurrently for speed.
+        """
         import asyncio
 
         all_items: list[dict[str, Any]] = []
 
         async def _safe_fetch(source: dict[str, str]) -> list[dict[str, Any]]:
             try:
+                # Reddit rate-limits concurrent requests — add 1-2s stagger
+                if "reddit.com" in source["url"]:
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
                 return await self._fetch_rss(source)
             except Exception as exc:
                 logger.warning("Failed to fetch from %s: %s", source["name"], exc)
                 return []
 
-        # Fetch all sources concurrently (3x faster than sequential)
+        # Fetch all sources concurrently (Reddit staggered, others in parallel)
         results = await asyncio.gather(*[_safe_fetch(s) for s in BMW_RSS_SOURCES])
         for items in results:
             all_items.extend(items)

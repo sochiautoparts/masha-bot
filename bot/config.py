@@ -295,25 +295,25 @@ class NewsSource:
 @dataclass
 class NewsConfig:
     """News source configuration — BMW-specific sources (v2: updated working feeds)."""
+    # v4.0: Replaced broken feeds with verified working ones
     sources: List[NewsSource] = field(default_factory=lambda: [
         # BMW-specific RSS feeds (verified working)
         NewsSource(name="BMWBlog", url="https://bmwblog.com/feed/", lang="en", category="bmw"),
         NewsSource(name="BimmerFile", url="https://bimmerfile.com/feed/", lang="en", category="bmw"),
         NewsSource(name="GoogleNewsBMW", url="https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", lang="en", category="bmw"),
         NewsSource(name="GoogleNewsBMWRU", url="https://news.google.com/rss/search?q=БМВ+новости&hl=ru&gl=RU&ceid=RU:ru", lang="ru", category="bmw"),
-        # General auto feeds (for BMW-relevant content)
-        # CarScoops returns 403 — replaced with MotorAuthority
-        NewsSource(name="MotorAuthority", url="https://www.motorauthority.com/rss.xml", lang="en", category="auto"),
+        # General auto feeds (v4.0: MotorAuthority 403→CarScoops, added CarAndDriver)
+        NewsSource(name="CarScoops", url="https://www.carscoops.com/feed/", lang="en", category="auto"),
+        NewsSource(name="CarAndDriver", url="https://www.caranddriver.com/rss/all.xml", lang="en", category="auto"),
         NewsSource(name="Autocar", url="https://www.autocar.co.uk/rss", lang="en", category="auto"),
         NewsSource(name="AutoExpress", url="https://www.autoexpress.co.uk/rss", lang="en", category="auto"),
         NewsSource(name="CarExpert", url="https://carexpert.com.au/feed/", lang="en", category="auto"),
         NewsSource(name="Electrek", url="https://electrek.co/feed/", lang="en", category="auto"),
         NewsSource(name="InsideEVs", url="https://insideevs.com/feed/", lang="en", category="auto"),
-        # Reddit (old.reddit.com for better bot compatibility)
+        # v4.0: Removed r/MotorSport (429) and r/BMWMotorrad (429), added Jalopnik
         NewsSource(name="RedditBMW", url="https://old.reddit.com/r/BMW/.rss", lang="en", category="reddit"),
         NewsSource(name="Reddcars", url="https://old.reddit.com/r/cars/.rss", lang="en", category="reddit"),
-        NewsSource(name="RedditMotorSport", url="https://old.reddit.com/r/MotorSport/.rss", lang="en", category="reddit"),
-        NewsSource(name="RedditBMWMotorrad", url="https://old.reddit.com/r/BMWMotorrad/.rss", lang="en", category="reddit"),
+        NewsSource(name="Jalopnik", url="https://jalopnik.com/rss", lang="en", category="auto"),
     ])
 
 

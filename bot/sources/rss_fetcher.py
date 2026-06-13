@@ -36,8 +36,9 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "Google News BMW", "url": "https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", "category": "bmw_news"},
     {"name": "Google News BMW RU", "url": "https://news.google.com/rss/search?q=%D0%91%D0%9C%D0%92+%D0%BD%D0%BE%D0%B2%D0%BE%D1%81%D1%82%D0%B8&hl=ru&gl=RU&ceid=RU:ru", "category": "bmw_news"},
     # ── General auto with BMW coverage ──────────────────────────────────────
-    # CarScoops returns 403 — replaced with MotorAuthority (verified working)
-    {"name": "MotorAuthority", "url": "https://www.motorauthority.com/rss.xml", "category": "general_auto"},
+    # v4.0: MotorAuthority returns 403 — replaced with CarScoops (HTTP 200, BMW content, images)
+    {"name": "CarScoops", "url": "https://www.carscoops.com/feed/", "category": "general_auto"},
+    {"name": "CarAndDriver", "url": "https://www.caranddriver.com/rss/all.xml", "category": "general_auto"},
     {"name": "Autocar", "url": "https://www.autocar.co.uk/rss", "category": "general_auto"},
     {"name": "AutoExpress", "url": "https://www.autoexpress.co.uk/rss", "category": "general_auto"},
     {"name": "CarExpert", "url": "https://carexpert.com.au/feed/", "category": "general_auto"},
@@ -45,10 +46,10 @@ BMW_RSS_SOURCES: list[dict[str, str]] = [
     {"name": "Electrek", "url": "https://electrek.co/feed/", "category": "electric"},
     {"name": "InsideEVs", "url": "https://insideevs.com/feed/", "category": "electric"},
     # ── Reddit (use old.reddit.com for better bot compatibility) ──────────
+    # v4.0: Removed r/MotorSport (429) and r/BMWMotorrad (429) — replaced with Jalopnik
     {"name": "Reddit r/BMW", "url": "https://old.reddit.com/r/BMW/.rss", "category": "reddit"},
     {"name": "Reddit r/cars", "url": "https://old.reddit.com/r/cars/.rss", "category": "reddit"},
-    {"name": "Reddit r/MotorSport", "url": "https://old.reddit.com/r/MotorSport/.rss", "category": "reddit"},
-    {"name": "Reddit r/BMWMotorrad", "url": "https://old.reddit.com/r/BMWMotorrad/.rss", "category": "bmw_motorrad"},
+    {"name": "Jalopnik", "url": "https://jalopnik.com/rss", "category": "general_auto"},
 ]
 
 # ── BMW-focused search queries ────────────────────────────────────────────────
@@ -242,8 +243,22 @@ class BMWRSSFetcher:
                 link = getattr(entry, "link", "")
                 published = getattr(entry, "published", "")
 
-                # Filter for BMW relevance
-                combined = f"{title} {summary}".lower()
+                # v4.0: Extract full content from RSS if available
+                # Many feeds include <content:encoded> with much more text than <summary>
+                content_raw = getattr(entry, "content", None)
+                full_content = ""
+                if content_raw:
+                    if isinstance(content_raw, list) and content_raw:
+                        full_content = content_raw[0].get("value", "")
+                    elif isinstance(content_raw, str):
+                        full_content = content_raw
+
+                # Strip HTML from full_content for text analysis
+                import re as _re
+                full_content_clean = _re.sub(r'<[^>]+>', '', full_content) if full_content else ""
+
+                # Use the best available text for BMW relevance check
+                combined = f"{title} {full_content_clean or summary}".lower()
                 if not self._is_bmw_relevant(combined):
                     continue
 
@@ -257,6 +272,7 @@ class BMWRSSFetcher:
                     "source": name,
                     "title": title,
                     "summary": summary[:500],
+                    "full_content": full_content_clean[:3000] if full_content_clean else "",  # v4.0: full article from RSS
                     "url": link,
                     "published": published,
                     "category": source.get("category", ""),

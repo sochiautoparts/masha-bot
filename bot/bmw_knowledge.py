@@ -372,14 +372,12 @@ BMW_GOOGLE_NEWS_QUERIES = [
 # ── BMW-Specific RSS Sources ─────────────────────────────────────────────────────
 
 BMW_RSS_SOURCES = [
+    # v4.0: Updated — removed broken feeds, synced with rss_fetcher.py
     {"name": "BMWBlog", "url": "https://bmwblog.com/feed/", "lang": "en", "category": "bmw"},
-    {"name": "BimmerPost", "url": "https://bimmerpost.com/feed/", "lang": "en", "category": "bmw"},
-    {"name": "Motor1BMW", "url": "https://www.motor1.com/rss/bmw/", "lang": "en", "category": "bmw"},
-    {"name": "CarAndDriverBMW", "url": "https://www.caranddriver.com/bmw/rss/", "lang": "en", "category": "bmw"},
-    {"name": "AutoExpressBMW", "url": "https://www.autoexpress.co.uk/bmw/rss", "lang": "en", "category": "bmw"},
-    {"name": "RedditBMW", "url": "https://www.reddit.com/r/BMW/.rss", "lang": "en", "category": "bmw"},
-    {"name": "RedditM5", "url": "https://www.reddit.com/r/M5/.rss", "lang": "en", "category": "bmw"},
-    {"name": "RedditBimmerTech", "url": "https://www.reddit.com/r/BimmerTech/.rss", "lang": "en", "category": "bmw"},
+    {"name": "BimmerFile", "url": "https://bimmerfile.com/feed/", "lang": "en", "category": "bmw"},
+    {"name": "CarScoops", "url": "https://www.carscoops.com/feed/", "lang": "en", "category": "auto"},
+    {"name": "CarAndDriver", "url": "https://www.caranddriver.com/rss/all.xml", "lang": "en", "category": "auto"},
+    {"name": "RedditBMW", "url": "https://old.reddit.com/r/BMW/.rss", "lang": "en", "category": "reddit"},
 ]
 
 

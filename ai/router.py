@@ -194,10 +194,14 @@ class AIRouter:
 
         instruction = type_instructions.get(content_type, type_instructions["news+reaction"])
 
-        # Media-aware instructions
+        # Media-aware instructions — v4.0: STRICTER char limit for media posts
         media_note = ""
         if has_media and media_count > 0:
-            media_note = f"\n\nК посту прикреплены {media_count} фото. Не описывай их подробно — они уже прикреплены. Пиши текст новости."
+            media_note = (
+                f"\n\nК посту прикреплены {media_count} фото. Не описывай их подробно — они уже прикреплены."
+                "\nСРОЧНО: С МЕДИА ЛИМИТ 1024 СИМВОЛА! Пиши КОМПАКТНО: 3-5 предложений + подпись."
+                "\nУбери лишние абзацы — каждый символ на счету!"
+            )
         elif not has_media:
             media_note = "\n\nК посту НЕТ прикреплённых фото. Пиши текст так, чтобы он был самодостаточным."
 
@@ -216,10 +220,10 @@ class AIRouter:
 {extra_note}
 
 Ограничения:
-- Максимум 1024 символа (пост с фото) или 4096 (текстовый пост)
+- {'СТРОГИЙ ЛИМИТ: максимум 900 символов текста + подпись (итого 1024)! Пиши КОМПАКТНО — 3-5 предложений, без воды!' if has_media else 'Максимум 4096 символов для текстового поста'}
 - Живой язык, не энциклопедия
 - BMW-экспертность, не вода
-- Подпись в конце обязательна"""
+- Подпись в конце обязательна: Автор @asmasha_bot\\n@bmw_mpower_club\\n#bmw_mpower_club"""
 
         messages = [
             {"role": "system", "content": system},

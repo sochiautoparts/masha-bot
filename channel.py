@@ -76,7 +76,7 @@ _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # ── Keyword-based semantic dedup ────────────────────────────────────────────
 _recent_post_keywords: list = []
-_MAX_RECENT_POSTS = 50  # Reduced from 100 — 100 was too aggressive
+_MAX_RECENT_POSTS = 30  # v4.0: Reduced from 50 — fewer comparisons = fewer false positives
 
 _SEMANTIC_STOP_WORDS = frozenset([
     "в", "на", "с", "о", "у", "по", "из", "за", "от", "до", "к", "не", "и", "но",
@@ -107,26 +107,32 @@ _BMW_CORE_WORDS = frozenset([
 
 
 def _is_semantically_duplicate(title: str) -> bool:
-    """Check if 3+ significant words from title match a recently posted title."""
+    """Check if a title is semantically duplicate of recently posted titles.
+
+    v4.0: RADICALLY RELAXED — was blocking 2/3 of posts in a cycle.
+    Now requires 7+ significant word matches (was 5) AND 4+ core BMW word
+    matches (was 3). In a BMW channel, BMW/M3/M5/etc. are in almost every
+    title, so low thresholds = false positives = only 1 post per cycle.
+    """
     global _recent_post_keywords
 
     words = re.findall(r'[a-zа-яё]{3,}', title.lower())
     significant = [w for w in words if w not in _SEMANTIC_STOP_WORDS]
 
-    if len(significant) < 2:
+    if len(significant) < 3:
         return False
 
     core_words = [w for w in significant if w in _BMW_CORE_WORDS]
 
     for recent_words in _recent_post_keywords:
         matches = sum(1 for w in significant if w in recent_words)
-        if matches >= 5:  # Raised from 3 — too many false positives for BMW channel
+        if matches >= 7:  # v4.0: Raised from 5 — was too aggressive, blocked diverse posts
             return True
 
-        if len(core_words) >= 3:  # Raised from 2 — need more specific overlap
+        if len(core_words) >= 4:  # v4.0: Raised from 3 — BMW terms are in every title
             recent_core = [w for w in recent_words if w in _BMW_CORE_WORDS]
             core_matches = sum(1 for w in core_words if w in recent_core)
-            if core_matches >= 3:  # Raised from 2 — BMW terms are too common in our posts
+            if core_matches >= 4:  # v4.0: Raised from 3 — need near-identical BMW topic
                 return True
 
     return False
@@ -361,7 +367,11 @@ def _ensure_footer(text: str) -> str:
 
 
 def _enforce_char_limit(text: str, has_media: bool) -> str:
-    """Smart character limit enforcement — always preserves footer."""
+    """Smart character limit enforcement — always preserves footer.
+
+    v4.0: Instead of blunt truncation with "...", trims at the last
+    complete paragraph/sentence to keep the text readable.
+    """
     footer = "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
     char_limit = config.TELEGRAM_CAPTION_LIMIT if has_media else config.TELEGRAM_TEXT_LIMIT
 
@@ -377,10 +387,26 @@ def _enforce_char_limit(text: str, has_media: bool) -> str:
     if max_content < 100:
         return footer.lstrip('\n')
 
-    if len(content) > max_content:
-        content = content[:max_content - 3] + "..."
+    if len(content) <= max_content:
+        return content + footer
 
-    return content + footer
+    # v4.0: Smart truncation — cut at last paragraph break, then sentence
+    trimmed = content[:max_content]
+
+    # Try cutting at last paragraph break (\n\n)
+    last_para = trimmed.rfind('\n\n')
+    if last_para > max_content * 0.5:
+        trimmed = trimmed[:last_para]
+    else:
+        # Try cutting at last sentence end (. ! ?)
+        last_sent = max(trimmed.rfind('. '), trimmed.rfind('! '), trimmed.rfind('? '))
+        if last_sent > max_content * 0.5:
+            trimmed = trimmed[:last_sent + 1]
+        else:
+            # Fallback: simple truncation
+            trimmed = trimmed.rstrip() + "..."
+
+    return trimmed.rstrip() + footer
 
 
 class ChannelManager:
@@ -872,13 +898,40 @@ class ChannelManager:
 
         return image_list, source
 
-    async def _generate_post_text(self, news_item: Dict) -> Optional[str]:
-        """Generate post text for a news item using AI."""
+    async def _generate_post_text(self, news_item: Dict, has_media: bool = False, media_count: int = 0) -> Optional[str]:
+        """Generate post text for a news item using AI.
+
+        v4.0: MAJOR REWORK — now scrapes FULL article text instead of using
+        truncated RSS summaries. The AI gets complete facts and writes a
+        unique post in Russian, translating if needed.
+
+        Flow:
+        1. Resolve article URL (Google News redirects → direct URL)
+        2. Scrape full article text from the page
+        3. Fall back to RSS summary if scraping fails
+        4. Pass full text + translation/uniquification instructions to AI
+        """
         title = news_item.get("title", "")
         summary = news_item.get("summary", "")
         source_url = news_item.get("url", "")
 
-        # Build context
+        # ── Step 1: Resolve Google News redirect URLs ──
+        article_url = source_url
+        if article_url:
+            article_url = await self._resolve_article_url(article_url, title=title)
+
+        # ── Step 2: Scrape FULL article text ──
+        full_article_text = ""
+        if article_url:
+            try:
+                from bot.sources.image_fetcher import fetch_article_text
+                full_article_text = await fetch_article_text(article_url, max_chars=3000)
+                if full_article_text:
+                    logger.info(f"Scraped {len(full_article_text)} chars from article: {title[:50]}")
+            except Exception as e:
+                logger.debug(f"Article text scraping failed: {e}")
+
+        # ── Step 3: Build context for AI ──
         context_parts = [get_date_context()]
 
         # BMW-specific context
@@ -890,22 +943,44 @@ class ChannelManager:
         except Exception:
             pass
 
-        if summary:
-            context_parts.append(f"Исходная новость: {summary[:500]}")
+        # Use the BEST available text source:
+        # 1. Scraped full article (best — complete text from the page)
+        # 2. RSS full_content (good — <content:encoded> has more text than summary)
+        # 3. RSS summary (fallback — truncated teaser)
+        rss_full_content = news_item.get("full_content", "")
+        if full_article_text:
+            context_parts.append(
+                f"ПОЛНЫЙ ТЕКСТ СТАТЬИ (используй факты для написания уникального поста):\n{full_article_text}"
+            )
+        elif rss_full_content:
+            context_parts.append(
+                f"РАСШИРЕННЫЙ ТЕКСТ ИЗ RSS (используй факты для написания уникального поста):\n{rss_full_content}"
+            )
+        elif summary:
+            context_parts.append(
+                f"Исходная новость (сокращённая из RSS, полная статья недоступна):\n{summary[:500]}"
+            )
 
-        if source_url:
-            context_parts.append(f"Источник: {source_url}")
+        if article_url:
+            context_parts.append(f"Источник: {article_url}")
 
         # Add editorial aside hint
         aside = get_editorial_aside()
         if aside:
             context_parts.append(f"Редакционная шутка (используй если уместно): {aside}")
 
-        # Add translation/uniquification hint for English sources
+        # Add translation/uniquification hint
         lang = news_item.get("lang", "")
         uniquify_hint = get_translation_uniquification_hint(lang)
         if uniquify_hint:
             context_parts.append(uniquify_hint)
+
+        # v4.0: Explicit instruction to write unique content, not copy
+        context_parts.append(
+            "ЗАДАЧА: Прочитай факты из статьи и напиши СОВЕРШЕННО НОВЫЙ, УНИКАЛЬНЫЙ текст. "
+            "НЕ копируй и НЕ пересказывай близко к тексту — собери факты и напиши СВОЙ текст. "
+            "Если статья на английском — ПЕРЕВЕДИ факты и напиши пост на русском."
+        )
 
         full_context = "\n\n".join(context_parts)
 
@@ -914,12 +989,14 @@ class ChannelManager:
         if not content_type or content_type in ("auto", "bmw_official", "bmw_community", "bmw_news"):
             content_type = "news+reaction"
 
-        # Generate with AI using persona
+        # Generate with AI using persona — v4.0: pass has_media so AI knows the limit
         try:
             response = await get_ai_router().generate_channel_post(
                 topic=title,
                 context=full_context,
                 content_type=content_type,
+                has_media=has_media,
+                media_count=media_count,
             )
 
             if response.error or not response.text:
@@ -994,8 +1071,15 @@ class ChannelManager:
                 logger.info(f"All {max_retries} attempts blocked by dedup")
                 return False
 
-            # Generate post text
-            post_text = await self._generate_post_text(news_item)
+            # v4.0: Get images FIRST so AI knows the char limit (1024 with media, 4096 without)
+            image_data_list, image_source = await self._get_post_images(news_item)
+            has_media = len(image_data_list) > 0
+            media_count = len(image_data_list) if has_media else 0
+
+            # Generate post text — now knows about media attachment
+            post_text = await self._generate_post_text(
+                news_item, has_media=has_media, media_count=media_count
+            )
             if not post_text:
                 return False
 
@@ -1004,11 +1088,6 @@ class ChannelManager:
             if not _validate_post_text(post_text):
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
-
-            # Get images — ONLY from article page
-            image_data_list, image_source = await self._get_post_images(news_item)
-            has_media = len(image_data_list) > 0
-            media_count = len(image_data_list) if has_media else 0
 
             # ── MEDIA DECISION ──
             #

@@ -1,45 +1,32 @@
-"""Smart Image Fetcher v6.0 — Real-photo-first image sourcing for masha-bot.
+"""Smart Image Fetcher v2.0 — Original-first image sourcing for masha-bot.
 
 PRIORITY PIPELINE:
-  1. Direct image URLs from news data (RSS image_urls, article_url)
-  2. RSS enclosures + content:encoded images — <enclosure> / <media:content>
-  3. Article images — BeautifulSoup+lxml scraping (og:image / twitter:image / JSON-LD / <img>)
-  4. BMW Press Images — official press.bmwgroup.com photos (highest quality, real news)
-  5. Google Images via SearXNG — category=images with smart BMW queries
-  6. Google Custom Search Images — additional image search via SearXNG engines=google
-  7. Bing Image Search — direct scraping with retry logic and anti-bot headers
-  8. Unsplash API — proper api.unsplash.com/search/photos (REAL photos, not AI)
-  9. Wikimedia Commons — real automotive photos
- 10. NO AI IMAGE GENERATION — disabled per user requirement
+  1. Article images — og:image / twitter:image / <img> from source URL
+  2. RSS enclosures — <enclosure> / <media:content> from RSS feed
+  3. Image search — SearXNG images / Google Images
+  4. AI generation — Pollinations (LAST RESORT ONLY, handled by caller)
 
-KEY IMPROVEMENTS v6.0 (over v5.0):
-  - FIXED: Unsplash source.unsplash.com was SHUT DOWN in 2024 — replaced with
-    proper Unsplash API (api.unsplash.com/search/photos) with download URLs
-  - FIXED: Bing Image Search — better headers, cookies, retry logic, anti-bot
-  - UPDATED: SearXNG instances — removed dead instances, added working ones
-  - NEW: _search_bmw_press_images() — official BMW press photos from press.bmwgroup.com
-  - NEW: _search_google_custom_images() — Google image search via SearXNG with engines=google
-  - NEW: 45-second global timeout wrapper in fetch() — prevents runaway searches
-  - All image URLs are verified as downloadable, not redirect URLs
-
-NOTE: This module returns image BYTES (not base64) because that's what
-channel.py expects for Telegram posting.
+KEY FEATURES:
+  - Extracts original photos from article pages (og:image, twitter:image)
+  - Parses RSS enclosures and media:content
+  - Validates images: min size, content-type, magic bytes
+  - Caches images by topic/entity with 7-day TTL
+  - Blacklist of junk image domains and patterns
+  - Returns base64-encoded images ready for Telegram
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
-import io
 import json
 import logging
-import os
-import random
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urljoin, quote_plus
+from urllib.parse import urlparse
 
 import httpx
 
@@ -49,127 +36,40 @@ logger = logging.getLogger("masha.image_fetcher")
 
 IMAGE_CACHE_DIR = Path("data/image_cache")
 IMAGE_CACHE_TTL_DAYS = 7
-IMAGE_MIN_SIZE_BYTES = 3_000         # 3 KB — lower threshold for news images
-IMAGE_MAX_SIZE_BYTES = 5_242_880     # 5 MB — matching channel.py limit
-IMAGE_MIN_WIDTH = 320
-IMAGE_MIN_HEIGHT = 240
-IMAGE_FETCH_TIMEOUT = 15.0
-ARTICLE_FETCH_TIMEOUT = 20.0
-MAX_IMAGES_PER_SOURCE = 10           # Up to 10 candidates per source
-MAX_IMAGES_PER_POST = 10             # Telegram mediagroup limit
-DOWNLOAD_CONCURRENCY = 5             # Parallel image downloads
-MAX_RETRIES = 2                      # Retries per image download
-GLOBAL_FETCH_TIMEOUT = 45.0          # Max total seconds for the entire fetch() call
+IMAGE_MIN_SIZE_BYTES = 10_000        # 10 KB — filter out tracking pixels, icons
+IMAGE_MAX_SIZE_BYTES = 10_485_760    # 10 MB — Telegram limit
+IMAGE_MIN_WIDTH = 400
+IMAGE_MIN_HEIGHT = 300
+IMAGE_FETCH_TIMEOUT = 12.0
+ARTICLE_FETCH_TIMEOUT = 15.0
+MAX_IMAGES_PER_SOURCE = 3
 
 # ── Blacklist — junk image URLs that should never be used ─────────────────────
 
 JUNK_DOMAINS = {
+    # Tracking / analytics
     "pixel", "tracker", "analytics", "counter", "beacon",
     "mc.yandex.ru", "mc.yandex.com", "google-analytics.com",
     "facebook.com/tr", "connect.facebook.net",
-    "feeds.feedburner.com", "feedburner.google.com",
-    "pixel.wp.com", "stats.wordpress.com",
+    # Icons / UI elements
+    "gravatar.com", "wp.com/mu-plugins/",
+    # Ad networks
     "doubleclick.net", "adservice.google.com",
     "pagead2.googlesyndication.com", "ad.doubleclick.net",
+    # Social media UI
     "platform.twitter.com", "apis.google.com",
-    "source.unsplash.com",  # DEAD since 2024 — redirects to unsplash.com homepage
 }
 
 JUNK_PATTERNS = [
     r"[\?&](utm_|ref|share|action|callback|client_id)=.*$",
     r"/(icon|logo|favicon|badge|avatar|spinner|loading|placeholder|blank|pixel)\b",
-    r"\d+x\d+\.(gif|png)$",
+    r"\d+x\d+\.(gif|png)$",              # e.g. 16x16.gif, 32x32.png
     r"tracker|beacon|pixel|counter|analytics",
     r"gravatar|avatar|profile.*photo",
     r"(button|btn|icon|logo|badge|spinner)\.(png|gif|svg|webp)$",
 ]
 
-JUNK_KEYWORDS = [
-    "icon", "logo", "favicon", "avatar", "badge", "button", "btn",
-    "spinner", "loading", "placeholder", "pixel", "tracker",
-    "analytics", "share", "facebook", "twitter", "vk.",
-    "telegram", "whatsapp", "instagram", "youtube", "tiktok",
-    "advert", "sponsor", "ad_banner", "ad_image",
-    "emoji", "smileys", "captcha", "recaptcha",
-    "1x1", "spacer", "blank", "transparent", "dot.",
-]
-
-JUNK_EXTENSIONS = {".gif", ".svg"}
-
-# ── BMW model context for smarter search queries ─────────────────────────────
-
-BMW_MODELS_MAP = {
-    "m2": {"generations": ["F87", "G87"], "years": "2016-2026"},
-    "m3": {"generations": ["F80", "G80"], "years": "2014-2026"},
-    "m4": {"generations": ["F82", "G82"], "years": "2014-2026"},
-    "m5": {"generations": ["F90", "G90"], "years": "2018-2026"},
-    "m8": {"generations": ["F91", "F92", "F93"], "years": "2019-2026"},
-    "x3 m": {"generations": ["F97"], "years": "2019-2026"},
-    "x4 m": {"generations": ["F98"], "years": "2019-2026"},
-    "x5 m": {"generations": ["F85", "F95"], "years": "2015-2026"},
-    "x6 m": {"generations": ["F86", "F96"], "years": "2015-2026"},
-    "x5": {"generations": ["F15", "G05"], "years": "2013-2026"},
-    "x3": {"generations": ["F25", "G01"], "years": "2011-2026"},
-    "x7": {"generations": ["G07"], "years": "2019-2026"},
-    "i4": {"generations": ["G26"], "years": "2021-2026"},
-    "i5": {"generations": ["G60"], "years": "2023-2026"},
-    "i7": {"generations": ["G70"], "years": "2022-2026"},
-    "ix": {"generations": ["iX"], "years": "2021-2026"},
-    "z4": {"generations": ["G29"], "years": "2019-2026"},
-    "3 series": {"generations": ["F30", "G20"], "years": "2012-2026"},
-    "5 series": {"generations": ["G30", "G60"], "years": "2017-2026"},
-    "7 series": {"generations": ["G11", "G70"], "years": "2016-2026"},
-    "alpina": {"generations": [], "years": "2020-2026"},
-}
-
-
-def _extract_bmw_model(topic: str) -> str:
-    """Extract BMW model name from topic for smarter image search."""
-    topic_lower = topic.lower()
-    for model_name in sorted(BMW_MODELS_MAP.keys(), key=len, reverse=True):
-        if model_name in topic_lower:
-            info = BMW_MODELS_MAP[model_name]
-            # Also check for generation code
-            for gen in info.get("generations", []):
-                if gen.lower() in topic_lower:
-                    return f"BMW {model_name.upper()} {gen}"
-            return f"BMW {model_name.upper()}"
-    return "BMW"
-
-
-def _build_image_search_queries(topic: str) -> List[str]:
-    """Build multiple search queries optimized for finding REAL images.
-    
-    Returns 5-6 diverse queries to maximize chances of finding images.
-    """
-    model = _extract_bmw_model(topic)
-    queries = []
-    
-    # Query 1: Direct news photo search
-    queries.append(f"{topic} photo")
-    
-    # Query 2: BMW model specific
-    queries.append(f"{model} 2025 2026 press photo")
-    
-    # Query 3: BMW news photo
-    queries.append(f"{model} news image")
-    
-    # Query 4: Broader BMW context
-    queries.append(f"BMW {model.split()[-1] if ' ' in model else model} official photo")
-    
-    # Query 5: Russian language (for Russian news sources)
-    queries.append(f"{topic} фото")
-    
-    # Query 6: If topic mentions a specific event
-    topic_lower = topic.lower()
-    if any(kw in topic_lower for kw in ["recall", "отзыв", "redesign", "facelift", "новый", "новая"]):
-        queries.append(f"{model} recall news photo 2025")
-    elif any(kw in topic_lower for kw in ["nurburgring", "нюрбургринг", "record", "рекорд", "lap"]):
-        queries.append(f"{model} Nurburgring track photo")
-    elif any(kw in topic_lower for kw in ["electric", "электр", "i4", "i5", "i7", "ix"]):
-        queries.append(f"{model} electric BMW photo")
-    
-    return queries[:6]
+JUNK_EXTENSIONS = {".gif", ".svg"}  # Too often icons/buttons; very rarely real photos
 
 
 # ── Image Cache ───────────────────────────────────────────────────────────────
@@ -185,6 +85,7 @@ class ImageCache:
         self._load_index()
 
     def _load_index(self) -> None:
+        """Load cache index from disk."""
         try:
             if self._index_path.exists():
                 with open(self._index_path, "r", encoding="utf-8") as f:
@@ -194,6 +95,7 @@ class ImageCache:
             self._index = {}
 
     def _save_index(self) -> None:
+        """Save cache index to disk."""
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             with open(self._index_path, "w", encoding="utf-8") as f:
@@ -201,1266 +103,561 @@ class ImageCache:
         except Exception as e:
             logger.debug(f"Failed to save image cache index: {e}")
 
-    def get(self, key: str) -> Optional[List[bytes]]:
-        """Get cached images for a key. Returns None if not found or expired."""
+    def _cache_key(self, topic: str) -> str:
+        """Generate cache key from topic."""
+        return hashlib.md5(topic.lower().strip().encode()).hexdigest()
+
+    def get(self, topic: str) -> Optional[Dict[str, Any]]:
+        """Get cached image data for a topic."""
+        key = self._cache_key(topic)
         entry = self._index.get(key)
         if not entry:
             return None
-        
-        timestamp = entry.get("timestamp", 0)
-        if time.time() - timestamp > self.ttl_days * 86400:
-            # Expired
-            self.delete(key)
-            return None
-        
-        images = []
-        for path_str in entry.get("files", []):
-            path = Path(path_str)
-            if path.exists():
-                try:
-                    images.append(path.read_bytes())
-                except Exception:
-                    pass
-        
-        if not images:
-            self.delete(key)
-            return None
-        
-        return images
 
-    def put(self, key: str, images: List[bytes]) -> None:
-        """Cache images for a key."""
+        # Check TTL
+        cached_at = entry.get("cached_at", 0)
+        age_days = (time.time() - cached_at) / 86400
+        if age_days > self.ttl_days:
+            self.delete(topic)
+            return None
+
+        # Check file exists
+        file_path = self.cache_dir / entry.get("filename", "")
+        if not file_path.exists():
+            self.delete(topic)
+            return None
+
+        try:
+            with open(file_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            return {
+                "image_b64": img_b64,
+                "source": entry.get("source", "cache"),
+                "url": entry.get("url", ""),
+            }
+        except Exception as e:
+            logger.debug(f"Failed to read cached image: {e}")
+            return None
+
+    def put(self, topic: str, img_b64: str, source: str, url: str = "") -> None:
+        """Store image in cache."""
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            key_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
-            files = []
-            for i, img_data in enumerate(images):
-                path = self.cache_dir / f"{key_hash}_{i}.jpg"
-                path.write_bytes(img_data)
-                files.append(str(path))
-            
+            key = self._cache_key(topic)
+            filename = f"{key}.jpg"
+
+            # Decode and save raw bytes
+            img_bytes = base64.b64decode(img_b64)
+            file_path = self.cache_dir / filename
+            with open(file_path, "wb") as f:
+                f.write(img_bytes)
+
             self._index[key] = {
-                "timestamp": time.time(),
-                "files": files,
-                "count": len(images),
+                "topic": topic[:100],
+                "filename": filename,
+                "source": source,
+                "url": url[:500],
+                "cached_at": time.time(),
             }
             self._save_index()
         except Exception as e:
-            logger.debug(f"Failed to cache images for '{key}': {e}")
+            logger.debug(f"Failed to cache image: {e}")
 
-    def delete(self, key: str) -> None:
+    def delete(self, topic: str) -> None:
+        """Remove a topic from cache."""
+        key = self._cache_key(topic)
         entry = self._index.pop(key, None)
         if entry:
-            for path_str in entry.get("files", []):
-                try:
-                    Path(path_str).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            try:
+                file_path = self.cache_dir / entry.get("filename", "")
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                pass
             self._save_index()
 
 
-# ── Helper Functions ──────────────────────────────────────────────────────────
+# ── Validation ────────────────────────────────────────────────────────────────
 
 def _is_junk_url(url: str) -> bool:
-    """Check if an image URL is likely junk (icon, logo, tracker, etc.)."""
-    if not url or len(url) < 15:
-        return True
-    
-    # Check junk domains
-    try:
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
-        for domain in JUNK_DOMAINS:
-            if domain in hostname:
-                return True
-    except Exception:
-        pass
-    
+    """Check if a URL is a junk/tracking/icon image."""
     url_lower = url.lower()
-    
+    parsed = urlparse(url_lower)
+
+    # Check junk domains
+    hostname = parsed.hostname or ""
+    for junk in JUNK_DOMAINS:
+        if junk in hostname:
+            return True
+
     # Check junk patterns
     for pattern in JUNK_PATTERNS:
-        if re.search(pattern, url_lower, re.IGNORECASE):
+        if re.search(pattern, url_lower):
             return True
-    
-    # Check junk keywords
-    for kw in JUNK_KEYWORDS:
-        if kw in url_lower:
-            return True
-    
-    # Check extension
-    path_lower = urlparse(url).path.lower()
+
+    # Check junk extensions
+    path = parsed.path.lower()
     for ext in JUNK_EXTENSIONS:
-        if path_lower.endswith(ext):
+        if path.endswith(ext):
             return True
-    
-    # Check tiny size indicators in URL
-    size_match = re.search(r'[/=_x](\d{1,3})x(\d{1,3})[/._]', url_lower)
-    if size_match:
-        w, h = int(size_match.group(1)), int(size_match.group(2))
-        if w < 100 or h < 100:
-            return True
-    
+
     return False
 
 
-def _validate_image_bytes(data: bytes) -> bool:
-    """Validate image bytes — check format and minimum dimensions if PIL available."""
-    if len(data) < IMAGE_MIN_SIZE_BYTES:
-        return False
-    if len(data) > IMAGE_MAX_SIZE_BYTES:
-        return False
-    
-    # Check magic bytes for known formats
-    if data[:3] == b'\xff\xd8\xff':  # JPEG
-        pass
-    elif data[:4] == b'\x89PNG':  # PNG
-        pass
-    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':  # WebP
-        pass
-    elif data[:6] in (b'GIF87a', b'GIF89a'):  # GIF (but we skip these)
-        return False
-    elif b'<svg' in data[:500]:  # SVG
-        return False
-    else:
-        # Unknown format — might still be valid, try PIL
-        pass
-    
-    # Try PIL for dimension check
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(data))
-        width, height = img.size
-        if width < IMAGE_MIN_WIDTH or height < IMAGE_MIN_HEIGHT:
-            return False
-        # Reject extremely wide/tall images (banners)
-        if width / max(height, 1) > 3.0:
-            return False
-        if height / max(width, 1) > 3.0:
-            return False
-    except ImportError:
-        # PIL not available — accept based on size alone
-        pass
-    except Exception:
-        # PIL couldn't open it — might be corrupt
-        pass
-    
-    return True
-
-
-def deduplicate_images(images: List[bytes]) -> List[bytes]:
-    """Deduplicate images by SHA256 hash."""
-    seen = set()
-    result = []
-    for img in images:
-        h = hashlib.sha256(img).hexdigest()
-        if h not in seen:
-            seen.add(h)
-            result.append(img)
-    return result
-
-
-# ── SearXNG Image Search ─────────────────────────────────────────────────────
-
-SEARXNG_INSTANCES = [
-    # Verified working as of early 2025 — removed dead instances
-    "https://search.mdosch.de",
-    "https://searx.tiekoetter.com",
-    "https://search.sapti.me",
-    "https://searx.be",
-    "https://searxng.ch",
-    "https://baresearch.org",
-    "https://searxng.site",
-    "https://searx.work",
-    "https://searxng.perennialte.ch",
-    "https://searx.datura.network",
-    "https://searx.fmac.xyz",
-    "https://searxng.au",
-    "https://search.lvkaszus.pl",
-    # New working instances added 2025
-    "https://search.bus-hit.me",
-    "https://searxng.shreven.org",
-    "https://search.whateveritworks.org",
-    "https://searxng.no-logs.com",
-    "https://search.rhscze.cf",
-    "https://searxng.net",
-    "https://search.suenot.com",
-]
-
-
-async def _search_searxng_images(query: str, max_results: int = 10) -> List[str]:
-    """Search for images using SearXNG with category=images.
-    
-    Returns list of direct image URLs (not page URLs).
-    """
-    results = []
-    instances = SEARXNG_INSTANCES.copy()
-    random.shuffle(instances)
-    
-    CONCURRENT = 3
-    PER_INSTANCE_TIMEOUT = 10.0
-    
-    async def _try_instance(instance: str) -> List[str]:
-        image_urls = []
-        try:
-            async with httpx.AsyncClient(
-                timeout=PER_INSTANCE_TIMEOUT,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "application/json, */*",
-                },
-            ) as client:
-                params = {
-                    "q": query,
-                    "format": "json",
-                    "categories": "images",
-                    "pageno": 1,
-                }
-                response = await client.get(f"{instance}/search", params=params)
-                if response.status_code == 200:
-                    content_type = response.headers.get("content-type", "")
-                    if "json" not in content_type and "javascript" not in content_type:
-                        return []
-                    data = response.json()
-                    for item in data.get("results", [])[:max_results]:
-                        # SearXNG image results have img_src or thumbnail
-                        img_url = item.get("img_src", "") or item.get("thumbnail_src", "") or item.get("url", "")
-                        if img_url and not _is_junk_url(img_url):
-                            image_urls.append(img_url)
-        except Exception as e:
-            logger.debug(f"SearXNG images {instance} failed: {e}")
-        return image_urls
-    
-    for batch_start in range(0, len(instances), CONCURRENT):
-        batch = instances[batch_start:batch_start + CONCURRENT]
-        tasks = [_try_instance(inst) for inst in batch]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in batch_results:
-            if isinstance(result, list) and result:
-                results.extend(result)
-        
-        if len(results) >= max_results:
-            return results[:max_results]
-    
-    return results[:max_results]
-
-
-# ── Google Custom Search Images via SearXNG ───────────────────────────────────
-
-async def _search_google_custom_images(query: str, max_results: int = 8) -> List[str]:
-    """Search for images via SearXNG specifically using Google engine.
-    
-    This forces SearXNG to use Google's image index which tends to have
-    better news/press photos than the default multi-engine blend.
-    """
-    results = []
-    instances = SEARXNG_INSTANCES.copy()
-    random.shuffle(instances)
-    
-    async def _try_google_instance(instance: str) -> List[str]:
-        image_urls = []
-        try:
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "application/json, */*",
-                },
-            ) as client:
-                params = {
-                    "q": query,
-                    "format": "json",
-                    "categories": "images",
-                    "engines": "google images",
-                    "pageno": 1,
-                }
-                response = await client.get(f"{instance}/search", params=params)
-                if response.status_code == 200:
-                    content_type = response.headers.get("content-type", "")
-                    if "json" not in content_type and "javascript" not in content_type:
-                        return []
-                    data = response.json()
-                    for item in data.get("results", [])[:max_results]:
-                        img_url = item.get("img_src", "") or item.get("thumbnail_src", "") or item.get("url", "")
-                        if img_url and not _is_junk_url(img_url):
-                            image_urls.append(img_url)
-        except Exception as e:
-            logger.debug(f"SearXNG Google images {instance} failed: {e}")
-        return image_urls
-    
-    # Try up to 3 instances concurrently
-    tasks = [_try_google_instance(inst) for inst in instances[:3]]
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for result in batch_results:
-        if isinstance(result, list) and result:
-            results.extend(result)
-    
-    return results[:max_results]
-
-
-# ── BMW Press Images ─────────────────────────────────────────────────────────
-
-async def _search_bmw_press_images(query: str, max_results: int = 5) -> List[str]:
-    """Search for official BMW press images from press.bmwgroup.com.
-    
-    BMW's press site has the highest-quality official photos — exactly what
-    we want for a BMW news bot. We search via SearXNG restricted to the
-    BMW press domain, and also try the BMW press RSS feed.
-    """
-    results = []
-    model = _extract_bmw_model(query)
-    
-    # Strategy 1: SearXNG search restricted to press.bmwgroup.com
-    press_query = f"site:press.bmwgroup.com {model} press photo"
-    instances = SEARXNG_INSTANCES.copy()
-    random.shuffle(instances)
-    
-    async def _try_press_searxng(instance: str) -> List[str]:
-        image_urls = []
-        try:
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "application/json, */*",
-                },
-            ) as client:
-                # General search (not images category) to find press release pages
-                params = {
-                    "q": press_query,
-                    "format": "json",
-                    "categories": "general",
-                    "pageno": 1,
-                }
-                response = await client.get(f"{instance}/search", params=params)
-                if response.status_code != 200:
-                    return []
-                content_type = response.headers.get("content-type", "")
-                if "json" not in content_type and "javascript" not in content_type:
-                    return []
-                data = response.json()
-                press_urls = []
-                for item in data.get("results", [])[:5]:
-                    url = item.get("url", "")
-                    if "press.bmwgroup.com" in url:
-                        press_urls.append(url)
-                
-                # Now scrape each press release page for images
-                for press_url in press_urls:
-                    try:
-                        page_resp = await client.get(press_url)
-                        if page_resp.status_code != 200:
-                            continue
-                        html = page_resp.text
-                        # BMW press pages use high-res images in data-src or src
-                        # with press.bmwgroup.com image CDN
-                        img_matches = re.findall(
-                            r'(?:src|data-src|data-large)=["\']'
-                            r'(https://press\.bmwgroup\.com/[^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)'
-                            r'["\']',
-                            html, re.IGNORECASE,
-                        )
-                        for img_url in img_matches:
-                            if not _is_junk_url(img_url):
-                                image_urls.append(img_url)
-                        # Also look for og:image
-                        og_match = re.search(
-                            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-                            html, re.IGNORECASE,
-                        )
-                        if not og_match:
-                            og_match = re.search(
-                                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-                                html, re.IGNORECASE,
-                            )
-                        if og_match:
-                            og_url = og_match.group(1)
-                            if "press.bmwgroup.com" in og_url and not _is_junk_url(og_url):
-                                image_urls.append(og_url)
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.debug(f"BMW press SearXNG {instance} failed: {e}")
-        return image_urls
-    
-    # Strategy 2: Direct BMW press site search API
-    async def _try_bmw_press_api() -> List[str]:
-        image_urls = []
-        try:
-            async with httpx.AsyncClient(
-                timeout=12.0,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://press.bmwgroup.com/",
-                },
-            ) as client:
-                # BMW press search page
-                search_url = f"https://press.bmwgroup.com/search?q={quote_plus(model)}"
-                response = await client.get(search_url)
-                if response.status_code != 200:
-                    return []
-                
-                html = response.text
-                # Look for image URLs in the BMW press CDN
-                img_matches = re.findall(
-                    r'(https://press\.bmwgroup\.com/[^"\'>\s]+\.(?:jpg|jpeg|png|webp)(?:\?[^"\'>\s]*)?)',
-                    html, re.IGNORECASE,
-                )
-                for img_url in img_matches:
-                    if not _is_junk_url(img_url) and img_url not in image_urls:
-                        image_urls.append(img_url)
-        except Exception as e:
-            logger.debug(f"BMW press direct search failed: {e}")
-        return image_urls
-    
-    # Run both strategies concurrently
-    tasks = [_try_press_searxng(inst) for inst in instances[:2]]
-    tasks.append(_try_bmw_press_api())
-    
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for result in batch_results:
-        if isinstance(result, list) and result:
-            results.extend(result)
-    
-    # Deduplicate while preserving order
-    seen = set()
-    unique = []
-    for url in results:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
-    
-    return unique[:max_results]
-
-
-# ── Bing Image Search (scraping with improved anti-bot) ──────────────────────
-
-async def _search_bing_images(query: str, max_results: int = 8) -> List[str]:
-    """Search Bing Images for real photos with retry logic and better headers.
-    
-    Improved v6.0:
-    - Better User-Agent rotation to avoid bot detection
-    - Cookie support to appear more like a real browser
-    - Retry logic with exponential backoff
-    - Multiple URL extraction patterns for robustness
-    """
-    results = []
-    
-    # Rotate between realistic browser User-Agents
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    ]
-    
-    ua = random.choice(USER_AGENTS)
-    
-    for attempt in range(3):  # Up to 3 attempts with retry
-        try:
-            async with httpx.AsyncClient(
-                timeout=15.0,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": ua,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9,ru-RU;q=0.8,ru;q=0.7",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                    "Cache-Control": "max-age=0",
-                    # Mimic a real browser with a Referer
-                    "Referer": "https://www.bing.com/",
-                },
-                cookies={
-                    # Basic cookies to look like a real session
-                    "MUID": "".join(random.choices("0123456789ABCDEF", k=32)),
-                    "SRCHD": "AF=NOFORM",
-                    "SRCHUID": "V=2&GUID=&dmnchg=1",
-                },
-            ) as client:
-                params = {
-                    "q": query,
-                    "qft": "+filterui:photo-photo",  # Only photos, no illustrations
-                    "form": "IRFLTR",
-                }
-                response = await client.get("https://www.bing.com/images/search", params=params)
-                
-                if response.status_code == 200:
-                    html = response.text
-                    
-                    # Method 1: Extract from m= attribute (JSON with mediaurl)
-                    media_urls = re.findall(r'mediaurl&quot;:&quot;(https?://[^&]+)', html)
-                    for url in media_urls[:max_results]:
-                        if not _is_junk_url(url):
-                            results.append(url)
-                    
-                    # Method 2: Extract from m attribute (HTML-escaped JSON)
-                    if len(results) < max_results:
-                        m_attrs = re.findall(r'm="([^"]+)"', html)
-                        for m_attr in m_attrs:
-                            try:
-                                # Unescape HTML entities and parse JSON
-                                unescaped = m_attr.replace("&quot;", '"').replace("&amp;", "&").replace("&#39;", "'")
-                                m_json = json.loads(unescaped)
-                                mediaurl = m_json.get("mediaurl", "") or m_json.get("murl", "")
-                                if mediaurl and not _is_junk_url(mediaurl) and mediaurl not in results:
-                                    results.append(mediaurl)
-                                    if len(results) >= max_results:
-                                        break
-                            except (json.JSONDecodeError, KeyError):
-                                continue
-                    
-                    # Method 3: src= pattern for thumbnail/large images
-                    if len(results) < max_results:
-                        src_urls = re.findall(r'src="(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', html, re.IGNORECASE)
-                        for url in src_urls:
-                            if not _is_junk_url(url) and url not in results:
-                                results.append(url)
-                                if len(results) >= max_results:
-                                    break
-                    
-                    # Method 4: Look for imgurl in the page (legacy Bing format)
-                    if len(results) < max_results:
-                        imgurl_matches = re.findall(r'imgurl=(https?://[^&]+)', html)
-                        for url in imgurl_matches:
-                            url = url.replace("%3A", ":").replace("%2F", "/")
-                            if not _is_junk_url(url) and url not in results:
-                                results.append(url)
-                                if len(results) >= max_results:
-                                    break
-                    
-                    if results:
-                        break  # Success — don't retry
-                        
-                elif response.status_code == 429:
-                    # Rate limited — wait longer and rotate UA
-                    wait_time = (attempt + 1) * 3 + random.uniform(0.5, 2.0)
-                    logger.debug(f"Bing rate limited, waiting {wait_time:.1f}s (attempt {attempt + 1})")
-                    await asyncio.sleep(wait_time)
-                    ua = random.choice(USER_AGENTS)
-                    continue
-                    
-                elif response.status_code == 403:
-                    # Bot detection — rotate UA and try again
-                    logger.debug(f"Bing 403 (bot detection), rotating UA (attempt {attempt + 1})")
-                    await asyncio.sleep((attempt + 1) * 2)
-                    ua = random.choice(USER_AGENTS)
-                    continue
-                    
-                else:
-                    logger.debug(f"Bing returned status {response.status_code}")
-                    break
-                    
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            if attempt < 2:
-                wait_time = (attempt + 1) * 2 + random.uniform(0, 1)
-                logger.debug(f"Bing connection error, retrying in {wait_time:.1f}s: {e}")
-                await asyncio.sleep(wait_time)
-                ua = random.choice(USER_AGENTS)
-                continue
-        except Exception as e:
-            logger.debug(f"Bing image search failed: {e}")
-            break
-    
-    return results[:max_results]
-
-
-# ── Google Images via SearXNG general search ──────────────────────────────────
-
-async def _search_google_images_rss(query: str, max_results: int = 5) -> List[str]:
-    """Search Google News for images via RSS. Returns image URLs from news articles."""
-    results = []
-    try:
-        url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ru&gl=RU&ceid=RU:ru"
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            response = await client.get(url)
-            if response.status_code != 200:
-                return []
-            
-            import feedparser
-            feed = feedparser.parse(response.text)
-            for entry in feed.entries[:max_results]:
-                # Extract images from summary HTML
-                summary = entry.get("summary", "")
-                if summary:
-                    img_srcs = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', summary, re.IGNORECASE)
-                    for src in img_srcs:
-                        if not _is_junk_url(src):
-                            results.append(src)
-                
-                # Check media_content
-                for mc in getattr(entry, "media_content", []):
-                    mc_url = mc.get("url", "")
-                    if mc_url and not _is_junk_url(mc_url):
-                        results.append(mc_url)
-    
-    except Exception as e:
-        logger.debug(f"Google News RSS image search failed: {e}")
-    
-    return results[:max_results]
-
-
-# ── Unsplash API (v6.0 — FIXED: uses proper api.unsplash.com) ────────────────
-
-# Unsplash API access key — for demo/development use.
-# Production deployments should use a registered Unsplash app key.
-# Get one free at https://unsplash.com/oauth/applications
-UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
-
-
-async def _search_unsplash_images(query: str, max_results: int = 5) -> List[str]:
-    """Search Unsplash for real photos using the proper Unsplash API.
-    
-    v6.0 FIX: source.unsplash.com was SHUT DOWN in 2024. This function now uses
-    the official Unsplash Search API at api.unsplash.com/search/photos which
-    returns proper downloadable image URLs.
-    
-    If no UNSPLASH_ACCESS_KEY is configured, falls back to searching via SearXNG
-    restricted to unsplash.com — which still returns real photo URLs.
-    """
-    results = []
-    
-    if UNSPLASH_ACCESS_KEY:
-        # ── Strategy A: Official Unsplash API with access key ──
-        try:
-            async with httpx.AsyncClient(
-                timeout=12.0,
-                follow_redirects=True,
-                headers={
-                    "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}",
-                    "Accept-Version": "v1",
-                    "Accept": "application/json",
-                },
-            ) as client:
-                params = {
-                    "query": query,
-                    "per_page": min(max_results, 10),
-                    "orientation": "landscape",
-                    "content_filter": "high",
-                }
-                response = await client.get(
-                    "https://api.unsplash.com/search/photos",
-                    params=params,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    for item in data.get("results", []):
-                        # Use the regular size (1080px) — good for Telegram
-                        # The 'urls' dict contains: raw, full, regular, small, thumb
-                        img_url = item.get("urls", {}).get("regular", "")
-                        if img_url and not _is_junk_url(img_url):
-                            results.append(img_url)
-                        if len(results) >= max_results:
-                            break
-                    
-                    if results:
-                        logger.debug(f"Unsplash API found {len(results)} images for '{query[:40]}'")
-                        return results
-        except Exception as e:
-            logger.debug(f"Unsplash API search failed: {e}")
-    
-    # ── Strategy B: Fallback — SearXNG search restricted to unsplash.com ──
-    # This still returns real Unsplash photo download URLs even without an API key
-    try:
-        fallback_query = f"site:unsplash.com {query}"
-        instances = SEARXNG_INSTANCES.copy()
-        random.shuffle(instances)
-        
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "Accept": "application/json, */*",
-            },
-        ) as client:
-            for instance in instances[:3]:  # Try up to 3 instances
-                try:
-                    params = {
-                        "q": fallback_query,
-                        "format": "json",
-                        "categories": "images",
-                        "pageno": 1,
-                    }
-                    response = await client.get(f"{instance}/search", params=params)
-                    if response.status_code != 200:
-                        continue
-                    content_type = response.headers.get("content-type", "")
-                    if "json" not in content_type and "javascript" not in content_type:
-                        continue
-                    data = response.json()
-                    for item in data.get("results", [])[:max_results * 2]:
-                        img_url = item.get("img_src", "") or item.get("thumbnail_src", "")
-                        if img_url and "unsplash.com" in img_url and not _is_junk_url(img_url):
-                            results.append(img_url)
-                    
-                    if results:
-                        break
-                except Exception:
-                    continue
-    except Exception as e:
-        logger.debug(f"Unsplash SearXNG fallback failed: {e}")
-    
-    return results[:max_results]
-
-
-# ── Wikimedia Commons ────────────────────────────────────────────────────────
-
-async def _search_wikimedia_images(query: str, max_results: int = 3) -> List[str]:
-    """Search Wikimedia Commons for real automotive photos."""
-    results = []
-    try:
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            search_resp = await client.get(
-                "https://commons.wikimedia.org/w/api.php",
-                params={
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "srnamespace": "6",
-                    "format": "json",
-                    "srlimit": max_results * 2,
-                },
-            )
-            if search_resp.status_code != 200:
-                return []
-            
-            data = search_resp.json()
-            for item in data.get("query", {}).get("search", [])[:max_results * 2]:
-                title = item.get("title", "").replace("File:", "")
-                if not title:
-                    continue
-                # Get actual image URL
-                img_resp = await client.get(
-                    "https://commons.wikimedia.org/w/api.php",
-                    params={
-                        "action": "query",
-                        "titles": f"File:{title}",
-                        "prop": "imageinfo",
-                        "iiprop": "url",
-                        "iiurlwidth": 800,
-                        "format": "json",
-                    },
-                )
-                if img_resp.status_code == 200:
-                    img_data = img_resp.json()
-                    pages = img_data.get("query", {}).get("pages", {})
-                    for page in pages.values():
-                        iis = page.get("imageinfo", [])
-                        if iis:
-                            url = iis[0].get("thumburl", "") or iis[0].get("url", "")
-                            if url and not _is_junk_url(url):
-                                results.append(url)
-                if len(results) >= max_results:
-                    break
-    except Exception as e:
-        logger.debug(f"Wikimedia search failed: {e}")
-    
-    return results[:max_results]
-
-
-# ── Image Downloader with Retry ──────────────────────────────────────────────
-
-async def _download_image(
+async def _validate_image(
     client: httpx.AsyncClient,
     url: str,
-    retries: int = MAX_RETRIES,
-) -> Optional[bytes]:
-    """Download an image with retry logic. Returns bytes or None."""
-    for attempt in range(retries):
+    max_size: int = IMAGE_MAX_SIZE_BYTES,
+) -> Optional[Dict[str, Any]]:
+    """Download and validate an image URL. Returns dict with b64 data or None."""
+    try:
+        # Quick HEAD request to check content-type and size
         try:
-            response = await client.get(url)
-            if response.status_code == 200:
-                data = response.content
-                if _validate_image_bytes(data):
-                    return data
+            head_resp = await client.head(url, timeout=6.0, follow_redirects=True)
+            content_type = head_resp.headers.get("content-type", "").lower()
+            content_length = int(head_resp.headers.get("content-length", "0"))
+
+            # Only allow image types
+            if not any(ct in content_type for ct in ["image/jpeg", "image/png", "image/webp", "image/jpg"]):
+                # Some servers don't return proper content-type on HEAD, so continue anyway
+                if content_type and not content_type.startswith("image/"):
+                    return None
+
+            # Skip obviously too small files
+            if 0 < content_length < IMAGE_MIN_SIZE_BYTES:
                 return None
-            elif response.status_code in (429, 503):
-                # Rate limited — wait and retry
-                wait_time = (attempt + 1) * 2
-                await asyncio.sleep(wait_time)
-                continue
-            else:
+
+            # Skip obviously too large files
+            if content_length > max_size:
                 return None
-        except (httpx.TimeoutException, httpx.ConnectError):
-            if attempt < retries - 1:
-                await asyncio.sleep((attempt + 1) * 1.5)
-                continue
         except Exception:
+            pass  # HEAD failed, try GET anyway
+
+        # Full GET request
+        resp = await client.get(url, timeout=IMAGE_FETCH_TIMEOUT, follow_redirects=True)
+        if resp.status_code != 200:
             return None
-    return None
+
+        img_bytes = resp.content
+
+        # Size checks
+        if len(img_bytes) < IMAGE_MIN_SIZE_BYTES:
+            return None
+        if len(img_bytes) > max_size:
+            return None
+
+        # Content-type check from GET response
+        content_type = resp.headers.get("content-type", "").lower()
+        if content_type and not any(ct in content_type for ct in [
+            "image/jpeg", "image/png", "image/webp", "image/jpg", "application/octet-stream",
+        ]):
+            return None
+
+        # Basic JPEG/PNG/WebP magic bytes check
+        is_valid_format = (
+            img_bytes[:2] == b'\xff\xd8'  # JPEG
+            or img_bytes[:8] == b'\x89PNG\r\n\x1a\n'  # PNG
+            or img_bytes[:4] == b'RIFF'  # WebP (RIFF container)
+        )
+        if not is_valid_format:
+            return None
+
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        return {
+            "image_b64": img_b64,
+            "image_url": str(resp.url),
+            "source": "fetched",
+            "size_bytes": len(img_bytes),
+        }
+
+    except Exception as e:
+        logger.debug(f"Image validation failed for {url}: {e}")
+        return None
 
 
-async def _download_images_concurrent(
-    urls: List[str],
-    max_count: int = MAX_IMAGES_PER_POST,
-    concurrency: int = DOWNLOAD_CONCURRENCY,
-) -> List[bytes]:
-    """Download multiple images concurrently with retry logic."""
-    if not urls:
-        return []
-    
-    images: List[bytes] = []
-    seen_hashes: set = set()
-    
-    semaphore = asyncio.Semaphore(concurrency)
-    
-    async with httpx.AsyncClient(
-        timeout=IMAGE_FETCH_TIMEOUT,
-        follow_redirects=True,
-        headers={
-            "User-Agent": "MashaBot/6.0 (+https://t.me/asmasha_bot)",
-            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-        },
-    ) as client:
-        async def _download_one(url: str) -> Optional[bytes]:
-            async with semaphore:
-                return await _download_image(client, url)
-        
-        tasks = [_download_one(url) for url in urls[:max_count * 3]]  # Request more, filter later
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in results:
-            if isinstance(result, bytes) and result:
-                h = hashlib.sha256(result).hexdigest()
-                if h not in seen_hashes:
-                    seen_hashes.add(h)
-                    images.append(result)
-                    if len(images) >= max_count:
-                        break
-    
-    return images
+# ── Strategy 1: Article page image extraction (og:image, twitter:image) ──────
 
+async def fetch_article_images(url: str) -> List[str]:
+    """Fetch original images from an article page.
 
-# ── Article Scraping ─────────────────────────────────────────────────────────
-
-async def _scrape_article_images(url: str, max_count: int = MAX_IMAGES_PER_POST) -> List[str]:
-    """Scrape article page for image URLs using BeautifulSoup.
-    
-    Extracts: og:image, twitter:image, JSON-LD images, <img> tags
+    Extracts images in priority order:
+    1. og:image meta tag
+    2. twitter:image meta tag
+    3. <link rel="image_src">
+    4. First large <img> in the article content area
     """
-    image_urls = []
-    
-    if not url or not url.startswith("http"):
-        return []
-    
+    image_urls: List[str] = []
+
+    if not url or not url.startswith(("http://", "https://")):
+        return image_urls
+
     try:
         async with httpx.AsyncClient(
             timeout=ARTICLE_FETCH_TIMEOUT,
             follow_redirects=True,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
             },
         ) as client:
-            response = await client.get(url)
-            if response.status_code != 200:
-                return []
-            
-            html = response.text
-            if len(html) < 500:
-                return []
-    except Exception as e:
-        logger.debug(f"Article fetch failed for {url[:60]}: {e}")
-        return []
-    
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
-    except ImportError:
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-        except ImportError:
-            # No BeautifulSoup — use regex fallback
-            return _scrape_article_images_regex(html, url, max_count)
-    
-    # 1. og:image
-    og_img = soup.find("meta", property="og:image")
-    if og_img:
-        img_url = og_img.get("content", "")
-        if img_url:
-            img_url = urljoin(url, img_url)
-            if not _is_junk_url(img_url):
-                image_urls.append(img_url)
-    
-    # 2. twitter:image
-    tw_img = soup.find("meta", attrs={"name": "twitter:image"})
-    if tw_img:
-        img_url = tw_img.get("content", "")
-        if img_url:
-            img_url = urljoin(url, img_url)
-            if not _is_junk_url(img_url):
-                image_urls.append(img_url)
-    
-    # 3. JSON-LD images
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            # Navigate JSON-LD for images
-            for key in ["image", "images", "thumbnailUrl"]:
-                val = data.get(key)
-                if isinstance(val, str) and val:
-                    img_url = urljoin(url, val)
-                    if not _is_junk_url(img_url):
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return image_urls
+
+            html = resp.text
+
+            # 1. og:image
+            og_match = re.search(
+                r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+                html, re.IGNORECASE,
+            )
+            if not og_match:
+                og_match = re.search(
+                    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
+                    html, re.IGNORECASE,
+                )
+            if og_match:
+                img_url = og_match.group(1).replace("&amp;", "&")
+                if not _is_junk_url(img_url):
+                    image_urls.append(img_url)
+
+            # 2. twitter:image
+            tw_match = re.search(
+                r'<meta\s+(?:property|name)=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+                html, re.IGNORECASE,
+            )
+            if not tw_match:
+                tw_match = re.search(
+                    r'<meta\s+content=["\']([^"\']+)["\']\s+(?:property|name)=["\']twitter:image["\']',
+                    html, re.IGNORECASE,
+                )
+            if tw_match:
+                img_url = tw_match.group(1).replace("&amp;", "&")
+                if not _is_junk_url(img_url) and img_url not in image_urls:
+                    image_urls.append(img_url)
+
+            # 3. <link rel="image_src">
+            link_match = re.search(
+                r'<link\s+[^>]*rel=["\']image_src["\'][^>]*href=["\']([^"\']+)["\']',
+                html, re.IGNORECASE,
+            )
+            if not link_match:
+                link_match = re.search(
+                    r'<link\s+[^>]*href=["\']([^"\']+)["\'][^>]*rel=["\']image_src["\']',
+                    html, re.IGNORECASE,
+                )
+            if link_match:
+                img_url = link_match.group(1).replace("&amp;", "&")
+                if not _is_junk_url(img_url) and img_url not in image_urls:
+                    image_urls.append(img_url)
+
+            # 4. First large <img> in article content area
+            article_blocks = re.findall(
+                r'<(?:article|main)[^>]*>(.*?)</(?:article|main)>',
+                html, re.DOTALL | re.IGNORECASE,
+            )
+            if not article_blocks:
+                article_blocks = re.findall(
+                    r'<div[^>]*class=["\'][^"\']*(?:content|post|entry|article)[^"\']*["\'][^>]*>(.*?)</div>',
+                    html, re.DOTALL | re.IGNORECASE,
+                )
+
+            for block in article_blocks[:2]:  # Check first 2 article blocks
+                img_matches = re.findall(
+                    r'<img[^>]+src=["\']([^"\']+)["\']',
+                    block, re.IGNORECASE,
+                )
+                for img_url in img_matches:
+                    img_url = img_url.replace("&amp;", "&")
+                    if not _is_junk_url(img_url) and img_url not in image_urls:
                         image_urls.append(img_url)
-                elif isinstance(val, list):
-                    for item in val:
-                        if isinstance(item, str):
-                            img_url = urljoin(url, item)
-                            if not _is_junk_url(img_url):
-                                image_urls.append(img_url)
-                        elif isinstance(item, dict):
-                            img_url = item.get("url", "") or item.get("contentUrl", "")
-                            if img_url:
-                                img_url = urljoin(url, img_url)
-                                if not _is_junk_url(img_url):
-                                    image_urls.append(img_url)
-                elif isinstance(val, dict):
-                    img_url = val.get("url", "") or val.get("contentUrl", "")
-                    if img_url:
-                        img_url = urljoin(url, img_url)
-                        if not _is_junk_url(img_url):
-                            image_urls.append(img_url)
-        except (json.JSONDecodeError, AttributeError):
-            continue
-    
-    # 4. <img> tags — prefer large images
-    img_tags = soup.find_all("img")
-    for img in img_tags:
-        src = img.get("src", "") or img.get("data-src", "") or img.get("data-lazy-src", "")
-        if not src:
-            continue
-        src = urljoin(url, src)
-        if not _is_junk_url(src):
-            # Check width/height hints
-            width = img.get("width", "")
-            height = img.get("height", "")
-            try:
-                if int(width) < 200 or int(height) < 150:
-                    continue
-            except (ValueError, TypeError):
-                pass
-            image_urls.append(src)
-    
-    return image_urls[:max_count]
+
+            # 5. Fallback: first <img> with width/height attributes suggesting large image
+            if not image_urls:
+                sized_imgs = re.findall(
+                    r'<img[^>]+src=["\']([^"\']+)["\'][^>]*(?:width|height)\s*=\s*["\'](\d+)["\']',
+                    html, re.IGNORECASE,
+                )
+                for img_url, dim in sized_imgs:
+                    if int(dim) >= IMAGE_MIN_WIDTH and not _is_junk_url(img_url) and img_url not in image_urls:
+                        image_urls.append(img_url)
+
+    except Exception as e:
+        logger.debug(f"Article image extraction failed for {url}: {e}")
+
+    return image_urls[:MAX_IMAGES_PER_SOURCE]
 
 
-def _scrape_article_images_regex(html: str, base_url: str, max_count: int) -> List[str]:
-    """Fallback article scraping using regex (when BeautifulSoup is not available)."""
-    image_urls = []
-    seen = set()
-    
-    # og:image
-    og_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if not og_match:
-        og_match = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, re.IGNORECASE)
-    if og_match:
-        url = urljoin(base_url, og_match.group(1))
-        if not _is_junk_url(url):
-            image_urls.append(url)
-    
-    # twitter:image
-    tw_match = re.search(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if not tw_match:
-        tw_match = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']', html, re.IGNORECASE)
-    if tw_match:
-        url = urljoin(base_url, tw_match.group(1))
-        if not _is_junk_url(url):
-            image_urls.append(url)
-    
-    # <img> tags
-    for match in re.finditer(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\']', html, re.IGNORECASE):
-        url = urljoin(base_url, match.group(1))
-        if url not in seen and not _is_junk_url(url):
-            seen.add(url)
-            image_urls.append(url)
-    
-    return image_urls[:max_count]
+# ── Strategy 2: RSS enclosure / media:content extraction ─────────────────────
 
+def extract_rss_images(entry: Any) -> List[str]:
+    """Extract image URLs from a feedparser entry.
 
-# ── RSS Image Extraction ─────────────────────────────────────────────────────
-
-def _extract_rss_images(rss_entry: Any) -> List[str]:
-    """Extract image URLs from a feedparser RSS entry.
-    
-    Checks: media_content, enclosures, links, media_thumbnail, content HTML
+    Checks:
+    1. <enclosure> with image type
+    2. <media:content> with image type
+    3. <media:thumbnail>
+    4. <content:encoded> <img> tags
+    5. <summary>/<description> <img> tags
     """
-    image_urls = []
-    seen = set()
-    
-    def _add(url: str):
-        if not url or len(url) < 15 or url in seen:
-            return
-        if url.startswith("//"):
-            url = "https:" + url
-        if not _is_junk_url(url):
-            seen.add(url)
-            image_urls.append(url)
-    
-    # 1. media_content
-    for mc in getattr(rss_entry, "media_content", []):
-        url = mc.get("url", "")
-        medium = mc.get("medium", "")
-        if url and (not medium or medium == "image"):
-            try:
-                w = int(mc.get("width", 0))
-                h = int(mc.get("height", 0))
-                if w > 0 and h > 0 and w < 100 and h < 100:
-                    continue
-            except (ValueError, TypeError):
-                pass
-            _add(url)
-    
-    # 2. enclosures
-    for enc in getattr(rss_entry, "enclosures", []):
+    image_urls: List[str] = []
+
+    # 1. <enclosure type="image/...">
+    enclosures = getattr(entry, "enclosures", []) or []
+    for enc in enclosures:
         url = enc.get("href", "") or enc.get("url", "")
-        enc_type = enc.get("type", "")
-        if url and ("image" in enc_type or not enc_type):
-            _add(url)
-    
-    # 3. links with rel="enclosure"
-    for link_item in getattr(rss_entry, "links", []):
-        if link_item.get("rel") == "enclosure":
-            url = link_item.get("href", "")
-            enc_type = link_item.get("type", "")
-            if url and ("image" in enc_type or not enc_type):
-                _add(url)
-    
-    # 4. media_thumbnail
-    for mt in getattr(rss_entry, "media_thumbnail", []):
+        enc_type = enc.get("type", "").lower()
+        if url and ("image" in enc_type or any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"])):
+            if not _is_junk_url(url) and url not in image_urls:
+                image_urls.append(url)
+
+    # 2. <media:content medium="image">
+    media_content = getattr(entry, "media_content", []) or []
+    for mc in media_content:
+        url = mc.get("url", "")
+        medium = mc.get("medium", "").lower()
+        mc_type = mc.get("type", "").lower()
+        if url and (medium == "image" or "image" in mc_type):
+            if not _is_junk_url(url) and url not in image_urls:
+                image_urls.append(url)
+
+    # 3. <media:thumbnail>
+    media_thumbnail = getattr(entry, "media_thumbnail", []) or []
+    for mt in media_thumbnail:
         url = mt.get("url", "")
-        if url:
-            _add(url)
-    
-    # 5. HTML content
-    for html_field in ["summary", "summary_detail", "content", "value"]:
-        val = getattr(rss_entry, html_field, None)
-        if isinstance(val, dict):
-            html = val.get("value", "")
-        elif isinstance(val, str):
-            html = val
-        else:
+        if url and not _is_junk_url(url) and url not in image_urls:
+            image_urls.append(url)
+
+    # 4. <content:encoded> or <summary> with <img>
+    for field_name in ("content", "summary", "description"):
+        content_value = getattr(entry, field_name, None)
+        if isinstance(content_value, list):
+            content_value = content_value[0].get("value", "") if content_value else ""
+        elif content_value is None:
             continue
-        if html and "<img" in html:
-            for src in re.findall(r'<img[^>]+src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE):
-                _add(src)
-            for src in re.findall(r'<img[^>]+data-src=["\x27]([^"\x27]+)["\x27]', html, re.IGNORECASE):
-                _add(src)
-    
-    return image_urls
+
+        img_matches = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', str(content_value), re.IGNORECASE)
+        for img_url in img_matches:
+            img_url = img_url.replace("&amp;", "&")
+            if not _is_junk_url(img_url) and img_url not in image_urls:
+                image_urls.append(img_url)
+
+    return image_urls[:MAX_IMAGES_PER_SOURCE]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main ImageFetcher class
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Strategy 3: Image search ─────────────────────────────────────────────────
+
+async def search_images(topic: str, max_images: int = 3) -> List[str]:
+    """Search for images related to a topic using SearXNG image search."""
+    image_urls: List[str] = []
+
+    try:
+        from bot.web_search import search_searxng
+
+        # Clean up topic for search
+        clean_topic = re.sub(r'[^\w\s]', '', topic)[:80]
+
+        # Try SearXNG image search
+        results = await search_searxng(
+            f"{clean_topic} BMW",
+            max_results=8,
+            language="ru",
+            categories="images",
+        )
+
+        for r in results:
+            if r.url:
+                url_lower = r.url.lower()
+                # Direct image URLs
+                if any(ext in url_lower for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                    if not _is_junk_url(r.url):
+                        image_urls.append(r.url)
+                # Image service URLs (imgur, etc.)
+                elif any(domain in url_lower for domain in ['imgur.com', 'flickr.com', 'unsplash.com']):
+                    if not _is_junk_url(r.url):
+                        image_urls.append(r.url)
+
+        # Fallback: regular web search with image keywords
+        if not image_urls:
+            from bot.web_search import web_search
+            results = await web_search(f"{clean_topic} BMW photo image", max_results=5)
+            for r in results:
+                if r.url and not _is_junk_url(r.url):
+                    image_urls.append(r.url)
+
+    except Exception as e:
+        logger.debug(f"Image search failed for '{topic}': {e}")
+
+    return image_urls[:max_images]
+
+
+# ── Main fetcher class ───────────────────────────────────────────────────────
 
 class ImageFetcher:
-    """Smart image fetcher with multi-engine search for REAL news photos.
-    
-    v6.0: Fixed dead APIs, added BMW press images, Google custom search,
-    global timeout control, and improved Bing scraping.
+    """Smart image fetcher with original-first priority pipeline.
+
+    Usage:
+        fetcher = ImageFetcher()
+        result = await fetcher.fetch(
+            topic="BMW M5 G90 debut",
+            article_url="https://bmwblog.com/...",
+            rss_entry=feed_entry,
+        )
+        # result = {"image_b64": ..., "source": "og:image", "url": ...}
     """
 
-    def __init__(self):
-        self._cache = ImageCache()
-        self._stats = {"fetches": 0, "images_found": 0, "sources_used": {}}
+    def __init__(self) -> None:
+        self.cache = ImageCache()
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=IMAGE_FETCH_TIMEOUT,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+            )
+        return self._client
 
     async def fetch(
         self,
         topic: str,
         article_url: str = "",
         rss_entry: Any = None,
-        image_urls: Optional[List[str]] = None,
-        max_images: int = MAX_IMAGES_PER_POST,
-    ) -> Tuple[List[bytes], str]:
-        """Fetch REAL images for a news post.
-        
-        Returns (image_list: List[bytes], source: str).
-        source is one of: 'rss', 'article', 'search', 'cache', 'none'
-        
-        The entire operation is wrapped in a GLOBAL_FETCH_TIMEOUT (45s) to
-        prevent runaway searches from blocking the bot.
-        """
-        # Wrap everything in a global timeout
-        try:
-            return await asyncio.wait_for(
-                self._fetch_impl(topic, article_url, rss_entry, image_urls, max_images),
-                timeout=GLOBAL_FETCH_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            elapsed = time.time()  # best effort
-            logger.warning(
-                f"⏰ Image fetch timed out after {GLOBAL_FETCH_TIMEOUT}s for '{topic[:50]}'"
-            )
-            self._stats["sources_used"]["timeout"] = self._stats["sources_used"].get("timeout", 0) + 1
-            return [], "none"
+        content_type: str = "news+reaction",
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch an image using the priority pipeline.
 
-    async def _fetch_impl(
+        Returns dict with keys: image_b64, source, url
+        Or None if no suitable image found (caller should fall back to AI generation).
+        """
+        # ── Step 0: Check cache ───────────────────────────────────────────
+        cached = self.cache.get(topic)
+        if cached:
+            logger.info(f"Image cache HIT for '{topic[:50]}'")
+            cached["source"] = f"cache:{cached.get('source', 'unknown')}"
+            return cached
+
+        client = self._get_client()
+        all_candidates: List[Tuple[str, str]] = []  # (url, source_label)
+
+        # ── Step 1: RSS enclosures / media:content ────────────────────────
+        if rss_entry is not None:
+            rss_urls = extract_rss_images(rss_entry)
+            for url in rss_urls:
+                all_candidates.append((url, "rss_enclosure"))
+            if rss_urls:
+                logger.info(f"RSS images: {len(rss_urls)} found for '{topic[:50]}'")
+
+        # ── Step 2: Article page og:image / twitter:image ─────────────────
+        if article_url:
+            article_urls = await fetch_article_images(article_url)
+            for url in article_urls:
+                if url not in [u for u, _ in all_candidates]:
+                    all_candidates.append((url, "og:image"))
+            if article_urls:
+                logger.info(f"Article images: {len(article_urls)} found for '{article_url[:60]}'")
+
+        # ── Step 3: Image search ──────────────────────────────────────────
+        if not all_candidates:
+            search_urls = await search_images(topic)
+            for url in search_urls:
+                if url not in [u for u, _ in all_candidates]:
+                    all_candidates.append((url, "image_search"))
+            if search_urls:
+                logger.info(f"Search images: {len(search_urls)} found for '{topic[:50]}'")
+
+        # ── Step 4: Validate and pick the best ────────────────────────────
+        for url, source_label in all_candidates:
+            result = await _validate_image(client, url)
+            if result:
+                result["source"] = source_label
+                # Cache the result
+                self.cache.put(topic, result["image_b64"], source=source_label, url=url)
+                logger.info(f"Image fetched via {source_label}: {url[:80]} ({result.get('size_bytes', 0)} bytes)")
+                return result
+
+        # ── All strategies failed ─────────────────────────────────────────
+        logger.info(f"No real image found for '{topic[:50]}' — AI generation will be used as fallback")
+        return None
+
+    async def fetch_multiple(
         self,
         topic: str,
-        article_url: str,
-        rss_entry: Any,
-        image_urls: Optional[List[str]],
-        max_images: int,
-    ) -> Tuple[List[bytes], str]:
-        """Internal implementation of fetch() — separated for timeout wrapping."""
-        self._stats["fetches"] += 1
-        start_time = time.time()
-        
-        logger.info(f"🖼️ ImageFetcher: searching images for '{topic[:60]}' (max={max_images})")
-        
-        # Step 0: Check cache
-        cache_key = f"{topic}:{article_url}"
-        cached = self._cache.get(cache_key)
-        if cached:
-            logger.info(f"📦 Cache hit: {len(cached)} images for '{topic[:50]}'")
-            self._stats["sources_used"]["cache"] = self._stats["sources_used"].get("cache", 0) + 1
-            return cached[:max_images], "cache"
-        
-        all_image_urls: List[str] = []
-        seen_urls: set = set()
-        
-        def _add_urls(urls: List[str], source_name: str):
-            added = 0
-            for url in urls:
-                if url not in seen_urls:
-                    seen_urls.add(url)
-                    all_image_urls.append(url)
-                    added += 1
-            if added > 0:
-                logger.info(f"  {source_name}: +{added} URLs (total={len(all_image_urls)})")
-            return added
-        
-        # Step 1: Direct image URLs from news data
-        if image_urls:
-            _add_urls([u for u in image_urls if not _is_junk_url(u)], "direct_urls")
-        
-        # Step 2: RSS entry images
-        if rss_entry:
-            rss_urls = _extract_rss_images(rss_entry)
-            _add_urls(rss_urls, "rss_entry")
-        
-        # Step 3: Article page scraping
-        if article_url:
-            try:
-                article_urls = await _scrape_article_images(article_url, max_count=max_images)
-                _add_urls(article_urls, "article_scrape")
-            except Exception as e:
-                logger.debug(f"Article scraping failed: {e}")
-        
-        # Step 4: Search for images — CONCURRENT multi-engine search
-        search_queries = _build_image_search_queries(topic)
-        logger.info(f"🔍 Searching images with {len(search_queries)} queries across multiple engines...")
-        
-        search_tasks = []
-        
-        # BMW Press Images — HIGHEST PRIORITY for real news photos
-        if search_queries:
-            search_tasks.append(("bmw_press", _search_bmw_press_images(search_queries[0], max_results=5)))
-        
-        # SearXNG images — try 2 queries
-        if len(search_queries) >= 1:
-            search_tasks.append(("searxng_1", _search_searxng_images(search_queries[0], max_results=8)))
-        if len(search_queries) >= 2:
-            search_tasks.append(("searxng_2", _search_searxng_images(search_queries[1], max_results=5)))
-        
-        # Google Custom Search via SearXNG — specifically Google's image index
-        if search_queries:
-            search_tasks.append(("google_custom", _search_google_custom_images(search_queries[0], max_results=6)))
-        
-        # Bing images — try 1 query (with improved retry logic)
-        if search_queries:
-            search_tasks.append(("bing", _search_bing_images(search_queries[0], max_results=6)))
-        
-        # Google News RSS — try 1 query for images in news articles
-        if search_queries:
-            search_tasks.append(("google_news", _search_google_images_rss(search_queries[0], max_results=5)))
-        
-        # Wikimedia — try 1 query
-        if len(search_queries) >= 3:
-            search_tasks.append(("wikimedia", _search_wikimedia_images(search_queries[2], max_results=3)))
-        
-        # Unsplash — try 1 query for high-quality photos (using proper API now)
-        if len(search_queries) >= 2:
-            search_tasks.append(("unsplash", _search_unsplash_images(search_queries[1], max_results=3)))
-        
-        # Execute all search tasks concurrently
-        search_results = await asyncio.gather(
-            *[task for _, task in search_tasks],
-            return_exceptions=True,
-        )
-        
-        for (engine_name, _), result in zip(search_tasks, search_results):
-            if isinstance(result, list) and result:
-                _add_urls(result, engine_name)
-        
-        # Step 5: Download all found image URLs concurrently
-        if not all_image_urls:
-            elapsed = time.time() - start_time
-            logger.warning(
-                f"❌ No image URLs found for '{topic[:50]}' "
-                f"({elapsed:.1f}s, tried {len(search_tasks)} search engines)"
-            )
-            self._stats["sources_used"]["none"] = self._stats["sources_used"].get("none", 0) + 1
-            return [], "none"
-        
-        logger.info(f"⬇️ Downloading {len(all_image_urls)} candidate images...")
-        downloaded = await _download_images_concurrent(
-            all_image_urls, max_count=max_images,
-        )
-        
-        if not downloaded:
-            elapsed = time.time() - start_time
-            logger.warning(
-                f"❌ All {len(all_image_urls)} image downloads failed for '{topic[:50]}' "
-                f"({elapsed:.1f}s)"
-            )
-            self._stats["sources_used"]["none"] = self._stats["sources_used"].get("none", 0) + 1
-            return [], "none"
-        
-        # Deduplicate
-        downloaded = deduplicate_images(downloaded)[:max_images]
-        
-        # Determine source
-        source = "search"
-        if image_urls and any(hashlib.sha256(img).hexdigest()[:8] in [hashlib.sha256(d).hexdigest()[:8] for d in downloaded[:1]] for img in []):
-            source = "rss"
-        elif rss_entry:
-            source = "rss"
-        
-        # Cache result
-        if downloaded:
-            self._cache.put(cache_key, downloaded)
-        
-        elapsed = time.time() - start_time
-        self._stats["images_found"] += len(downloaded)
-        self._stats["sources_used"][source] = self._stats["sources_used"].get(source, 0) + 1
-        
-        logger.info(
-            f"✅ Found {len(downloaded)} images for '{topic[:50]}' "
-            f"(source={source}, {elapsed:.1f}s, {len(all_image_urls)} URLs tried)"
-        )
-        
-        return downloaded, source
+        article_url: str = "",
+        rss_entry: Any = None,
+        max_images: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Fetch multiple images for a post (e.g., for mediagroup).
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Return fetcher statistics."""
-        return self._stats.copy()
+        Returns list of dicts with image_b64, source, url.
+        """
+        client = self._get_client()
+        all_candidates: List[Tuple[str, str]] = []
+
+        # Collect all candidate URLs from all sources
+        if rss_entry is not None:
+            for url in extract_rss_images(rss_entry):
+                all_candidates.append((url, "rss_enclosure"))
+
+        if article_url:
+            for url in await fetch_article_images(article_url):
+                if url not in [u for u, _ in all_candidates]:
+                    all_candidates.append((url, "og:image"))
+
+        if len(all_candidates) < max_images:
+            for url in await search_images(topic, max_images=max_images):
+                if url not in [u for u, _ in all_candidates]:
+                    all_candidates.append((url, "image_search"))
+
+        # Validate and collect
+        results: List[Dict[str, Any]] = []
+        for url, source_label in all_candidates:
+            if len(results) >= max_images:
+                break
+            result = await _validate_image(client, url)
+            if result:
+                result["source"] = source_label
+                results.append(result)
+
+        if results:
+            logger.info(f"Fetched {len(results)} images for '{topic[:50]}'")
+
+        return results
+
+    async def close(self) -> None:
+        """Clean up resources."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
+
+
+# ── Convenience function ─────────────────────────────────────────────────────
+
+_fetcher: Optional[ImageFetcher] = None
+
+
+async def fetch_image_for_post(
+    topic: str,
+    article_url: str = "",
+    rss_entry: Any = None,
+    content_type: str = "news+reaction",
+) -> Optional[Dict[str, Any]]:
+    """Module-level convenience function to fetch an image for a post.
+
+    Uses a module-level ImageFetcher instance (lazily initialized).
+    """
+    global _fetcher
+    if _fetcher is None:
+        _fetcher = ImageFetcher()
+    return await _fetcher.fetch(
+        topic=topic,
+        article_url=article_url,
+        rss_entry=rss_entry,
+        content_type=content_type,
+    )

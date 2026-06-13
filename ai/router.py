@@ -216,28 +216,22 @@ class AIRouter:
 {extra_note}
 
 Ограничения:
-- ⛔ СТРОГИЙ ЛИМИТ: с фото — 1024 символа ВЕСЬ пост, без фото — 4096
-- ЕСЛИ ТЫ НАПИШЕШЬ БОЛЬШЕ 1024 СИМВОЛОВ ДЛЯ ПОСТА С ФОТО — ОН ОБРЕЖЕТСЯ НА ПОЛУСЛОВЕ!
-- Пиши КОМПАКТНО и ЁМКО: 500-800 символов оптимально для поста с фото
-- НЕ ПИШИ длинных вступлений. Сразу к делу.
+- Максимум 1024 символа (пост с фото) или 4096 (текстовый пост)
 - Живой язык, не энциклопедия
 - BMW-экспертность, не вода
-- Подпись в конце обязательна — никогда не обрезай её"""
+- Подпись в конце обязательна"""
 
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ]
 
-        # Media posts need shorter text (1024 char limit), text-only can be longer (4096)
-        post_max_tokens = 600 if has_media else 1500
-
         # Channel posts use FUNCTION route (Cloud first, Local fallback)
         return await self.chat(
             messages=messages,
             model=model or random.choice(["openai", "mistral-large", "deepseek"]),
             temperature=temperature,
-            max_tokens=post_max_tokens,
+            max_tokens=1500,
             route_type=ROUTE_FUNCTION,
         )
 
@@ -335,12 +329,7 @@ class AIRouter:
         content_type: str = "news+reaction",
         character_mix: str | None = None,
     ) -> tuple[AIResponse, AIResponse | None]:
-        """Generate a channel post WITHOUT AI-generated image.
-
-        v4.0: AI image generation is DISABLED per user requirement.
-        Only real photos from news sources are used (handled by ImageFetcher).
-        This method now returns (text_response, None) — no AI images.
-        """
+        """Generate a channel post with optional image."""
         text_resp = await self.generate_channel_post(
             topic=topic,
             context=context,
@@ -348,8 +337,17 @@ class AIRouter:
             character_mix=character_mix,
         )
 
-        # NO AI image generation — only real photos from ImageFetcher
-        return text_resp, None
+        image_resp = None
+        if content_type in ("news+reaction", "lore/history", "garage stories", "partner"):
+            img_prompt = await self.generate_image_prompt(topic)
+            image_resp = await self._manager.generate_image(
+                prompt=img_prompt,
+                width=1024,
+                height=768,
+                model="flux",
+            )
+
+        return text_resp, image_resp
 
     async def decode_vin(
         self,

@@ -29,33 +29,32 @@ logger = logging.getLogger(__name__)
 # ── Model catalogues ──────────────────────────────────────────────────────────
 
 # Best models for masha-bot content (tested, good Russian support)
-# NOTE: Only valid model names/aliases on gen.pollinations.ai are listed.
-# "qwen" and "command-r" are NOT valid on gen API (400 errors).
 CHAT_MODELS = [
     "openai", "openai-large",
-    "qwen-coder",
+    "qwen-coder", "qwen",
     "llama", "llama-scale",
     "mistral", "mistral-large",
     "deepseek", "deepseek-r1", "deepseek-reasoner",
-    # REMOVED: "searchgpt", "sur" — invalid on gen.pollinations.ai (400 errors)
+    "command-r",
+    "searchgpt", "sur",
 ]
 
 # Models that work well on legacy free API (text.pollinations.ai)
-# Legacy API may accept model names that gen API rejects.
 LEGACY_CHAT_MODELS = [
     "openai", "mistral", "deepseek", "llama",
-    "mistral-large", "qwen-coder",
+    "qwen", "mistral-large", "qwen-coder", "command-r",
 ]
 
 VISION_MODELS = [
-    "openai", "openai-large", "llama",
+    "openai", "openai-large", "qwen", "llama",
     "mistral", "mistral-large", "deepseek",
+    "command-r",
 ]
 
 CONTENT_MODELS = [
-    "openai", "openai-large", "llama",
+    "openai", "openai-large", "qwen", "llama",
     "mistral", "mistral-large", "deepseek",
-    "deepseek-r1",
+    "deepseek-r1", "command-r",
 ]
 
 IMAGE_MODELS = [

@@ -50,69 +50,37 @@ class PostFormatter:
         return text
 
     def _truncate(self, text: str, limit: int) -> str:
-        """Truncate text to fit within the limit, preserving complete sentences.
-        
-        Uses smart boundary-based truncation — never cuts mid-word or mid-sentence.
-        Always preserves the footer.
-        """
+        """Truncate text to fit within the limit, preserving complete sentences."""
         if len(text) <= limit:
             return text
 
+        # Try to cut at last sentence boundary before limit
+        truncated = text[:limit]
+
+        # Find last sentence boundary
+        last_boundary = max(
+            truncated.rfind("."),
+            truncated.rfind("!"),
+            truncated.rfind("?"),
+            truncated.rfind("\n"),
+        )
+
+        if last_boundary > limit * 0.5:  # At least 50% preserved
+            text = text[: last_boundary + 1].strip()
+        else:
+            text = truncated.rstrip() + "..."
+
+        # Ensure footer fits
         footer = "Автор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
-        
-        # Separate content from footer
-        content = text
-        if footer in text:
-            content = text[:text.index(footer)].rstrip()
-        
-        max_content = limit - len(footer) - 4  # -4 for \n\n separator
-        if max_content < 100:
-            return footer
-        
-        if len(content) > max_content:
-            content = self._smart_truncate_content(content, max_content)
-        
-        return f"{content}\n\n{footer}"
-    
-    def _smart_truncate_content(self, text: str, max_len: int) -> str:
-        """Smart truncation at natural sentence/paragraph boundary."""
-        if len(text) <= max_len:
-            return text
-        
-        target = max_len - 3
-        if target < 50:
-            return text[:target] + "..."
-        
-        search_zone = text[:target + 1]
-        
-        # 1. Paragraph break
-        last_para = search_zone.rfind("\n\n")
-        if last_para > target * 0.5:
-            return text[:last_para].rstrip() + "..."
-        
-        # 2. Sentence end
-        sentence_end_chars = ['. ', '! ', '? ', '… ', '.\n', '!\n', '?\n', '…\n']
-        best_sentence_end = -1
-        for end_char in sentence_end_chars:
-            pos = search_zone.rfind(end_char)
-            if pos > best_sentence_end and pos > target * 0.5:
-                best_sentence_end = pos + len(end_char) - 1
-        
-        if best_sentence_end > target * 0.5:
-            return text[:best_sentence_end + 1].rstrip() + "..."
-        
-        # 3. Newline
-        last_newline = search_zone.rfind("\n")
-        if last_newline > target * 0.5:
-            return text[:last_newline].rstrip() + "..."
-        
-        # 4. Space (avoid mid-word)
-        last_space = search_zone.rfind(" ")
-        if last_space > target * 0.5:
-            return text[:last_space].rstrip() + "..."
-        
-        # 5. Hard cut — very last resort
-        return text[:target].rstrip() + "..."
+        if footer not in text:
+            needed = len(footer) + 2  # +2 for \n\n
+            if len(text) + needed > limit:
+                text = text[: limit - needed].rstrip()
+                if not text.endswith((".", "!", "?")):
+                    text += "..."
+            text = f"{text}\n\n{footer}"
+
+        return text
 
     def _format_paragraphs(self, text: str) -> str:
         """Ensure proper paragraph formatting."""

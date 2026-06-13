@@ -630,12 +630,7 @@ async def ai_discover_news() -> List[Dict]:
 
 
 async def search_auto_news() -> List[Dict]:
-    """Search for automotive/BMW news using web search + RSS.
-
-    v3.0: Now also fetches from BMW RSS feeds (via BMWRSSFetcher) so that
-    rss_entry is available for image extraction from content:encoded.
-    Web search items won't have rss_entry, but RSS items will.
-    """
+    """Search for automotive/BMW news using web search."""
     items = []
 
     query = _get_search_query()
@@ -680,32 +675,6 @@ async def search_auto_news() -> List[Dict]:
             })
     except Exception as e:
         logger.debug(f"Google News RSS search failed: {e}")
-
-    # ── v3.0: Also fetch from BMW RSS feeds for better image sourcing ────
-    # RSS items carry rss_entry which enables content:encoded image extraction
-    try:
-        from bot.sources.rss_fetcher import BMWRSSFetcher
-        from bot.database import Database
-        db = Database()
-        await db.connect()
-        try:
-            rss = BMWRSSFetcher(db=db)
-            rss_items = await rss._fetch_all_sources()
-            await rss.close()
-            # RSS items already have image_urls and rss_entry from rss_fetcher
-            for item in rss_items[:10]:
-                # Avoid duplicates with web search results
-                is_dup = any(
-                    existing.get("title", "").lower()[:40] == item.get("title", "").lower()[:40]
-                    for existing in items
-                )
-                if not is_dup:
-                    items.append(item)
-            logger.info(f"Added {min(len(rss_items), 10)} RSS items to news candidates")
-        finally:
-            await db.close()
-    except Exception as e:
-        logger.debug(f"RSS feed enrichment failed: {e}")
 
     return items
 

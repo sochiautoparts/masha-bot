@@ -630,9 +630,43 @@ async def ai_discover_news() -> List[Dict]:
 
 
 async def search_auto_news() -> List[Dict]:
-    """Search for automotive/BMW news using web search."""
+    """Search for automotive/BMW news using web search.
+
+    v3.1: RSS feeds are now the PRIMARY source because they provide:
+    - Direct article URLs (not Google News redirects)
+    - Image URLs already extracted from RSS enclosures/content
+    - More reliable and faster than web search
+
+    Web search is used as supplement for broader coverage.
+    """
     items = []
 
+    # ── PHASE 1: RSS feeds — PREFERRED source (direct URLs + images) ─────
+    try:
+        from bot.sources.rss_fetcher import BMWRSSFetcher
+        from bot.database import Database
+        db = Database()
+        rss_fetcher = BMWRSSFetcher(db)
+        try:
+            rss_items = await rss_fetcher._fetch_all_sources()
+            for item in rss_items:
+                # RSS items already have url, image_urls, and rss_entry
+                item["source"] = f"rss:{item.get('source', 'unknown')}"
+                item["category"] = item.get("category", "auto")
+                if "published_time" not in item:
+                    item["published_time"] = _extract_published_time_from_snippet(
+                        item.get("summary", "")
+                    )
+                if "lang" not in item:
+                    item["lang"] = "en" if any(c.isascii() for c in item.get("title", "")[:20]) else "ru"
+            items.extend(rss_items)
+            logger.info(f"RSS feeds: {len(rss_items)} items with direct URLs + images")
+        finally:
+            await rss_fetcher.close()
+    except Exception as e:
+        logger.debug(f"RSS feed fetch failed: {e}")
+
+    # ── PHASE 2: Web search — supplement for broader coverage ────────────
     query = _get_search_query()
     logger.info(f"Web search query: {query[:60]}")
 
@@ -640,7 +674,7 @@ async def search_auto_news() -> List[Dict]:
         results = await web_search(query, max_results=8)
     except Exception as e:
         logger.error(f"Web search failed: {e}")
-        return items
+        results = []
 
     for r in results:
         published_time = _extract_published_time_from_snippet(r.snippet)

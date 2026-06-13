@@ -694,18 +694,85 @@ class ChannelManager:
             pass
         return images
 
+    async def _resolve_article_url(self, url: str, title: str = "") -> str:
+        """Resolve a news URL to a direct article link.
+
+        Google News RSS returns redirect URLs like:
+          https://news.google.com/rss/articles/CBMidkFV...
+        These don't resolve to the real article — they lead to a Google
+        intermediate page with no article content to scrape.
+
+        Solution: If the URL is a Google News redirect, search DDG for the
+        article title to find the direct URL. This works because the title
+        is unique enough to find the exact article.
+
+        Returns the resolved (direct) URL, or the original URL if not a redirect.
+        """
+        if not url:
+            return url
+
+        # Detect Google News redirect URLs
+        is_google_redirect = (
+            'news.google.com' in url
+            or 'google.com/rss/articles' in url
+            or 'google.com/articles/' in url
+        )
+
+        if not is_google_redirect:
+            return url
+
+        if not title:
+            # Can't resolve without title — return as-is
+            logger.debug(f"Google News URL without title, can't resolve: {url[:60]}")
+            return url
+
+        # Try to find the direct URL via DDG search
+        logger.info(f"Resolving Google News URL for: {title[:50]}")
+        try:
+            from bot.web_search import search_ddg_html
+            # Clean title for search — remove site names in brackets
+            clean_title = re.sub(r'\s*[-–—]\s*[^–—]*$', '', title).strip()
+            search_query = clean_title[:80]
+
+            results = await search_ddg_html(search_query, max_results=5)
+            for r in results:
+                r_url = r.url
+                # Skip Google redirects, DDG redirect links
+                if 'google.com' in r_url or 'duckduckgo.com' in r_url:
+                    continue
+                # Extract real URL from DDG redirect if needed
+                if 'uddg=' in r_url:
+                    from urllib.parse import unquote, urlparse, parse_qs
+                    parsed = urlparse(r_url)
+                    params = parse_qs(parsed.query)
+                    if 'uddg' in params:
+                        r_url = unquote(params['uddg'][0])
+                if r_url.startswith('//'):
+                    r_url = 'https:' + r_url
+                # Found a direct URL
+                if r_url.startswith('http'):
+                    logger.info(f"Resolved Google URL → {r_url[:60]}")
+                    return r_url
+        except Exception as e:
+            logger.debug(f"Google URL resolution failed: {e}")
+
+        # Couldn't resolve — return original
+        logger.warning(f"Could not resolve Google News URL: {url[:60]}")
+        return url
+
     async def _get_post_images(self, news_item: Dict) -> tuple:
         """Get images for a news post — ONLY from the article page.
 
-        v3.0: RADICALLY SIMPLIFIED.
+        v3.1: Improved URL resolution.
         Automotive news articles ALWAYS come with photos.
         We extract them directly from the article. That's it.
 
         Steps:
-        1. Scrape the article page for images (og:image, JSON-LD, article body <img>)
-        2. If RSS provided image URLs, download those too (same source, different path)
+        1. Resolve URL (Google News redirects → direct article URL)
+        2. Download RSS image URLs if available (fast, no scraping needed)
+        3. Scrape the article page for MORE images (up to 10 total)
 
-        That's it. No fallbacks to stock photos, AI generation, or web search.
+        No fallbacks to stock photos, AI generation, or web search images.
         If the article has no photos = text-only post. Better than wrong photos.
 
         Returns (image_list: List[bytes], source: str)
@@ -714,39 +781,38 @@ class ChannelManager:
         source = "none"
         title = news_item.get("title", "")
 
-        # Step 1: Scrape article page — the PRIMARY and most reliable source
-        # Automotive articles ALWAYS have photos embedded in the page
+        # Step 0: Resolve Google News redirect URLs to direct article URLs
         article_url = news_item.get("url", "")
         if article_url:
+            article_url = await self._resolve_article_url(article_url, title=title)
+
+        # Step 1: Download RSS image URLs FIRST — these are the fastest
+        # (already extracted from feed, no HTML scraping needed)
+        rss_image_urls = news_item.get("image_urls", [])
+        if rss_image_urls:
+            try:
+                rss_images = await self._download_images(rss_image_urls, max_count=MAX_IMAGES_PER_POST)
+                if rss_images:
+                    image_list.extend(rss_images)
+                    source = "rss"
+                    logger.info(f"Downloaded {len(rss_images)} RSS images for: {title[:50]}")
+            except Exception as e:
+                logger.debug(f"RSS image download failed: {e}")
+
+        # Step 2: Scrape article page for MORE images
+        # This gives us the full gallery (up to 10 photos per article)
+        if article_url and len(image_list) < MAX_IMAGES_PER_POST:
             try:
                 scraped = await self._scrape_article_images(
                     article_url,
-                    max_count=MAX_IMAGES_PER_POST
+                    max_count=MAX_IMAGES_PER_POST - len(image_list)
                 )
                 if scraped:
                     image_list.extend(scraped)
-                    source = "article"
+                    source = "article" if source == "none" else source + "+article"
                     logger.info(f"Scraped {len(scraped)} images from article: {title[:50]}")
             except Exception as e:
                 logger.debug(f"Article scraping failed: {e}")
-
-        # Step 2: Add RSS image URLs if available (these come from the same source,
-        # just via RSS enclosures/media:content instead of HTML scraping)
-        rss_image_urls = news_item.get("image_urls", [])
-        if rss_image_urls and len(image_list) < MAX_IMAGES_PER_POST:
-            try:
-                # Filter out URLs we already have from scraping
-                existing_urls = set()
-                # We can't easily compare by URL since we've already downloaded,
-                # but we can still try to get more images
-                remaining = MAX_IMAGES_PER_POST - len(image_list)
-                rss_images = await self._download_images(rss_image_urls, max_count=remaining)
-                if rss_images:
-                    image_list.extend(rss_images)
-                    source = "article+rss" if source == "article" else "rss"
-                    logger.info(f"Added {len(rss_images)} RSS images: {title[:50]}")
-            except Exception as e:
-                logger.debug(f"RSS image download failed: {e}")
 
         # Hard limit
         image_list = image_list[:MAX_IMAGES_PER_POST]

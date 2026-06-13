@@ -10,6 +10,9 @@ ROUTE STRATEGY (LOCAL-FIRST):
   IMAGE generation           → Pollinations → Cloudflare → HuggingFace
 
 Level 0: Local Model (Qwen3-4B GGUF, CPU) — chat & comments FIRST
+  CHAT route local limit: 2048 tokens (detailed user answers)
+  COMMENT route local limit: 512 tokens (short group comments)
+  FUNCTION route local limit: 2048 tokens (channel posts, VIN, diagnostics fallback)
 Level 1: Pollinations (gen API with key → legacy free API)
 Level 2: Cloudflare Workers AI (free, 10k req/day/account)
 Level 3: HuggingFace Spaces (free, unlimited)
@@ -93,11 +96,15 @@ class ProviderManager:
             # Level 0: Try Local model first
             if self.local and self.local.is_available():
                 try:
+                    # Route-aware token limits for local model:
+                    #   CHAT: up to 2048 (detailed user answers, VIN, diagnostics)
+                    #   COMMENT: up to 512 (short group/channel comments)
+                    local_max = min(max_tokens, 2048) if route_type == ROUTE_CHAT else min(max_tokens, 512)
                     result = await self.local.chat(
                         messages=messages,
                         model="local-qwen3-4b",
                         temperature=temperature,
-                        max_tokens=min(max_tokens, 512),  # Local model limit
+                        max_tokens=local_max,
                         **kwargs,
                     )
                     if result.ok:
@@ -162,11 +169,13 @@ class ProviderManager:
         # Level 2.5: For FUNCTION routes — try Local as LAST fallback
         if route_type == ROUTE_FUNCTION and self.local and self.local.is_available():
             try:
+                # FUNCTION route needs longer output (channel posts, VIN, diagnostics)
+                local_max = min(max_tokens, 2048)
                 result = await self.local.chat(
                     messages=messages,
                     model="local-qwen3-4b",
                     temperature=temperature,
-                    max_tokens=min(max_tokens, 512),
+                    max_tokens=local_max,
                     **kwargs,
                 )
                 if result.ok:

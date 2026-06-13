@@ -14,8 +14,8 @@ USAGE STRATEGY:
   Level 1-3 (CLOUD): Function routes, channel posts, VIN, diagnostics, vision
 
   Local model excels at:
-    - Quick chat responses (saves cloud balance)
-    - Group comments (short, fast, cheap)
+    - Chat responses up to 2048 tokens (detailed user answers)
+    - Group comments up to 512 tokens (short, fast, cheap)
     - Simple Q&A about BMW
     - Fallback when all cloud providers are down
 
@@ -24,6 +24,11 @@ USAGE STRATEGY:
     - VIN decoding (needs accuracy)
     - Diagnostics (needs expert knowledge)
     - Vision tasks (local model can't do vision)
+
+TOKEN LIMITS (route-aware, enforced by ProviderManager):
+  CHAT route:    max 2048 tokens (detailed user conversations)
+  COMMENT route: max 512 tokens (short group/channel comments)
+  FUNCTION route: max 2048 tokens (fallback for posts, VIN, diagnostics)
 """
 
 import logging

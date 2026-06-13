@@ -73,7 +73,7 @@ class BotConfig:
     MODEL_PATH: str = os.getenv("MODEL_PATH", "models/Qwen3-4B-Q4_K_M.gguf") if ENABLE_LOCAL_MODEL else ""
     MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "8192"))
     MODEL_N_THREADS: int = int(os.getenv("MODEL_N_THREADS", "4"))
-    MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "512"))
+    MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "2048"))
     MODEL_HISTORY_LIMIT: int = int(os.getenv("MODEL_HISTORY_LIMIT", "6"))
     MODEL_AUTO_DOWNLOAD: bool = os.getenv("MODEL_AUTO_DOWNLOAD", "true").lower() in ("true", "1", "yes")
     MODEL_DOWNLOAD_URL: str = os.getenv(

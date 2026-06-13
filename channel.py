@@ -702,9 +702,11 @@ class ChannelManager:
         These don't resolve to the real article — they lead to a Google
         intermediate page with no article content to scrape.
 
-        Solution: If the URL is a Google News redirect, search DDG for the
-        article title to find the direct URL. This works because the title
-        is unique enough to find the exact article.
+        Strategy (in order):
+        1. If not a Google redirect, return as-is
+        2. Try HTTP redirect follow on the Google News URL itself
+        3. Try DDG search with the article title
+        4. If nothing works, try extracting from Google's redirect page
 
         Returns the resolved (direct) URL, or the original URL if not a redirect.
         """
@@ -722,16 +724,34 @@ class ChannelManager:
             return url
 
         if not title:
-            # Can't resolve without title — return as-is
             logger.debug(f"Google News URL without title, can't resolve: {url[:60]}")
             return url
 
-        # Try to find the direct URL via DDG search
+        # Strategy 1: Try following HTTP redirects on the Google News URL
+        # Sometimes Google redirects directly to the article
         logger.info(f"Resolving Google News URL for: {title[:50]}")
         try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, max_redirects=10) as client:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+                resp = await client.get(url, headers=headers)
+                final_url = str(resp.url)
+                # Check if the redirect landed on a real article (not google.com)
+                if final_url and 'google.com' not in final_url and final_url.startswith('http'):
+                    logger.info(f"Google URL resolved via redirect → {final_url[:60]}")
+                    return final_url
+        except Exception as e:
+            logger.debug(f"Google redirect follow failed: {e}")
+
+        # Strategy 2: Try DDG search with the article title
+        try:
             from bot.web_search import search_ddg_html
-            # Clean title for search — remove site names in brackets
+            # Clean title for search — remove site names in brackets, trailing dashes
             clean_title = re.sub(r'\s*[-–—]\s*[^–—]*$', '', title).strip()
+            # Remove common Google News suffixes like " - BMW Blog"
+            clean_title = re.sub(r'\s*[-–—|]\s*(BMW Blog|BimmerFile|Electrek|CarScoops|Autocar|AutoExpress|Reddit|InsideEVs)$', '', clean_title, flags=re.IGNORECASE).strip()
             search_query = clean_title[:80]
 
             results = await search_ddg_html(search_query, max_results=5)
@@ -751,10 +771,37 @@ class ChannelManager:
                     r_url = 'https:' + r_url
                 # Found a direct URL
                 if r_url.startswith('http'):
-                    logger.info(f"Resolved Google URL → {r_url[:60]}")
+                    logger.info(f"Resolved Google URL via DDG → {r_url[:60]}")
                     return r_url
         except Exception as e:
-            logger.debug(f"Google URL resolution failed: {e}")
+            logger.debug(f"Google URL resolution via DDG failed: {e}")
+
+        # Strategy 3: Try extracting the actual URL from Google's redirect page HTML
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+                resp = await client.get(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                })
+                html = resp.text
+                # Google redirect pages often contain the target URL in data attributes or JS
+                # Look for patterns like: data-url="...", href="...", window.location="..."
+                url_patterns = [
+                    r'data-url=["\x27](https?://[^"\x27]+)["\x27]',
+                    r'window\.location\s*=\s*["\x27](https?://[^"\x27]+)["\x27]',
+                    r'href=["\x27](https?://(?!news\.google\.com)[^"\x27]+)["\x27]',
+                    r'<a[^>]+href=["\x27](https?://(?!news\.google\.com|google\.com)[^"\x27]+)["\x27]',
+                    r'url=([^&"\x27]+)',
+                ]
+                for pattern in url_patterns:
+                    matches = re.findall(pattern, html, re.IGNORECASE)
+                    for match in matches:
+                        from urllib.parse import unquote
+                        candidate = unquote(match)
+                        if candidate.startswith('http') and 'google.com' not in candidate:
+                            logger.info(f"Resolved Google URL from HTML → {candidate[:60]}")
+                            return candidate
+        except Exception as e:
+            logger.debug(f"Google URL HTML extraction failed: {e}")
 
         # Couldn't resolve — return original
         logger.warning(f"Could not resolve Google News URL: {url[:60]}")

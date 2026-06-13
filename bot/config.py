@@ -294,18 +294,21 @@ class NewsSource:
 
 @dataclass
 class NewsConfig:
-    """News source configuration — BMW-specific sources."""
+    """News source configuration — BMW-specific sources (v2: updated working feeds)."""
     sources: List[NewsSource] = field(default_factory=lambda: [
-        # BMW-specific RSS feeds
+        # BMW-specific RSS feeds (verified working)
         NewsSource(name="BMWBlog", url="https://bmwblog.com/feed/", lang="en", category="bmw"),
-        NewsSource(name="BimmerPost", url="https://bimmerpost.com/feed/", lang="en", category="bmw"),
-        NewsSource(name="Motor1BMW", url="https://www.motor1.com/rss/bmw/", lang="en", category="bmw"),
-        NewsSource(name="CarAndDriverBMW", url="https://www.caranddriver.com/bmw/rss/", lang="en", category="bmw"),
-        NewsSource(name="AutoExpressBMW", url="https://www.autoexpress.co.uk/bmw/rss", lang="en", category="bmw"),
+        NewsSource(name="BimmerFile", url="https://bimmerfile.com/feed/", lang="en", category="bmw"),
+        NewsSource(name="GoogleNewsBMW", url="https://news.google.com/rss/search?q=BMW+when:7d&hl=en-US&gl=US&ceid=US:en", lang="en", category="bmw"),
+        NewsSource(name="GoogleNewsBMWRU", url="https://news.google.com/rss/search?q=БМВ+новости&hl=ru&gl=RU&ceid=RU:ru", lang="ru", category="bmw"),
         # General auto feeds (for BMW-relevant content)
-        NewsSource(name="ReutersAuto", url="https://www.reuters.com/business/autos-transportation/rss", lang="en", category="auto"),
+        NewsSource(name="CarScoops", url="https://www.carscoops.com/feed/", lang="en", category="auto"),
+        NewsSource(name="Autocar", url="https://www.autocar.co.uk/rss", lang="en", category="auto"),
+        NewsSource(name="AutoExpress", url="https://www.autoexpress.co.uk/rss", lang="en", category="auto"),
         NewsSource(name="Electrek", url="https://electrek.co/feed/", lang="en", category="auto"),
-        NewsSource(name="InsideEVs", url="https://insideevs.com/rss/", lang="en", category="auto"),
+        NewsSource(name="InsideEVs", url="https://insideevs.com/feed/", lang="en", category="auto"),
+        # Reddit
+        NewsSource(name="RedditBMW", url="https://www.reddit.com/r/BMW/.rss", lang="en", category="reddit"),
     ])
 
 

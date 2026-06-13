@@ -42,6 +42,7 @@ class Database:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._create_tables()
+        await self._run_migrations()
         logger.info("Database initialized at %s", self.db_path)
 
     async def close(self) -> None:
@@ -91,6 +92,7 @@ class Database:
                 is_used INTEGER DEFAULT 0,
                 content_type TEXT,
                 fingerprint TEXT,
+                image_urls TEXT DEFAULT '',
                 UNIQUE(url)
             );
 
@@ -202,6 +204,7 @@ class Database:
             "ALTER TABLE topic_registry ADD COLUMN last_posted REAL",
             "ALTER TABLE topic_registry ADD COLUMN post_count INTEGER DEFAULT 0",
             "ALTER TABLE topic_registry ADD COLUMN titles TEXT",
+            "ALTER TABLE news_items ADD COLUMN image_urls TEXT DEFAULT ''",
         ]
         for stmt in alter_statements:
             try:
@@ -210,6 +213,21 @@ class Database:
                 pass  # Column already exists
 
         await self._conn.commit()
+
+    async def _run_migrations(self) -> None:
+        """Run data migrations for existing databases."""
+        assert self._conn is not None
+
+        # Ensure image_urls column exists in news_items
+        try:
+            await self._conn.execute("SELECT image_urls FROM news_items LIMIT 1")
+        except Exception:
+            try:
+                await self._conn.execute("ALTER TABLE news_items ADD COLUMN image_urls TEXT DEFAULT ''")
+                await self._conn.commit()
+                logger.info("Migration: added image_urls column to news_items")
+            except Exception:
+                pass
 
     # ── Users ─────────────────────────────────────────────────────────────
 
@@ -292,6 +310,7 @@ class Database:
         published_at: str | None = None,
         is_urgent: bool = False,
         content_type: str | None = None,
+        image_urls: list[str] | None = None,
     ) -> bool:
         """Add a news item. Returns True if added, False if duplicate."""
         assert self._conn is not None
@@ -299,11 +318,14 @@ class Database:
             (title + (url or "")).encode()
         ).hexdigest()[:16]
 
+        # Serialize image_urls to JSON string for storage
+        image_urls_json = json.dumps(image_urls, ensure_ascii=False) if image_urls else ""
+
         try:
             await self._conn.execute(
-                """INSERT INTO news_items (source, title, url, summary, published_at, is_urgent, content_type, fingerprint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (source, title, url, summary, published_at, int(is_urgent), content_type, fingerprint),
+                """INSERT INTO news_items (source, title, url, summary, published_at, is_urgent, content_type, fingerprint, image_urls)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (source, title, url, summary, published_at, int(is_urgent), content_type, fingerprint, image_urls_json),
             )
             await self._conn.commit()
             return True
@@ -324,7 +346,17 @@ class Database:
 
         async with self._conn.execute(query, (limit,)) as cur:
             rows = await cur.fetchall()
-            return [dict(r) for r in rows]
+            items = [dict(r) for r in rows]
+            # Parse image_urls from JSON
+            for item in items:
+                if "image_urls" in item and isinstance(item["image_urls"], str) and item["image_urls"]:
+                    try:
+                        item["image_urls"] = json.loads(item["image_urls"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["image_urls"] = []
+                elif "image_urls" not in item:
+                    item["image_urls"] = []
+            return items
 
     async def mark_news_used(self, news_id: int) -> None:
         """Mark a news item as used."""
@@ -1029,6 +1061,14 @@ async def get_unposted_news(limit: int = 10) -> list[dict[str, Any]]:
             item["category"] = item["content_type"] or "auto"
         if "category" not in item:
             item["category"] = "auto"
+        # Parse image_urls from JSON string stored in DB
+        if "image_urls" in item and isinstance(item["image_urls"], str) and item["image_urls"]:
+            try:
+                item["image_urls"] = json.loads(item["image_urls"])
+            except (json.JSONDecodeError, TypeError):
+                item["image_urls"] = []
+        elif "image_urls" not in item:
+            item["image_urls"] = []
     return items
 
 

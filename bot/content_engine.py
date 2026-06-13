@@ -701,6 +701,7 @@ async def search_auto_news() -> List[Dict]:
             "published_time": published_time,
             "category": "auto",
             "lang": "en" if any(c.isascii() for c in r.title[:20]) else "ru",
+            "image_urls": [],  # Web search doesn't provide images; will be scraped from article
         })
 
     # Also try Google News RSS
@@ -719,6 +720,7 @@ async def search_auto_news() -> List[Dict]:
                 "published_time": time.time(),
                 "category": "auto",
                 "lang": gn_query[1],
+                "image_urls": [],  # Google News RSS doesn't include images
             })
     except Exception as e:
         logger.debug(f"Google News RSS search failed: {e}")

@@ -1300,10 +1300,54 @@ class ChannelManager:
                     # v5.0: _enforce_char_limit already ensured text fits caption limit
                     # No need for redundant [:1024] truncation here
 
-                    # Save images to temp files
+                    # Save images to temp files — resize if needed for Telegram
+                    # Telegram photo limits: max 10MB, each side 10-10000px,
+                    # total w+h <= 10000. Invalid dimensions = PHOTO_INVALID_DIMENSIONS
                     tmp_paths = []
                     for i, img_data in enumerate(image_data_list[:MAX_IMAGES_PER_POST]):
                         tmp_path = os.path.join(tempfile.gettempdir(), f"masha_post_{int(time.time())}_{i}.jpg")
+                        # Try to validate and resize with PIL before saving
+                        try:
+                            from PIL import Image
+                            import io
+                            img = Image.open(io.BytesIO(img_data))
+                            w, h = img.size
+                            needs_resize = False
+
+                            # Telegram requires: each side between 10-10000px, w+h <= 10000
+                            if w < 10 or h < 10:
+                                logger.warning(f"Image too small ({w}x{h}), skipping")
+                                continue
+                            if w + h > 10000:
+                                # Scale down so w+h <= 8000 (safe margin)
+                                scale = 8000 / (w + h)
+                                new_w = int(w * scale)
+                                new_h = int(h * scale)
+                                img = img.resize((new_w, new_h), Image.LANCZOS)
+                                needs_resize = True
+                                logger.info(f"Resized image: {w}x{h} -> {new_w}x{new_h} (w+h limit)")
+                            elif w > 10000 or h > 10000:
+                                # Single side exceeds Telegram max
+                                scale = 9000 / max(w, h)
+                                new_w = int(w * scale)
+                                new_h = int(h * scale)
+                                img = img.resize((new_w, new_h), Image.LANCZOS)
+                                needs_resize = True
+                                logger.info(f"Resized image: {w}x{h} -> {new_w}x{new_h} (side limit)")
+
+                            if needs_resize:
+                                # Convert to RGB if necessary (for JPEG save)
+                                if img.mode in ('RGBA', 'P', 'LA'):
+                                    img = img.convert('RGB')
+                                buf = io.BytesIO()
+                                img.save(buf, format='JPEG', quality=90)
+                                img_data = buf.getvalue()
+
+                        except ImportError:
+                            logger.debug("PIL not available — saving image as-is")
+                        except Exception as e:
+                            logger.debug(f"Image resize check failed: {e} — saving as-is")
+
                         with open(tmp_path, "wb") as f:
                             f.write(img_data)
                         tmp_paths.append(tmp_path)
@@ -1383,6 +1427,33 @@ class ChannelManager:
 
             except Exception as e:
                 logger.error(f"Error posting to channel: {e}")
+                # If photo failed, try posting as text-only (better than losing the post)
+                if has_media and "PHOTO" in str(e).upper():
+                    logger.info("Photo failed — retrying as text-only post")
+                    try:
+                        sent_message = await self._bot.send_message(
+                            chat_id=config.CHANNEL_ID,
+                            text=post_text[:4096],
+                            parse_mode=ParseMode.HTML,
+                        )
+                        if sent_message:
+                            await self._add_reaction(config.CHANNEL_ID, sent_message.message_id)
+                            await add_channel_post(
+                                content=post_text,
+                                message_id=sent_message.message_id,
+                                post_type="news",
+                                source_url=news_item.get("url", ""),
+                                has_image=False,
+                                image_url="",
+                            )
+                            if news_item.get("url"):
+                                await mark_news_posted(news_item["url"])
+                            _register_topic(entity_key, news_item["title"])
+                            _record_post_title(news_item["title"])
+                            logger.info(f"✅ Text-only fallback post published: {news_item['title'][:60]}")
+                            return news_item
+                    except Exception as e2:
+                        logger.error(f"Text-only fallback also failed: {e2}")
                 return False
 
         except Exception as e:

@@ -1343,11 +1343,199 @@ class ChannelManager:
             logger.error(f"Scheduled post error: {e}", exc_info=True)
             return False
 
+    # ── Partner image pipeline ──────────────────────────────────────────────
+
+    @staticmethod
+    def _svg_to_png(svg_data: bytes, width: int = 800, height: int = 600) -> Optional[bytes]:
+        """Convert SVG data to PNG using cairosvg.
+
+        Creates a white-background PNG from an SVG logo.
+        Returns PNG bytes or None if conversion fails.
+        """
+        try:
+            import cairosvg
+            import io
+            png_bytes = cairosvg.svg2png(
+                bytestring=svg_data,
+                output_width=width,
+                output_height=height,
+                background_color="white",
+            )
+            if png_bytes and len(png_bytes) > 500:
+                return png_bytes
+        except ImportError:
+            logger.debug("cairosvg not available for SVG→PNG conversion")
+        except Exception as e:
+            logger.debug(f"SVG→PNG conversion failed: {e}")
+        return None
+
+    @staticmethod
+    def _create_partner_card(logo_png: bytes, partner_name: str, category: str = "") -> Optional[bytes]:
+        """Create a branded partner card image with logo + text overlay.
+
+        Layout:
+        ┌────────────────────────────────┐
+        │  BMW ///M Power Club           │  ← Header
+        │  ─────────────────────         │
+        │                                │
+        │       [PARTNER LOGO]           │  ← Centered logo
+        │                                │
+        │  ─────────────────────         │
+        │  Партнёр канала               │  ← Footer
+        └────────────────────────────────┘
+
+        Returns JPEG bytes or None on failure.
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            import io
+
+            # Create canvas — 800x600 dark BMW-themed background
+            W, H = 800, 600
+            img = Image.new("RGB", (W, H), color=(20, 20, 30))
+            draw = ImageDraw.Draw(img)
+
+            # Try to load fonts
+            try:
+                font_large = ImageFont.truetype("/usr/share/fonts/truetype/chinese/NotoSansSC[wght].ttf", 28)
+                font_small = ImageFont.truetype("/usr/share/fonts/truetype/chinese/NotoSansSC[wght].ttf", 18)
+                font_header = ImageFont.truetype("/usr/share/fonts/truetype/chinese/NotoSansSC[wght].ttf", 22)
+            except Exception:
+                try:
+                    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+                    font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+                    font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+                except Exception:
+                    font_large = ImageFont.load_default()
+                    font_small = ImageFont.load_default()
+                    font_header = ImageFont.load_default()
+
+            # Header: "BMW ///M Power Club"
+            header_text = "BMW ///M Power Club"
+            draw.text((W // 2, 30), header_text, fill=(0, 150, 255), font=font_header, anchor="mt")
+
+            # Separator line
+            draw.line([(50, 65), (W - 50, 65)], fill=(0, 100, 200), width=2)
+
+            # Center partner logo
+            try:
+                logo_img = Image.open(io.BytesIO(logo_png)).convert("RGBA")
+                # Resize to fit: max 400x350
+                logo_w, logo_h = logo_img.size
+                max_w, max_h = 400, 350
+                ratio = min(max_w / max(logo_w, 1), max_h / max(logo_h, 1))
+                if ratio < 1:
+                    logo_img = logo_img.resize(
+                        (int(logo_w * ratio), int(logo_h * ratio)),
+                        Image.LANCZOS,
+                    )
+                logo_w, logo_h = logo_img.size
+
+                # Paste centered on white background
+                logo_bg = Image.new("RGBA", (logo_w + 20, logo_h + 20), (255, 255, 255, 240))
+                logo_bg.paste(logo_img, (10, 10), logo_img if logo_img.mode == "RGBA" else None)
+
+                paste_x = (W - logo_bg.width) // 2
+                paste_y = 80 + (400 - logo_bg.height) // 2
+                img.paste(logo_bg, (paste_x, paste_y), logo_bg if logo_bg.mode == "RGBA" else None)
+            except Exception as e:
+                logger.debug(f"Partner logo paste failed: {e}")
+
+            # Separator line
+            draw.line([(50, H - 90), (W - 50, H - 90)], fill=(0, 100, 200), width=2)
+
+            # Footer: "Партнёр канала"
+            footer_text = "🤝 Партнёр канала"
+            draw.text((W // 2, H - 50), footer_text, fill=(180, 180, 180), font=font_small, anchor="mt")
+
+            # Partner name (if fits)
+            if partner_name:
+                name_display = partner_name[:30]
+                draw.text((W // 2, H - 25), name_display, fill=(255, 255, 255), font=font_small, anchor="mt")
+
+            # Convert to JPEG
+            output = io.BytesIO()
+            img.convert("RGB").save(output, format="JPEG", quality=90)
+            return output.getvalue()
+        except Exception as e:
+            logger.debug(f"Partner card creation failed: {e}")
+            return None
+
+    async def _get_partner_image(self, program) -> Optional[bytes]:
+        """Get image for a partner post — from admitad_ads.json image URLs.
+
+        Strategy:
+        1. Try downloading raster image (jpg/png/webp) from partner's image_url
+        2. If SVG — convert to PNG, then create a branded card
+        3. If raster — create a branded card with the logo
+        4. Fallback: text-only post
+
+        Returns image bytes (always JPEG for Telegram) or None.
+        """
+        # Collect all image URLs from the partner program
+        image_urls = []
+        for attr in ('image_url', 'logo_url', 'image', 'brand_logo', 'advertiser_logo', 'logo'):
+            url = getattr(program, attr, '')
+            if url and url not in image_urls:
+                image_urls.append(url)
+
+        if not image_urls:
+            logger.info(f"No image URLs for partner: {program.name}")
+            return None
+
+        for url in image_urls:
+            try:
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                    resp = await client.get(url, headers={
+                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
+                    })
+                    if resp.status_code != 200:
+                        continue
+
+                    content = resp.content
+                    if len(content) < 200:
+                        continue
+
+                    content_type = resp.headers.get("content-type", "").lower()
+                    url_lower = url.lower()
+
+                    # ── Case 1: Raster image (jpg/png/webp) → create branded card ──
+                    if any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]) or \
+                       any(url_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
+                        # Create a branded card with the logo
+                        card = self._create_partner_card(content, program.name, getattr(program, 'category', ''))
+                        if card:
+                            logger.info(f"Partner card created from raster: {program.name} ({len(card)} bytes)")
+                            return card
+                        # If card creation fails, use the raw image (if big enough)
+                        if len(content) > 2000:
+                            logger.info(f"Using raw partner image: {program.name} ({len(content)} bytes)")
+                            return content
+                        continue
+
+                    # ── Case 2: SVG → convert to PNG → create branded card ──
+                    if "svg" in content_type or url_lower.endswith('.svg'):
+                        png_data = self._svg_to_png(content, width=400, height=300)
+                        if png_data:
+                            card = self._create_partner_card(png_data, program.name, getattr(program, 'category', ''))
+                            if card:
+                                logger.info(f"Partner card created from SVG: {program.name} ({len(card)} bytes)")
+                                return card
+                        continue
+
+            except Exception as e:
+                logger.debug(f"Partner image download failed for {program.name} from {url[:60]}: {e}")
+                continue
+
+        logger.info(f"No usable image for partner: {program.name}")
+        return None
+
     async def post_partner_content(self) -> bool:
         """Post partner content to the channel.
 
-        Partner posts try to get an image from the partner's logo URL.
-        If no image available, post as text-only.
+        v8.0: Uses images from admitad_ads.json — SVG logos are converted to PNG
+        and wrapped in a branded BMW-themed partner card.
+        Always tries to post WITH an image for maximum engagement.
         """
         if not partner_manager.should_post_partner():
             return False
@@ -1361,28 +1549,12 @@ class ChannelManager:
         if not _validate_post_text_partner(post_content):
             return False
 
-        # Try to get an image for the partner post
-        image_data = None
-
-        # Try downloading the partner's logo/image
-        logo_url = getattr(program, 'image_url', '') or getattr(program, 'logo_url', '') or getattr(program, 'image', '')
-        if logo_url:
-            try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    resp = await client.get(logo_url, headers={
-                        "User-Agent": "MashaBot/1.0 (+https://t.me/asmasha_bot)",
-                    })
-                    if resp.status_code == 200 and len(resp.content) > 1000:
-                        content_type = resp.headers.get("content-type", "")
-                        if any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]):
-                            image_data = resp.content
-                            logger.info(f"Partner logo downloaded: {program.name} ({len(resp.content)} bytes)")
-            except Exception as e:
-                logger.debug(f"Partner logo download failed for {program.name}: {e}")
+        # Get partner image — from admitad_ads.json (SVG→PNG conversion built-in)
+        image_data = await self._get_partner_image(program)
 
         try:
             if image_data:
-                # Post with image — v5.0: enforce caption limit
+                # Post with image — enforce caption limit
                 if len(post_content) > 1024:
                     post_content = _enforce_char_limit(post_content, has_media=True)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -1402,8 +1574,7 @@ class ChannelManager:
                     except OSError:
                         pass
             else:
-                # No image available — post text-only (partner posts should not be skipped)
-                # v5.0: enforce text limit
+                # No image available — post text-only
                 if len(post_content) > 4096:
                     post_content = _enforce_char_limit(post_content, has_media=False)
                 logger.warning(f"Partner post without image: {program.name}")

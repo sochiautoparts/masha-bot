@@ -73,6 +73,8 @@ class BotConfig:
     #   n_ctx=4096 — enough for system prompt + history + output, saves ~2GB RAM vs 8192
     #   n_threads=2 — matches GitHub Actions 2 vCPU (more threads = contention)
     #   max_tokens=1024 — cap for CPU speed; ProviderManager sets route-aware limits
+    #   FUNCTION route limit: 1024 tokens (was 768, increased for better local-only posting)
+    #   LOCAL-ONLY posting: 1024 tokens (last-resort fallback with simplified prompt)
     ENABLE_LOCAL_MODEL: bool = os.getenv("ENABLE_LOCAL_MODEL", "false").lower() in ("true", "1", "yes")
     MODEL_PATH: str = os.getenv("MODEL_PATH", "models/Qwen3-4B-Q4_K_M.gguf") if ENABLE_LOCAL_MODEL else ""
     MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "4096"))

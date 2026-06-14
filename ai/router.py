@@ -1,18 +1,22 @@
-"""AI Router v10.0 — LOCAL-FIRST MULTI-PROVIDER FAILOVER for masha-bot.
+"""AI Router v11.0 — LOCAL-FIRST MULTI-PROVIDER FAILOVER for masha-bot.
 
-FAILOVER CHAIN (4 levels before static fallback):
-  Level 0: Local Model (Qwen3-4B GGUF, CPU) — CHAT & COMMENT routes only
+FAILOVER CHAIN (5 levels before static fallback):
+  Level 0: Local Model (Qwen3-4B GGUF, CPU) — CHAT & COMMENT routes first
   Level 1: Pollinations (with API key) → KEY1 → KEY2
   Level 2: Pollinations FREE API (text.pollinations.ai, no auth)
   Level 3: Cloudflare Workers AI (@cf/mistralai/mistral-small-3.1-24b-instruct)
-  Last resort: Static fallback responses
+  Level 3.5: Local Model (fallback for FUNCTION routes)
+  Level 4: HuggingFace Spaces
+  Last resort: LOCAL-ONLY post generation (simplified prompt for 4B model)
+  Absolute last: Static fallback responses
 
-Route strategy (v10.0 — LOCAL-FIRST for simple tasks):
+Route strategy (v11.0 — LOCAL-FIRST with local-only posting fallback):
   CHAT route_type (user chats) → Local → Pollinations key → Pollinations free → Cloudflare → Static
-  FUNCTION route_type (posts, VIN, diagnostics, parts) → Pollinations key → Pollinations free → Cloudflare → Local(fallback) → Static
+  FUNCTION route_type (posts, VIN, diagnostics, parts) → Pollinations key → Pollinations free → Cloudflare → Local(fallback) → HuggingFace
   COMMENT route_type (comments) → Local → Pollinations key → Pollinations free → Cloudflare → Static
   VISION tasks (photos) → Pollinations vision (key) → Pollinations vision (free) → Cloudflare vision → Static
   IMAGE generation → Pollinations (key) → Pollinations free → None
+  LOCAL-ONLY posting (last resort) → Local model directly with simplified prompt
 """
 
 from __future__ import annotations
@@ -237,6 +241,74 @@ class AIRouter:
             temperature=temperature,
             max_tokens=1500,
             route_type=ROUTE_FUNCTION,
+        )
+
+    async def generate_local_post(
+        self,
+        title: str,
+        summary: str = "",
+        has_media: bool = False,
+    ) -> AIResponse:
+        """Generate a channel post using ONLY the local model — last-resort fallback.
+
+        Called when ALL cloud providers (Pollinations, Cloudflare, HuggingFace)
+        are unavailable or have exhausted their rate limits. Uses a SIMPLIFIED
+        prompt optimized for the Qwen3-4B 4B-parameter model running on CPU.
+
+        Key differences from generate_channel_post():
+          - Much shorter system prompt (4B model needs concise instructions)
+          - No elaborate editorial team references (confuses small models)
+          - Direct instruction format instead of creative persona
+          - Lower token limit (1024 max for CPU speed)
+          - Uses chat_local_only() — bypasses all cloud providers
+
+        Args:
+            title: News article title
+            summary: News article summary/text to rewrite
+            has_media: Whether the post will have media (affects char limit)
+
+        Returns:
+            AIResponse from local model (may have lower quality than cloud)
+        """
+        # Simplified system prompt for 4B model — short, direct, no fluff
+        local_system = (
+            "Ты Маша — BMW-эксперт, главред канала @bmw_mpower_club. "
+            "Пиши живо и коротко про BMW. Используй сленг: бимер, ///M, пушка, баварец. "
+            "Без политики. Только BMW."
+        )
+
+        # Build simplified user prompt
+        char_limit_note = (
+            "Пиши КОМПАКТНО — 3-5 предложений + подпись. Лимит 1024 символа!"
+            if has_media
+            else "Пиши развёрнуто, но не более 4096 символов."
+        )
+
+        user_msg = (
+            f"Новость: {title}\n\n"
+            f"{f'Текст: {summary[:600]}' if summary else ''}\n\n"
+            f"Задача: Напиши ПОСТ для BMW-канала на основе этой новости. "
+            f"НЕ копируй текст — напиши СВОЙ, уникальный. "
+            f"Добавь мнение или эмоцию про BMW.\n\n"
+            f"{char_limit_note}\n\n"
+            f"Обязательно в конце:\n"
+            f"Автор @asmasha_bot\n"
+            f"@bmw_mpower_club\n"
+            f"#bmw_mpower_club\n"
+            f"Плюс 2-3 BMW-хештега"
+        )
+
+        messages = [
+            {"role": "system", "content": local_system},
+            {"role": "user", "content": user_msg},
+        ]
+
+        # Use chat_local_only — bypasses all cloud providers entirely
+        logger.info("Attempting LOCAL-ONLY post generation (all cloud providers unavailable)")
+        return await self._manager.chat_local_only(
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.8,
         )
 
     async def generate_image_prompt(
@@ -645,7 +717,7 @@ class AIRouter:
             providers.append(f"Cloudflare ({len(self._manager.cloudflare._accounts)} accounts)")
         providers.append("HuggingFace")
 
-        logger.info("AI Router v10.0 LOCAL-FIRST initialized (providers: %s)", ", ".join(providers))
+        logger.info("AI Router v11.0 LOCAL-FIRST + LOCAL-ONLY FALLBACK initialized (providers: %s)", ", ".join(providers))
 
     def get_provider_status(self) -> dict[str, Any]:
         """Get full provider status for monitoring."""

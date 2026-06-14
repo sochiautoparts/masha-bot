@@ -1102,11 +1102,55 @@ class ChannelManager:
             if response.error or not response.text:
                 logger.warning(f"AI post generation failed: {response.error_message}")
 
-            text = response.text or ""
+                # ── LOCAL-ONLY FALLBACK ──
+                # When all cloud providers failed, try the local model directly
+                # with a simplified prompt optimized for the 4B model
+                logger.info("Cloud providers failed — trying LOCAL-ONLY fallback for post generation")
+                try:
+                    local_response = await get_ai_router().generate_local_post(
+                        title=title,
+                        summary=summary or "",
+                        has_media=has_media,
+                    )
+                    if local_response.ok and local_response.text:
+                        logger.info(
+                            "LOCAL-ONLY post generated successfully (%d chars, provider=%s)",
+                            len(local_response.text), local_response.provider,
+                        )
+                        text = local_response.text
+                    else:
+                        logger.warning(f"LOCAL-ONLY fallback also failed: {local_response.error or 'empty response'}")
+                        text = ""
+                except Exception as local_err:
+                    logger.error(f"LOCAL-ONLY fallback exception: {local_err}")
+                    text = ""
+            else:
+                text = response.text
 
         except Exception as e:
             logger.error(f"AI generation error: {e}")
-            return None
+
+            # ── LOCAL-ONLY FALLBACK (exception path) ──
+            # Even if the main generation threw an exception, try the local model
+            logger.info("AI generation threw exception — trying LOCAL-ONLY fallback")
+            try:
+                local_response = await get_ai_router().generate_local_post(
+                    title=title,
+                    summary=summary or "",
+                    has_media=has_media,
+                )
+                if local_response.ok and local_response.text:
+                    logger.info(
+                        "LOCAL-ONLY post generated after exception (%d chars)",
+                        len(local_response.text),
+                    )
+                    text = local_response.text
+                else:
+                    logger.warning(f"LOCAL-ONLY fallback failed after exception: {local_response.error}")
+                    return None
+            except Exception as local_err:
+                logger.error(f"LOCAL-ONLY fallback exception after main error: {local_err}")
+                return None
 
         return text.strip() if text else None
 

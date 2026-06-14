@@ -10,14 +10,16 @@ Provides local inference for Masha Bot using llama-cpp-python with:
   - Fallback to cloud providers on failure
 
 USAGE STRATEGY:
-  Level 0 (LOCAL): Simple chat, comments, short responses
-  Level 1-3 (CLOUD): Function routes, channel posts, VIN, diagnostics, vision
+  Level 0 (LOCAL-FIRST): Simple chat, comments, short responses
+  Level 2.5 (LOCAL-FALLBACK): Function routes as fallback when cloud is down
+  Level LAST (LOCAL-ONLY): Channel posts when ALL cloud providers are down/exhausted
 
   Local model excels at:
-    - Chat responses up to 2048 tokens (detailed user answers)
-    - Group comments up to 512 tokens (short, fast, cheap)
+    - Chat responses up to 1024 tokens (fast user answers on CPU)
+    - Group comments up to 256 tokens (short, fast, cheap)
     - Simple Q&A about BMW
-    - Fallback when all cloud providers are down
+    - LAST-RESORT channel posts when all cloud providers are down
+    - Partner post text (simple templates, AI-optional)
 
   Cloud models are better for:
     - Channel post generation (needs creativity + quality)
@@ -28,7 +30,8 @@ USAGE STRATEGY:
 TOKEN LIMITS (route-aware, enforced by ProviderManager):
   CHAT route:    max 1024 tokens (fast user answers on CPU)
   COMMENT route: max 256 tokens (short group comments, must be fast)
-  FUNCTION route: max 768 tokens (fallback for posts, VIN, diagnostics)
+  FUNCTION route: max 1024 tokens (fallback for posts, VIN, diagnostics)
+  LOCAL-ONLY:    max 1024 tokens (last-resort posting via local model)
   
   Internal cap: max_tokens capped at 1024 in _generate() to prevent
   slow CPU inference. Qwen3-4B on CPU generates ~5-10 tokens/sec,

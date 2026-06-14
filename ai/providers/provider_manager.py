@@ -1,4 +1,4 @@
-"""Provider Manager v2.0 — LOCAL-FIRST multi-provider failover for masha-bot.
+"""Provider Manager v3.0 — LOCAL-FIRST multi-provider failover for masha-bot.
 
 Manages the provider failover chain with route-aware routing:
 
@@ -8,11 +8,13 @@ ROUTE STRATEGY (LOCAL-FIRST):
   FUNCTION route (posts,VIN) → Pollinations(key) → Pollinations(free) → Cloudflare → Local(fallback) → HuggingFace
   VISION tasks (photos)      → Pollinations vision → Cloudflare vision → (Local can't do vision)
   IMAGE generation           → Pollinations → Cloudflare → HuggingFace
+  LOCAL-ONLY (last resort)   → Local model directly — when ALL cloud providers are down/exhausted
 
 Level 0: Local Model (Qwen3-4B GGUF, CPU) — chat & comments FIRST
   CHAT route local limit: 1024 tokens (fast user answers on CPU)
   COMMENT route local limit: 256 tokens (short group comments, must be fast)
-  FUNCTION route local limit: 768 tokens (fallback for posts, VIN, diagnostics)
+  FUNCTION route local limit: 1024 tokens (fallback for posts, VIN, diagnostics)
+  LOCAL-ONLY post limit: 1024 tokens (dedicated posting via local model)
 Level 1: Pollinations (gen API with key → legacy free API)
 Level 2: Cloudflare Workers AI (free, 10k req/day/account)
 Level 3: HuggingFace Spaces (free, unlimited)
@@ -170,10 +172,11 @@ class ProviderManager:
         # Level 2.5: For FUNCTION routes — try Local as LAST fallback
         if route_type == ROUTE_FUNCTION and self.local and self.local.is_available():
             try:
-                # FUNCTION route local limit: 768 tokens
+                # FUNCTION route local limit: 1024 tokens
                 # Local 4B model can generate decent short posts/diagnostics
-                # but 1500+ tokens would be very slow on CPU and quality drops
-                local_max = min(max_tokens, 768)
+                # 1024 tokens = ~700-900 Russian chars, good for Telegram media caption
+                # On CPU ~5-10 tokens/sec → 1024 tokens = ~100-200s max generation time
+                local_max = min(max_tokens, 1024)
                 result = await self.local.chat(
                     messages=messages,
                     model="local-qwen3-4b",
@@ -212,6 +215,79 @@ class ProviderManager:
             provider="none",
             model=model or "unknown",
         )
+
+    async def chat_local_only(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = 1024,
+        temperature: float = 0.8,
+    ) -> AIResponse:
+        """Chat using ONLY the local model — bypasses all cloud providers.
+
+        Used as a last-resort fallback when ALL cloud providers are unavailable
+        or have exhausted their rate limits. This ensures the bot can ALWAYS
+        generate content for the channel, even if quality is lower.
+
+        The local model (Qwen3-4B) is less creative than cloud models but
+        can produce acceptable short posts with simplified prompts.
+
+        Args:
+            messages: Chat messages (should use simplified prompts for 4B model)
+            max_tokens: Max tokens to generate (capped at 1024 for CPU speed)
+            temperature: Sampling temperature (0.8 default for some creativity)
+
+        Returns:
+            AIResponse from local model, or error if local model is unavailable
+        """
+        if not self.local:
+            return AIResponse(
+                error="Local model not configured",
+                provider="none",
+                model="local-qwen3-4b",
+            )
+
+        if not self.local.is_available():
+            # Try loading it one more time
+            try:
+                loaded = self.local._load_model()
+                if not loaded:
+                    return AIResponse(
+                        error="Local model not available (load failed)",
+                        provider="none",
+                        model="local-qwen3-4b",
+                    )
+            except Exception as e:
+                return AIResponse(
+                    error=f"Local model load error: {e}",
+                    provider="none",
+                    model="local-qwen3-4b",
+                )
+
+        # Cap at 1024 tokens for CPU inference speed
+        actual_max = min(max_tokens, 1024)
+
+        try:
+            result = await self.local.chat(
+                messages=messages,
+                model="local-qwen3-4b",
+                temperature=temperature,
+                max_tokens=actual_max,
+            )
+            if result.ok:
+                self._last_provider = "local-only"
+                self._local_fallback_count += 1
+                logger.info(
+                    "Local-ONLY model responded (%d chars, %d tokens requested)",
+                    len(result.text), actual_max,
+                )
+            return result
+        except Exception as exc:
+            logger.error("Local-only chat exception: %s", exc)
+            return AIResponse(
+                error=f"Local-only chat failed: {exc}",
+                provider="local",
+                model="local-qwen3-4b",
+            )
 
     async def _chat_cloud_only(
         self,

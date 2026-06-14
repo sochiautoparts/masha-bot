@@ -1,4 +1,4 @@
-name: Masha Bot — LOCAL-FIRST v10 — Маша + Редакция
+name: Masha Bot — LOCAL-FIRST v11 — Маша + Редакция + Local-Only Fallback
 
 on:
   schedule:
@@ -37,6 +37,8 @@ env:
   #   n_ctx=4096 — saves ~2GB RAM vs 8192, enough for system prompt + history + output
   #   n_threads=2 — matches 2 vCPU on ubuntu-latest (4 threads = contention)
   #   max_tokens=1024 — cap for CPU speed; ProviderManager enforces route-aware limits
+  #   FUNCTION route: 1024 tokens (increased from 768 for better local-only posting)
+  #   LOCAL-ONLY fallback: 1024 tokens (last-resort posting with simplified prompt)
   ENABLE_LOCAL_MODEL: "true"
   MODEL_PATH: "models/Qwen3-4B-Q4_K_M.gguf"
   MODEL_N_CTX: "4096"
@@ -162,22 +164,26 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v10.0 — LOCAL-FIRST ==="
-          echo "ARCHITECTURE: Local-First 4-Level Failover"
+          echo "=== Starting Masha Bot v11.0 — LOCAL-FIRST + LOCAL-ONLY FALLBACK ==="
+          echo "ARCHITECTURE: Local-First 5-Level Failover + Local-Only Post Fallback"
           echo "  Level 0: LOCAL Qwen3-4B (4B params, Q4_K_M, CPU) — chat & comments"
           echo "  Level 1: Pollinations (key) — all routes, 60+ models"
           echo "  Level 2: Pollinations FREE — fallback, no auth"
           echo "  Level 3: Cloudflare Workers AI — Mistral Small 3.1, 20K req/day"
-          echo "  Last resort: Static fallback"
+          echo "  Level 3.5: LOCAL fallback — FUNCTION route (posts, VIN, diagnostics)"
+          echo "  Level 4: HuggingFace Spaces — unlimited"
+          echo "  Last resort: LOCAL-ONLY post generation (simplified prompt, 4B model)"
+          echo "  Absolute last: Static fallback"
           echo "LOCAL MODEL USAGE:"
           echo "  CHAT route: Local → Cloud (saves balance!)"
           echo "  COMMENT route: Local → Cloud (saves balance!)"
           echo "  FUNCTION route (posts, VIN, diagnostics): Cloud → Local (fallback)"
           echo "  VISION: Cloud only (local can't do vision)"
           echo "  IMAGE GEN: Cloud only"
-          echo "ROUTING: Local(chat/comment) → Pollinations(key) → Pollinations(free) → Cloudflare → Static"
+          echo "  LOCAL-ONLY POSTING: When ALL cloud providers down → local model with simplified prompt"
+          echo "ROUTING: Local(chat/comment) → Pollinations(key) → Pollinations(free) → Cloudflare → Local(fallback) → HuggingFace → Local-Only(last resort)"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
-          echo "CONTENT: BMW-first, RSS + web search, multi-strategy image sourcing"
+          echo "CONTENT: BMW-first, news.json source, multi-strategy image sourcing"
           echo "FORMATS: 6 content types for diverse schedule"
           echo "SCHEDULE: 30 min intervals, 3 posts/cycle + partner posts"
           echo ""

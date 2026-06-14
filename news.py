@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -233,6 +234,7 @@ def _filter_curated_images(images: list[str]) -> list[str]:
 
     filtered = []
     seen_base = set()  # Track base filenames to dedup resized versions
+    seen_google_thumb = False  # Track Google News generic thumbnails
 
     for url in images:
         if not url or len(url) < 10:
@@ -254,6 +256,31 @@ def _filter_curated_images(images: list[str]) -> list[str]:
         # Skip data: URIs
         if url.startswith('data:'):
             continue
+
+        # ── Google News generic thumbnail ──
+        # Google News articles all use the SAME generic icon:
+        #   https://lh3.googleusercontent.com/...=s0-w300-rw
+        # This is NOT an article image — it's just the Google News logo.
+        # Block ALL googleusercontent images with size markers like =s0-w300-rw
+        if 'googleusercontent.com' in url_lower:
+            # Size markers in Google image URLs: =s0-w300-rw, =w300, =h200, etc.
+            if re.search(r'=[sw]\d+', url_lower) or re.search(r'-w\d+-rw', url_lower):
+                continue
+            # Also block if it has query params with small dimensions
+            if re.search(r'[?&]w=\d+', url_lower) or re.search(r'[?&]h=\d+', url_lower):
+                continue
+
+        # ── Motorsport.com wrong-car images ──
+        # motorsport.com images often show wrong cars in filename
+        # e.g., "91-manthey-dk-engineering-pors.jpg" for a BMW article
+        # If filename contains non-BMW brand identifiers, skip it
+        if 'motorsport.com' in url_lower:
+            filename = url_lower.split('/')[-1]
+            wrong_car_markers = ['pors', 'ferrari', 'toyota', 'mercedes', 'audi',
+                                 'honda', 'nissan', 'renault', 'ford', 'chevrolet']
+            if any(marker in filename for marker in wrong_car_markers):
+                logger.debug(f"Skipping motorsport.com wrong-car image: {filename[:60]}")
+                continue
 
         # Check for junk patterns
         if _is_junk_url(url):

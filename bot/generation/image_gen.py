@@ -11,8 +11,7 @@ import random
 from typing import Any, Optional
 
 from ...ai.router import AIRouter
-from ...ai.providers.pollinations_provider import PollinationsProvider, IMAGE_MODELS
-from ...bot.core.config import get_config
+from ...ai.providers.pollinations_provider import IMAGE_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +65,9 @@ class ImageGenerator:
         self._router: Optional[AIRouter] = None
 
     def _get_router(self) -> AIRouter:
-        if self._router is None:
-            config = get_config()
-            provider = PollinationsProvider(
-                api_key=config.pollinations_api_key,
-                api_key_2=config.pollinations_api_key_2,
-            )
-            self._router = AIRouter(provider=provider)
-        return self._router
+        """Get the global AI router singleton."""
+        from ai.router import get_ai_router
+        return get_ai_router()
 
     async def generate(
         self,
@@ -168,6 +162,5 @@ class ImageGenerator:
         return None
 
     async def close(self) -> None:
-        """Clean up resources."""
-        if self._router:
-            await self._router.provider.close()
+        """Clean up resources — router is a global singleton, nothing to close here."""
+        pass

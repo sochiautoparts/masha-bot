@@ -11,9 +11,9 @@ import random
 from typing import Any, Optional
 
 from ...ai.router import AIRouter
-from ...ai.providers.pollinations_provider import PollinationsProvider, CHAT_MODELS, CONTENT_MODELS
+from ...ai.providers.pollinations_provider import CHAT_MODELS, CONTENT_MODELS
 from ...ai.providers.provider_manager import ROUTE_FUNCTION
-from ...bot.core.config import get_config, get_persona
+from ...bot.core.config import get_persona
 from ...bot.generation.persona import PersonaManager
 from ...bot.knowledge.characters import CharacterManager, ALL_CHARACTERS
 
@@ -24,14 +24,14 @@ class ContentWriter:
     """Generates content for the @bmw_mpower_club channel."""
 
     def __init__(self) -> None:
-        config = get_config()
-        self.provider = PollinationsProvider(
-            api_key=config.pollinations_api_key,
-            api_key_2=config.pollinations_api_key_2,
-        )
-        self.router = AIRouter(provider=self.provider)
+        self._router = None
         self.persona_manager = PersonaManager()
         self.character_manager = CharacterManager()
+
+    def _get_router(self):
+        """Get the global AI router singleton."""
+        from ai.router import get_ai_router
+        return get_ai_router()
 
     async def generate(
         self,
@@ -61,7 +61,7 @@ class ContentWriter:
                 {"role": "user", "content": user_prompt},
             ]
 
-            response = await self.router.chat(
+            response = await self._get_router().chat(
                 messages=messages,
                 model=model,
                 temperature=temperature,
@@ -218,5 +218,5 @@ class ContentWriter:
         return text
 
     async def close(self) -> None:
-        """Clean up resources."""
-        await self.provider.close()
+        """Clean up resources — router is a global singleton, nothing to close here."""
+        pass

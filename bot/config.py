@@ -29,6 +29,12 @@ class BotConfig:
     POLLINATIONS_API_KEY_2: str = os.getenv("POLLINATIONS_API_KEY_2", "")
     POLLINATIONS_BASE_URL: str = "https://gen.pollinations.ai"
 
+    # Cloudflare Workers AI — dual-account failover (10k req/day per account)
+    CF_ACCOUNT_ID_1: str = os.getenv("CF_ACCOUNT_ID_1", "")
+    CF_API_TOKEN_1: str = os.getenv("CF_API_TOKEN_1", "")
+    CF_ACCOUNT_ID_2: str = os.getenv("CF_ACCOUNT_ID_2", "")
+    CF_API_TOKEN_2: str = os.getenv("CF_API_TOKEN_2", "")
+
     # GitHub PAT for self-dispatch
     GH_PAT_TOKEN: str = os.getenv("GH_PAT_TOKEN", "")
     GH_REPO: str = os.getenv("GH_REPO", "sochiautoparts/masha-bot")
@@ -95,6 +101,46 @@ class BotConfig:
 
     # Singleton lock
     LOCK_FILE: str = "/tmp/masha_bot.lock"
+
+    # ── Aliases for internal modules (lowercase snake_case) ──────────────
+    # Internal modules access config via snake_case property names.
+    # These aliases delegate to the UPPER_CASE env-backed fields.
+
+    @property
+    def bot_token(self) -> str:
+        return self.BOT_TOKEN
+
+    @property
+    def channel_id(self) -> str:
+        return self.CHANNEL_ID
+
+    @property
+    def pollinations_api_key(self) -> str:
+        return self.POLLINATIONS_API_KEY
+
+    @property
+    def pollinations_api_key_2(self) -> str:
+        return self.POLLINATIONS_API_KEY_2
+
+    @property
+    def max_posts_per_day(self) -> int:
+        return self.CHANNEL_MAX_POSTS_PER_DAY
+
+    @property
+    def partner_post_frequency(self) -> float:
+        return 1 / 6
+
+    @property
+    def dedup_similarity_threshold(self) -> float:
+        return 0.75
+
+    @property
+    def enable_fact_check(self) -> bool:
+        return True
+
+    @property
+    def enable_images(self) -> bool:
+        return True
 
 
 @dataclass

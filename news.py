@@ -32,7 +32,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ── The ONLY news source ──────────────────────────────────────────────────────
-NEWS_JSON_URL = "https://raw.githubusercontent.com/creastudioai-beep/nebm/refs/heads/main/data/news.json"
+NEWS_JSON_URL = "https://raw.githubusercontent.com/creastudioai-beep/nebm/main/data/news.json"
 
 # Reuse BMW relevance/blocklist keywords from rss_fetcher for any filtering
 from bot.sources.rss_fetcher import (
@@ -59,15 +59,22 @@ _EXTRA_BMW_KEYWORDS: list[str] = [
     # BMW racing
     "bmw m motorsport", "bmw m team", "bmw m hybrid",
     "bmw m4 gt3", "bmw m4 gt4", "bmw m2 csr",
+    # Common BMW model names (1er-8er, X-series, Z-series)
+    "m140i", "m135i", "m240i", "m340i", "m440i", "m550i", "m760i",
+    "118i", "320i", "330i", "330e", "520i", "530i", "540i", "740i", "750i",
+    "s1000rr", "s1k",  # BMW motorcycle
     # Common model codes
     "g20", "g80", "g82", "g87", "g60", "g70", "g65",
     "f90", "f80", "f82", "f87", "f30", "f10", "e46", "e39", "e30", "e36",
+    "g01", "g05", "g07", "g15", "g29",  # X-series, Z4, 8er codes
     # Russian BMW terms
     "баварский моторный", "баварец", "бимер",
     # BMW sub-brands
-    "alpina", "diniz", "ac schnitzer",
+    "alpina", "diniz", "ac schnitzer", "bovensiepen",
     # BMW concepts / events
     "concept neue klasse", "le mans bmw", "bmw art car",
+    # Reddit community BMW-specific terms
+    "bimmer", "bimmerpost",
 ]
 
 
@@ -93,7 +100,7 @@ def _is_bmw_relevant(text: str) -> bool:
     return False
 
 
-async def fetch_news_json(limit: int = 100) -> list[dict[str, Any]]:
+async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
     """Fetch news from the curated news.json file.
 
     Returns items with the same field names used throughout the codebase:
@@ -296,8 +303,13 @@ def _filter_curated_images(images: list[str]) -> list[str]:
         # external-preview.redd.it can't be converted (different domain structure)
         # — skip those entirely as they're cached previews of external images
         if 'external-preview.redd.it' in url_lower:
-            # Can't convert these — skip them
-            continue
+            # external-preview.redd.it works with proper User-Agent header
+            # These are cached previews of external images hosted by Reddit CDN
+            # Strip small-width query params to get full size
+            if '?width=' in url_lower:
+                # Small width thumbnail — strip to get full size
+                url = url.split('?')[0]
+                url_lower = url.lower()
 
         if 'preview.redd.it' in url_lower:
             import re as _re
@@ -415,7 +427,7 @@ async def run_news_cycle() -> int:
         from bot.database import _get_db
         db = _get_db()
 
-        items = await fetch_news_json(limit=100)
+        items = await fetch_news_json(limit=500)
         new_count = 0
 
         for item in items:

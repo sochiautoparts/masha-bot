@@ -658,7 +658,7 @@ async def search_auto_news() -> List[Dict]:
     """
     try:
         from news import fetch_news_json
-        items = await fetch_news_json(limit=100)
+        items = await fetch_news_json(limit=500)
         logger.info(f"Loaded {len(items)} items from curated news.json")
         return items
     except Exception as e:

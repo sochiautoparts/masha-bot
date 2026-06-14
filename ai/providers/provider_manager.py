@@ -192,22 +192,12 @@ class ProviderManager:
             except Exception as exc:
                 logger.debug("Local model fallback exception: %s", exc)
 
-        # Level 3: Try HuggingFace (text chat)
-        if self.huggingface and self.huggingface.is_available():
-            try:
-                result = await self.huggingface.chat(
-                    messages=messages,
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **kwargs,
-                )
-                if result.ok:
-                    self._last_provider = "huggingface"
-                    logger.info("HuggingFace fallback succeeded (text)")
-                    return result
-            except Exception as exc:
-                logger.debug("HuggingFace chat exception: %s", exc)
+        # Level 3: HuggingFace — image generation only, text chat NOT supported
+        # HuggingFace Spaces are primarily for image generation.
+        # Text chat always returns error ("HuggingFace provider is image-only"),
+        # so skip for text routes to save time and avoid wasted requests.
+        # if self.huggingface and self.huggingface.is_available():
+        #     ... text chat attempt removed — HF is image-only ...
 
         # All providers failed
         return AIResponse(

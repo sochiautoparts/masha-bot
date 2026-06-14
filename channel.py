@@ -990,8 +990,16 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Curated image download failed: {e}")
 
-        # No fallback to article scraping — curated images ONLY
-        # If no curated images available, the post will be text-only
+        # Fallback: try article scraping if curated images failed or were empty
+        if not image_list and resolved_url:
+            try:
+                scraped_images = await self._scrape_article_images(resolved_url, max_count=3)
+                if scraped_images:
+                    image_list.extend(scraped_images)
+                    source = "scraped"
+                    logger.info(f"Fallback: scraped {len(scraped_images)} images from article for: {title[:50]}")
+            except Exception as e:
+                logger.debug(f"Article scraping fallback failed: {e}")
 
         # Hard limit
         image_list = image_list[:MAX_IMAGES_PER_POST]

@@ -290,34 +290,39 @@ def _filter_curated_images(images: list[str]) -> list[str]:
         if _is_thumbnail_url(url):
             continue
 
-        # ── Reddit preview URL filtering ──
-        # Reddit URLs like: preview.redd.it/xxx.jpg?width=140&height=140&crop=1:1,smart
-        # These are small thumbnails. We want the larger versions.
-        # Strategy: if width or height is < 400, it's a thumbnail
-        if 'preview.redd.it' in url_lower or 'external-preview.redd.it' in url_lower:
+        # ── Reddit URL fix: preview.redd.it → i.redd.it ──
+        # preview.redd.it returns 403 Forbidden for bots
+        # i.redd.it works fine and serves the full-size image
+        # external-preview.redd.it can't be converted (different domain structure)
+        # — skip those entirely as they're cached previews of external images
+        if 'external-preview.redd.it' in url_lower:
+            # Can't convert these — skip them
+            continue
+
+        if 'preview.redd.it' in url_lower:
             import re as _re
-            # Check for width/height params
+            # Convert preview.redd.it → i.redd.it
+            url = url.replace('preview.redd.it', 'i.redd.it')
+            url_lower = url.lower()
+
+            # Check for small width/height query params
             w_match = _re.search(r'width=(\d+)', url_lower)
             h_match = _re.search(r'height=(\d+)', url_lower)
             if w_match and h_match:
                 w, h = int(w_match.group(1)), int(h_match.group(1))
                 if w < 400 or h < 400:
-                    # This is a small Reddit thumbnail — skip it
-                    # But try to get the full-size URL by removing size params
-                    base_reddit_url = url.split('?')[0]
-                    if base_reddit_url not in seen_base:
-                        # Use the full-size URL instead
-                        seen_base.add(base_reddit_url)
-                        filtered.append(base_reddit_url)
-                    continue
+                    # Small Reddit thumbnail — use base URL without query params
+                    url = url.split('?')[0]
+                    url_lower = url.lower()
             elif w_match:
                 w = int(w_match.group(1))
                 if w < 400:
-                    base_reddit_url = url.split('?')[0]
-                    if base_reddit_url not in seen_base:
-                        seen_base.add(base_reddit_url)
-                        filtered.append(base_reddit_url)
-                    continue
+                    url = url.split('?')[0]
+                    url_lower = url.lower()
+            else:
+                # No size params — strip query params anyway for cleaner URL
+                url = url.split('?')[0]
+                url_lower = url.lower()
 
         # Dedup by base filename — keep the larger version
         # e.g., "bmw-m3-eletric-touring-02-830x467.jpg" and

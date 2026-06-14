@@ -26,9 +26,13 @@ USAGE STRATEGY:
     - Vision tasks (local model can't do vision)
 
 TOKEN LIMITS (route-aware, enforced by ProviderManager):
-  CHAT route:    max 2048 tokens (detailed user conversations)
-  COMMENT route: max 512 tokens (short group/channel comments)
-  FUNCTION route: max 2048 tokens (fallback for posts, VIN, diagnostics)
+  CHAT route:    max 1024 tokens (fast user answers on CPU)
+  COMMENT route: max 256 tokens (short group comments, must be fast)
+  FUNCTION route: max 768 tokens (fallback for posts, VIN, diagnostics)
+  
+  Internal cap: max_tokens capped at 1024 in _generate() to prevent
+  slow CPU inference. Qwen3-4B on CPU generates ~5-10 tokens/sec,
+  so 1024 tokens = ~100-200 seconds maximum generation time.
 """
 
 import logging
@@ -474,13 +478,19 @@ class LocalProvider(BaseAIProvider):
             except Exception:
                 pass
 
+            # Route-aware generation parameters:
+            # - Lower max_tokens for faster CPU inference
+            # - top_k=20 (vs 40) for faster sampling on CPU
+            # - repeat_penalty=1.15 (slightly stronger to avoid loops in small model)
+            actual_max_tokens = min(max_tokens, 1024) if max_tokens > 1024 else max_tokens
+
             result = self._llm(
                 prompt,
-                max_tokens=max_tokens,
+                max_tokens=actual_max_tokens,
                 temperature=temperature,
                 top_p=0.9,
-                top_k=40,
-                repeat_penalty=1.1,
+                top_k=20,
+                repeat_penalty=1.15,
                 stop=["<|im_end|>", "</s>", "<|im_start|>"],
             )
         except Exception as e:

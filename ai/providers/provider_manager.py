@@ -10,9 +10,9 @@ ROUTE STRATEGY (LOCAL-FIRST):
   IMAGE generation           → Pollinations → Cloudflare → HuggingFace
 
 Level 0: Local Model (Qwen3-4B GGUF, CPU) — chat & comments FIRST
-  CHAT route local limit: 2048 tokens (detailed user answers)
-  COMMENT route local limit: 512 tokens (short group comments)
-  FUNCTION route local limit: 2048 tokens (channel posts, VIN, diagnostics fallback)
+  CHAT route local limit: 1024 tokens (fast user answers on CPU)
+  COMMENT route local limit: 256 tokens (short group comments, must be fast)
+  FUNCTION route local limit: 768 tokens (fallback for posts, VIN, diagnostics)
 Level 1: Pollinations (gen API with key → legacy free API)
 Level 2: Cloudflare Workers AI (free, 10k req/day/account)
 Level 3: HuggingFace Spaces (free, unlimited)
@@ -97,9 +97,10 @@ class ProviderManager:
             if self.local and self.local.is_available():
                 try:
                     # Route-aware token limits for local model:
-                    #   CHAT: up to 2048 (detailed user answers, VIN, diagnostics)
-                    #   COMMENT: up to 512 (short group/channel comments)
-                    local_max = min(max_tokens, 2048) if route_type == ROUTE_CHAT else min(max_tokens, 512)
+                    #   CHAT: up to 1024 (user conversations — local model is fast at this)
+                    #   COMMENT: up to 256 (short group/channel comments — must be fast)
+                    # Capped lower than cloud to keep CPU inference fast
+                    local_max = min(max_tokens, 1024) if route_type == ROUTE_CHAT else min(max_tokens, 256)
                     result = await self.local.chat(
                         messages=messages,
                         model="local-qwen3-4b",
@@ -169,8 +170,10 @@ class ProviderManager:
         # Level 2.5: For FUNCTION routes — try Local as LAST fallback
         if route_type == ROUTE_FUNCTION and self.local and self.local.is_available():
             try:
-                # FUNCTION route needs longer output (channel posts, VIN, diagnostics)
-                local_max = min(max_tokens, 2048)
+                # FUNCTION route local limit: 768 tokens
+                # Local 4B model can generate decent short posts/diagnostics
+                # but 1500+ tokens would be very slow on CPU and quality drops
+                local_max = min(max_tokens, 768)
                 result = await self.local.chat(
                     messages=messages,
                     model="local-qwen3-4b",

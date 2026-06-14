@@ -80,11 +80,15 @@ class BotConfig:
     SEARCH_TIMEOUT_SECONDS: int = 15
 
     # Local model (Qwen3-4B GGUF, CPU inference via llama-cpp-python)
+    # Optimized for GitHub Actions (2 vCPU, 7GB RAM):
+    #   n_ctx=4096 — enough for system prompt + history + output, saves ~2GB RAM vs 8192
+    #   n_threads=2 — matches GitHub Actions 2 vCPU (more threads = contention)
+    #   max_tokens=1024 — cap for CPU speed; ProviderManager sets route-aware limits
     ENABLE_LOCAL_MODEL: bool = os.getenv("ENABLE_LOCAL_MODEL", "false").lower() in ("true", "1", "yes")
     MODEL_PATH: str = os.getenv("MODEL_PATH", "models/Qwen3-4B-Q4_K_M.gguf") if ENABLE_LOCAL_MODEL else ""
-    MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "8192"))
-    MODEL_N_THREADS: int = int(os.getenv("MODEL_N_THREADS", "4"))
-    MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "2048"))
+    MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "4096"))
+    MODEL_N_THREADS: int = int(os.getenv("MODEL_N_THREADS", "2"))
+    MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "1024"))
     MODEL_HISTORY_LIMIT: int = int(os.getenv("MODEL_HISTORY_LIMIT", "6"))
     MODEL_AUTO_DOWNLOAD: bool = os.getenv("MODEL_AUTO_DOWNLOAD", "true").lower() in ("true", "1", "yes")
     MODEL_DOWNLOAD_URL: str = os.getenv(

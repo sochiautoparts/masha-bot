@@ -54,9 +54,9 @@ class BotConfig:
     NEWS_CACHE_HOURS: int = 24
 
     # Channel posting
-    CHANNEL_POST_INTERVAL_MINUTES: int = int(os.getenv("CHANNEL_POST_INTERVAL_MINUTES", "30"))
-    CHANNEL_MAX_POSTS_PER_HOUR: int = 6
-    CHANNEL_MAX_POSTS_PER_DAY: int = 48
+    CHANNEL_POST_INTERVAL_MINUTES: int = int(os.getenv("CHANNEL_POST_INTERVAL_MINUTES", "60"))
+    CHANNEL_MAX_POSTS_PER_HOUR: int = 6  # 5 news + 1 partner per hour
+    CHANNEL_MAX_POSTS_PER_DAY: int = 144  # 6 posts/hour x 24 hours
 
     # Telegram character limits
     TELEGRAM_TEXT_LIMIT: int = 4096
@@ -65,8 +65,8 @@ class BotConfig:
 
     # Partner / admitad / Rossko
     ADMITAD_ADS_FILE: str = os.getenv("ADMITAD_ADS_FILE", "admitad_ads.json")
-    PARTNER_POST_INTERVAL_HOURS: int = int(os.getenv("PARTNER_POST_INTERVAL_HOURS", "4"))
-    PARTNER_DAILY_LIMIT: int = 4
+    PARTNER_POST_INTERVAL_HOURS: int = int(os.getenv("PARTNER_POST_INTERVAL_HOURS", "1"))
+    PARTNER_DAILY_LIMIT: int = 24  # 1 partner post per hour x 24 hours
     ROSSKO_AFFILIATE_URL: str = os.getenv("ROSSKO_AFFILIATE_URL", "https://rossko.ru")
     ROSSKO_SEARCH_URL: str = "https://rossko.ru/search?text="
 
@@ -125,7 +125,7 @@ class BotConfig:
 
     @property
     def partner_post_frequency(self) -> float:
-        return 0.1  # 10% of posts should be partner content
+        return 1 / 6  # ~1 partner post per 6 posts (1 per hour out of 6)
 
     @property
     def dedup_similarity_threshold(self) -> float:

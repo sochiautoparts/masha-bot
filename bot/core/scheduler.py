@@ -149,7 +149,7 @@ URGENT_KEYWORDS = [
 
 # ── Posting schedule (UTC hours) ─────────────────────────────────────────────
 
-DEFAULT_POSTING_HOURS = [7, 9, 11, 13, 15, 17, 19, 21]
+DEFAULT_POSTING_HOURS = list(range(24))  # Every hour: 0,1,2,...,23
 
 
 class Scheduler:
@@ -189,14 +189,14 @@ class Scheduler:
         """Select content type based on distribution weights.
 
         Distribution:
-        - news+reaction: 40%
-        - DIY/how-to: 15%
-        - polls/debates: 15%
+        - news+reaction: 50%
+        - DIY/how-to: 10%
+        - polls/debates: 10%
         - lore/history: 10%
         - garage stories: 10%
-        - partner: 10%
+        - partner: 10% (separate hourly post)
         """
-        weights = [40, 15, 15, 10, 10, 10]
+        weights = [50, 10, 10, 10, 10, 10]
         types = [
             "news+reaction",
             "DIY/how-to",

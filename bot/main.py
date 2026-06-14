@@ -226,26 +226,29 @@ class BackgroundTasks:
                 await asyncio.sleep(1)
 
     async def _channel_poster(self) -> None:
-        """Periodically post to channel — 3 DIFFERENT posts per cycle.
+        """Post to channel — 5 news + 1 partner per hourly cycle.
         
-        Each 30-min cycle publishes 3 different posts:
-        1st post: news or partner content
-        2nd post: a DIFFERENT news item (different topic)
-        3rd post: another DIFFERENT news item (different topic)
-        
+        Each 60-min cycle publishes 6 posts:
+          Posts 1-5: DIFFERENT news items (each with dedup checks)
+          Post 6: partner content (if interval allows)
+          
+        Between posts: 2-4 min gap to avoid Telegram rate limits.
         Tracks tried titles per cycle to avoid re-selecting the same article.
         """
         await asyncio.sleep(30)
         
-        logger.info("Channel poster started — will try to post every cycle")
+        logger.info("Channel poster started — 5 news + 1 partner per hourly cycle")
 
         consecutive_empty_cycles = 0
+        NEWS_POSTS_PER_CYCLE = 5
 
         while self._running:
             posts_this_cycle = 0
             tried_titles_this_cycle = []  # Track titles tried this cycle
-            logger.info(f"Channel poster: starting new cycle (consecutive_empty={consecutive_empty_cycles})")
-            for post_num in range(3):
+            logger.info(f"Channel poster: starting new hourly cycle (consecutive_empty={consecutive_empty_cycles})")
+            
+            # ── Phase 1: 5 news posts ──
+            for post_num in range(NEWS_POSTS_PER_CYCLE):
                 try:
                     posted = await channel_manager.run_scheduled_post(
                         exclude_titles=tried_titles_this_cycle
@@ -255,21 +258,34 @@ class BackgroundTasks:
                         # Record the posted title so we don't try it again this cycle
                         if isinstance(posted, dict) and posted.get("title"):
                             tried_titles_this_cycle.append(posted["title"])
-                        logger.info(f"Channel poster: post {post_num + 1}/3 published successfully")
-                        if post_num < 2:
-                            gap = random.randint(60, 120)
-                            logger.info(f"Waiting {gap}s before next post in this cycle")
-                            for _ in range(gap):
-                                if not self._running:
-                                    break
-                                await asyncio.sleep(1)
+                        logger.info(f"Channel poster: news post {post_num + 1}/{NEWS_POSTS_PER_CYCLE} published")
                     else:
-                        logger.info(f"Channel poster: post {post_num + 1}/3 returned False")
+                        logger.info(f"Channel poster: news post {post_num + 1}/{NEWS_POSTS_PER_CYCLE} returned False")
                 except Exception as e:
-                    logger.error(f"Channel poster error (post {post_num + 1}): {e}", exc_info=True)
+                    logger.error(f"Channel poster error (news post {post_num + 1}): {e}", exc_info=True)
+                
+                # Gap between news posts: 2-4 minutes
+                if post_num < NEWS_POSTS_PER_CYCLE - 1:
+                    gap = random.randint(120, 240)
+                    logger.info(f"Waiting {gap}s before next news post")
+                    for _ in range(gap):
+                        if not self._running:
+                            break
+                        await asyncio.sleep(1)
+            
+            # ── Phase 2: 1 partner post ──
+            try:
+                partner_posted = await channel_manager.post_partner_content()
+                if partner_posted:
+                    posts_this_cycle += 1
+                    logger.info("Channel poster: partner post published")
+                else:
+                    logger.info("Channel poster: partner post skipped (interval or no content)")
+            except Exception as e:
+                logger.error(f"Channel poster error (partner post): {e}", exc_info=True)
             
             if posts_this_cycle > 0:
-                logger.info(f"Channel poster cycle complete: {posts_this_cycle} posts published")
+                logger.info(f"Channel poster hourly cycle complete: {posts_this_cycle} posts published")
                 consecutive_empty_cycles = 0
             else:
                 consecutive_empty_cycles += 1
@@ -277,12 +293,12 @@ class BackgroundTasks:
                     try:
                         await self.bot.send_message(
                             chat_id=config.OWNER_ID,
-                            text=f"⚠️ Маша: 3 цикла подряд без постов в канал. Возможна проблема с контентом или дедупликацией. Проверь логи."
+                            text=f"⚠️ Маша: 3 часа подряд без постов в канал. Возможна проблема с контентом или дедупликацией. Проверь логи."
                         )
                     except Exception:
                         pass
 
-            # Wait for next cycle
+            # Wait for next hourly cycle
             interval = config.CHANNEL_POST_INTERVAL_MINUTES * 60
             for _ in range(interval):
                 if not self._running:

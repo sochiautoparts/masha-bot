@@ -4,12 +4,13 @@ Handles news posts, partner posts, scheduled content, reactions,
 media, polls, and internet news search.
 Properly enforces Telegram character limits: 1024 with media, 4096 without.
 
-v3.0 KEY CHANGES:
-- RADICALLY SIMPLIFIED image pipeline: ONLY photos from the article page
-- Automotive news ALWAYS comes with photos — we just extract them
-- Removed: Pexels, Pixabay, Wikimedia, AI generation, stock BMW, web search images
-  (all of those return IRRELEVANT photos that have nothing to do with the news)
-- No photo = text-only post. Better no photo than a wrong photo.
+v7.0 KEY CHANGES:
+- SINGLE NEWS SOURCE: curated news.json replaces ALL RSS feeds + web search
+  - Pre-curated images — no more junk/thumbnail/logo photos!
+  - Direct article URLs — no Google News redirects to resolve
+  - Consistent data format, no broken feeds, no rate limits
+- Image pipeline: images from curated news.json → fallback to article scrape
+- Dedup: 5-layer protection (DB unique, fingerprint, semantic Jaccard, entity, title)
 - Support up to 10 media files per Telegram post
 """
 
@@ -948,18 +949,18 @@ class ChannelManager:
         return url
 
     async def _get_post_images(self, news_item: Dict, resolved_url: str = "") -> tuple:
-        """Get images for a news post — ONLY from the article page.
+        """Get images for a news post — from curated news.json images.
 
-        v5.0: Accepts pre-resolved URL to avoid double resolution.
-        Automotive news articles ALWAYS come with photos.
-        We extract them directly from the article. That's it.
+        v7.0: COMPLETELY REWORKED — images come from curated news.json.
+        Each news item in news.json has a pre-curated `images[]` list
+        with direct, high-quality image URLs. No more scraping, no more junk.
 
         Steps:
-        1. Download RSS image URLs if available (fast, no scraping needed)
-        2. Scrape the article page for MORE images (up to 10 total)
+        1. Download images from news_item["image_urls"] (curated from news.json)
+        2. FALLBACK: Scrape article page ONLY if curated images yield nothing
 
-        No fallbacks to stock photos, AI generation, or web search images.
-        If the article has no photos = text-only post. Better than wrong photos.
+        The curated source already filters out thumbnails, logos, icons, etc.
+        These are REAL article photos selected by the news curator.
 
         Returns (image_list: List[bytes], source: str)
         """
@@ -967,45 +968,45 @@ class ChannelManager:
         source = "none"
         title = news_item.get("title", "")
 
-        # Use pre-resolved URL if available, otherwise resolve now
-        article_url = resolved_url or news_item.get("url", "")
-        if article_url and not resolved_url:
-            article_url = await self._resolve_article_url(article_url, title=title)
-
-        # Step 1: Download RSS image URLs FIRST — these are the fastest
-        # (already extracted from feed, no HTML scraping needed)
-        rss_image_urls = news_item.get("image_urls", [])
-        if rss_image_urls:
+        # Step 1: Download pre-curated images from news.json
+        # These are already filtered for quality (no thumbnails, logos, icons)
+        curated_image_urls = news_item.get("image_urls", [])
+        if curated_image_urls:
             try:
-                rss_images = await self._download_images(rss_image_urls, max_count=MAX_IMAGES_PER_POST)
-                if rss_images:
-                    image_list.extend(rss_images)
-                    source = "rss"
-                    logger.info(f"Downloaded {len(rss_images)} RSS images for: {title[:50]}")
+                curated_images = await self._download_images(curated_image_urls, max_count=MAX_IMAGES_PER_POST)
+                if curated_images:
+                    image_list.extend(curated_images)
+                    source = "curated"
+                    logger.info(f"Downloaded {len(curated_images)} curated images for: {title[:50]}")
             except Exception as e:
-                logger.debug(f"RSS image download failed: {e}")
+                logger.debug(f"Curated image download failed: {e}")
 
-        # Step 2: Scrape article page for MORE images
-        # This gives us the full gallery (up to 10 photos per article)
-        if article_url and len(image_list) < MAX_IMAGES_PER_POST:
-            try:
-                scraped = await self._scrape_article_images(
-                    article_url,
-                    max_count=MAX_IMAGES_PER_POST - len(image_list)
-                )
-                if scraped:
-                    image_list.extend(scraped)
-                    source = "article" if source == "none" else source + "+article"
-                    logger.info(f"Scraped {len(scraped)} images from article: {title[:50]}")
-            except Exception as e:
-                logger.debug(f"Article scraping failed: {e}")
+        # Step 2: FALLBACK — scrape article page ONLY if curated images yield nothing
+        # This is a safety net in case the curated images are all broken/unavailable
+        if not image_list:
+            article_url = resolved_url or news_item.get("url", "")
+            if article_url and not resolved_url:
+                article_url = await self._resolve_article_url(article_url, title=title)
+
+            if article_url:
+                try:
+                    scraped = await self._scrape_article_images(
+                        article_url,
+                        max_count=3  # Limited — only as fallback
+                    )
+                    if scraped:
+                        image_list.extend(scraped)
+                        source = "article_fallback"
+                        logger.info(f"Fallback: scraped {len(scraped)} images from article: {title[:50]}")
+                except Exception as e:
+                    logger.debug(f"Article scraping fallback failed: {e}")
 
         # Hard limit
         image_list = image_list[:MAX_IMAGES_PER_POST]
 
         if not image_list:
             logger.info(
-                f"No images from article for: {title[:60]}. "
+                f"No images available for: {title[:60]}. "
                 f"Post will be published as text-only."
             )
 
@@ -1014,30 +1015,26 @@ class ChannelManager:
     async def _generate_post_text(self, news_item: Dict, has_media: bool = False, media_count: int = 0, resolved_url: str = "") -> Optional[str]:
         """Generate post text for a news item using AI.
 
-        v5.0: Accepts pre-resolved URL to avoid double resolution.
-        Now scrapes FULL article text instead of using
-        truncated RSS summaries. The AI gets complete facts and writes a
-        unique post in Russian, translating if needed.
-
-        Flow:
-        1. Use pre-resolved URL (or resolve if not provided)
-        2. Scrape full article text from the page
-        3. Fall back to RSS summary if scraping fails
-        4. Pass full text + translation/uniquification instructions to AI
+        v7.0: Optimized for curated news.json source.
+        - news.json provides direct URLs (no Google News redirects)
+        - Summary from news.json is already good quality
+        - Still tries to scrape full article for more detail
+        - Falls back to curated summary if scraping fails
         """
         title = news_item.get("title", "")
         summary = news_item.get("summary", "")
 
         # ── Step 1: Use pre-resolved URL if available ──
+        # news.json URLs are already direct — no Google News redirects
         if resolved_url:
             article_url = resolved_url
         else:
-            source_url = news_item.get("url", "")
-            article_url = source_url
-            if article_url:
+            article_url = news_item.get("url", "")
+            # Only resolve if it's actually a Google redirect (rare for news.json)
+            if article_url and 'news.google.com' in article_url:
                 article_url = await self._resolve_article_url(article_url, title=title)
 
-        # ── Step 2: Scrape FULL article text ──
+        # ── Step 2: Try to scrape FULL article text for more detail ──
         full_article_text = ""
         if article_url:
             try:
@@ -1062,20 +1059,14 @@ class ChannelManager:
 
         # Use the BEST available text source:
         # 1. Scraped full article (best — complete text from the page)
-        # 2. RSS full_content (good — <content:encoded> has more text than summary)
-        # 3. RSS summary (fallback — truncated teaser)
-        rss_full_content = news_item.get("full_content", "")
+        # 2. Curated summary from news.json (good — already detailed)
         if full_article_text:
             context_parts.append(
                 f"ПОЛНЫЙ ТЕКСТ СТАТЬИ (используй факты для написания уникального поста):\n{full_article_text}"
             )
-        elif rss_full_content:
-            context_parts.append(
-                f"РАСШИРЕННЫЙ ТЕКСТ ИЗ RSS (используй факты для написания уникального поста):\n{rss_full_content}"
-            )
         elif summary:
             context_parts.append(
-                f"Исходная новость (сокращённая из RSS, полная статья недоступна):\n{summary[:500]}"
+                f"Исходная новость (используй факты для написания уникального поста):\n{summary[:800]}"
             )
 
         if article_url:
@@ -1092,7 +1083,7 @@ class ChannelManager:
         if uniquify_hint:
             context_parts.append(uniquify_hint)
 
-        # v4.0: Explicit instruction to write unique content, not copy
+        # Explicit instruction to write unique content, not copy
         context_parts.append(
             "ЗАДАЧА: Прочитай факты из статьи и напиши СОВЕРШЕННО НОВЫЙ, УНИКАЛЬНЫЙ текст. "
             "НЕ копируй и НЕ пересказывай близко к тексту — собери факты и напиши СВОЙ текст. "
@@ -1106,7 +1097,7 @@ class ChannelManager:
         if not content_type or content_type in ("auto", "bmw_official", "bmw_community", "bmw_news"):
             content_type = "news+reaction"
 
-        # Generate with AI using persona — v4.0: pass has_media so AI knows the limit
+        # Generate with AI using persona
         try:
             response = await get_ai_router().generate_channel_post(
                 topic=title,
@@ -1188,13 +1179,12 @@ class ChannelManager:
                 logger.info(f"All {max_retries} attempts blocked by dedup")
                 return False
 
-            # v5.0: Resolve URL ONCE — pass to both image fetcher and text generator
-            # This avoids double resolution of Google News URLs (was causing 2x HTTP requests)
+            # v7.0: news.json URLs are already direct — no need to resolve Google News redirects.
+            # Only resolve if the URL is actually a Google redirect (rare for news.json).
             source_url = news_item.get("url", "")
-            resolved_url = ""
-            if source_url:
+            resolved_url = source_url
+            if source_url and 'news.google.com' in source_url:
                 resolved_url = await self._resolve_article_url(source_url, title=title)
-                # Cache the resolved URL in the news_item so other code can use it
                 news_item["_resolved_url"] = resolved_url
 
             # v4.0: Get images FIRST so AI knows the char limit (1024 with media, 4096 without)

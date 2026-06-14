@@ -643,89 +643,27 @@ async def ai_discover_news() -> List[Dict]:
 
 
 async def search_auto_news() -> List[Dict]:
-    """Search for automotive/BMW news using web search.
+    """Fetch automotive/BMW news from the curated news.json source.
 
-    v3.1: RSS feeds are now the PRIMARY source because they provide:
-    - Direct article URLs (not Google News redirects)
-    - Image URLs already extracted from RSS enclosures/content
-    - More reliable and faster than web search
+    v7.0: SINGLE SOURCE — loads ONLY from the curated news.json file.
+    This replaces all RSS feeds, web search, and Google News RSS.
 
-    Web search is used as supplement for broader coverage.
+    The curated news.json provides:
+    - Pre-curated image URLs (no more junk/thumbnail/logo photos!)
+    - Direct article URLs (no Google News redirects to resolve)
+    - Language detection already included
+    - Consistent, reliable data format
+
+    No more: broken RSS feeds, 404 errors, rate limits, Google redirects.
     """
-    items = []
-
-    # ── PHASE 1: RSS feeds — PREFERRED source (direct URLs + images) ─────
     try:
-        from bot.sources.rss_fetcher import BMWRSSFetcher
-        from bot.database import Database
-        db = Database()
-        rss_fetcher = BMWRSSFetcher(db)
-        try:
-            rss_items = await rss_fetcher._fetch_all_sources()
-            for item in rss_items:
-                # RSS items already have url, image_urls, and rss_entry
-                item["source"] = f"rss:{item.get('source', 'unknown')}"
-                item["category"] = item.get("category", "auto")
-                if "published_time" not in item:
-                    item["published_time"] = _extract_published_time_from_snippet(
-                        item.get("summary", "")
-                    )
-                if "lang" not in item:
-                    item["lang"] = "en" if any(c.isascii() for c in item.get("title", "")[:20]) else "ru"
-            items.extend(rss_items)
-            logger.info(f"RSS feeds: {len(rss_items)} items with direct URLs + images")
-        finally:
-            await rss_fetcher.close()
+        from news import fetch_news_json
+        items = await fetch_news_json(limit=100)
+        logger.info(f"Loaded {len(items)} items from curated news.json")
+        return items
     except Exception as e:
-        logger.debug(f"RSS feed fetch failed: {e}")
-
-    # ── PHASE 2: Web search — supplement for broader coverage ────────────
-    query = _get_search_query()
-    logger.info(f"Web search query: {query[:60]}")
-
-    try:
-        results = await web_search(query, max_results=8)
-    except Exception as e:
-        logger.error(f"Web search failed: {e}")
-        results = []
-
-    for r in results:
-        published_time = _extract_published_time_from_snippet(r.snippet)
-
-        items.append({
-            "source": "web_search",
-            "title": r.title,
-            "url": r.url,
-            "summary": r.snippet[:500] if r.snippet else "",
-            "published": published_time or time.time(),
-            "published_time": published_time,
-            "category": "auto",
-            "lang": "en" if any(c.isascii() for c in r.title[:20]) else "ru",
-            "image_urls": [],  # Web search doesn't provide images; will be scraped from article
-        })
-
-    # Also try Google News RSS
-    try:
-        gn_query = random.choice(BMW_GOOGLE_NEWS_QUERIES)
-        gn_results = await search_google_news_rss(
-            query=gn_query[0], lang=gn_query[1], gl=gn_query[2], max_results=5
-        )
-        for r in gn_results:
-            items.append({
-                "source": "google_news_rss",
-                "title": r.title,
-                "url": r.url,
-                "summary": r.snippet[:500] if r.snippet else "",
-                "published": time.time(),
-                "published_time": time.time(),
-                "category": "auto",
-                "lang": gn_query[1],
-                "image_urls": [],  # Google News RSS doesn't include images
-            })
-    except Exception as e:
-        logger.debug(f"Google News RSS search failed: {e}")
-
-    return items
+        logger.error(f"Curated news.json fetch failed: {e}")
+        return []
 
 
 async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str] = None) -> Optional[Dict]:

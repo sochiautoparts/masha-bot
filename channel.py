@@ -524,19 +524,21 @@ class ChannelManager:
         '/widgets/', '/plugins/',
     ])
 
-    async def _download_images(self, image_urls: List[str], max_count: int = 10) -> List[bytes]:
-        """Download images from URLs with STRICT quality validation.
+    async def _download_images(self, image_urls: List[str], max_count: int = 10, curated: bool = False) -> List[bytes]:
+        """Download images from URLs with quality validation.
 
-        v5.0: HEAVILY enhanced junk filtering. The previous version was too
-        permissive — it allowed logos, avatars, sidebar nav images, banners,
-        and other non-article images that look terrible in Telegram posts.
+        v8.2: Added `curated` flag — when images come from curated news.json,
+        we skip URL-based junk/thumbnail filters since they've already been
+        pre-filtered by _filter_curated_images(). Only basic validation
+        (file size, magic bytes, dimensions) is applied to curated images.
 
         Filter layers:
         1. URL domain check — block known junk domains (gravatar, ads, etc.)
         2. URL path check — block logos, icons, thumbs, theme assets, etc.
-        3. File size check — 15KB min (was 10KB), 5MB max
+           [SKIPPED for curated images — already pre-filtered]
+        3. File size check — 10KB min for curated, 15KB for scraped
         4. Magic bytes check — must be JPEG/PNG/WebP
-        5. Dimension check — min 400x300, reject extreme aspect ratios
+        5. Dimension check — min 300x200 for curated, 400x300 for scraped
         6. Dedup by URL — same image won't be downloaded twice
 
         Returns list of image data bytes.
@@ -547,7 +549,7 @@ class ChannelManager:
             return images
 
         MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-        MIN_IMAGE_SIZE = 15_000           # 15KB — skip tiny icons, thumbnails, and low-quality images
+        MIN_IMAGE_SIZE = 10_000 if curated else 15_000  # Lower threshold for curated images
 
         # Use a single client for all downloads
         async with httpx.AsyncClient(
@@ -572,25 +574,7 @@ class ChannelManager:
                     continue
                 seen_urls.add(url_stripped)
 
-                # ── LAYER 1: Domain check ──
-                from urllib.parse import urlparse
-                parsed = urlparse(url)
-                domain = parsed.netloc.lower()
-                if any(junk_domain in domain for junk_domain in self._JUNK_IMAGE_DOMAINS):
-                    logger.debug(f"Skipping junk domain: {domain}")
-                    continue
-
-                # ── LAYER 2: Path/pattern check ──
                 url_lower = url.lower()
-                if any(kw in url_lower for kw in self._JUNK_IMAGE_PATHS):
-                    logger.debug(f"Skipping junk path: {url[:80]}")
-                    continue
-
-                # Skip thumbnail URLs (dimension patterns in URL)
-                from bot.sources.image_fetcher import _is_thumbnail_url
-                if _is_thumbnail_url(url):
-                    logger.debug(f"Skipping thumbnail URL: {url[:80]}")
-                    continue
 
                 # Skip SVG — always icons/logos
                 if url_lower.endswith('.svg') or '.svg?' in url_lower:
@@ -599,6 +583,29 @@ class ChannelManager:
                 # Skip data: URIs
                 if url.startswith('data:'):
                     continue
+
+                # ── URL-BASED FILTERS (only for non-curated images) ──
+                # Curated images from news.json have already been filtered
+                # by _filter_curated_images() — no need to re-check
+                if not curated:
+                    # Domain check
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    domain = parsed.netloc.lower()
+                    if any(junk_domain in domain for junk_domain in self._JUNK_IMAGE_DOMAINS):
+                        logger.debug(f"Skipping junk domain: {domain}")
+                        continue
+
+                    # Path/pattern check
+                    if any(kw in url_lower for kw in self._JUNK_IMAGE_PATHS):
+                        logger.debug(f"Skipping junk path: {url[:80]}")
+                        continue
+
+                    # Thumbnail URL check
+                    from bot.sources.image_fetcher import _is_thumbnail_url
+                    if _is_thumbnail_url(url):
+                        logger.debug(f"Skipping thumbnail URL: {url[:80]}")
+                        continue
 
                 try:
                     response = await client.get(url)
@@ -620,15 +627,17 @@ class ChannelManager:
                     if not is_valid:
                         continue
 
-                    # Dimension check with PIL if available — STRICT minimums
+                    # Dimension check with PIL if available
                     try:
                         from PIL import Image
                         import io
                         img = Image.open(io.BytesIO(content))
                         w, h = img.size
-                        # v5.0: Raised minimums — 400x300 (was 300x200)
-                        # Thumbnails are typically 150-300px. Real photos are 800+
-                        if w < 400 or h < 300:
+                        # v8.2: Lower minimums for curated images (300x200)
+                        # since they're already pre-filtered by news.json
+                        min_w = 300 if curated else 400
+                        min_h = 200 if curated else 300
+                        if w < min_w or h < min_h:
                             logger.debug(f"Skipping small image: {w}x{h} from {url[:60]}")
                             continue
                         # Skip extreme aspect ratios (banners/ads)
@@ -964,12 +973,11 @@ class ChannelManager:
         source = "none"
         title = news_item.get("title", "")
 
-        # Step 1: Download pre-curated images from news.json
-        # These are already filtered for quality (no thumbnails, logos, icons)
+        # Download curated images — skip URL-based junk filters (already pre-filtered)
         curated_image_urls = news_item.get("image_urls", [])
         if curated_image_urls:
             try:
-                curated_images = await self._download_images(curated_image_urls, max_count=MAX_IMAGES_PER_POST)
+                curated_images = await self._download_images(curated_image_urls, max_count=MAX_IMAGES_PER_POST, curated=True)
                 if curated_images:
                     image_list.extend(curated_images)
                     source = "curated"

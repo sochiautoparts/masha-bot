@@ -728,6 +728,21 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
         if image_urls and len(image_urls) > 0:
             total += 0.3  # Significant bonus for having photos
         
+        # v8.2: Deprioritize Reddit/community posts vs real news articles
+        # Reddit posts are personal stories, not news — they should rank lower
+        source = item.get("source", "")
+        url = item.get("url", "")
+        if "reddit.com" in url or "redd.it" in url or "reddit" in source.lower():
+            total -= 0.5  # Significant penalty for Reddit content
+        # Personal/community posts have informal titles
+        title_lower = title.lower()
+        reddit_phrases = ["my first bmw", "new to me", "just bought", "just cleaned",
+                          "you can only have", "what do you think", "look at this",
+                          "check out my", "my baby", "finally got", "dream come true",
+                          "should i buy", "rate my", "love my", "my new"]
+        if any(phrase in title_lower for phrase in reddit_phrases):
+            total -= 0.4  # Penalty for personal/community-style titles
+        
         scored.append((total, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)

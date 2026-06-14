@@ -672,6 +672,9 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
     Args:
         items: Pre-fetched items. If None, fetches fresh news.
         exclude_titles: List of titles to exclude (already posted/tried this cycle).
+    
+    v8.0: Added source URL dedup — if an article URL was already posted,
+    it's skipped regardless of AI-generated text differences.
     """
     if items is None:
         items = await search_auto_news()
@@ -686,13 +689,34 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
             # Normalize: lowercase, strip
             exclude_set.add(t.lower().strip()[:80])
 
+    # Pre-filter: check which source URLs were already posted
+    # This is the PRIMARY dedup mechanism
+    posted_urls = set()
+    try:
+        from bot.database import is_source_url_posted
+        for item in items:
+            url = item.get("url", "")
+            if url:
+                is_posted = await is_source_url_posted(url)
+                if is_posted:
+                    posted_urls.add(url)
+        if posted_urls:
+            logger.info(f"Source URL dedup: {len(posted_urls)} already-posted URLs filtered out")
+    except Exception as e:
+        logger.debug(f"Source URL pre-filter failed: {e}")
+
     # Score and sort — v5.0: bonus for items with images (more engaging posts)
     scored = []
     for item in items:
         title = item.get("title", "")
+        url = item.get("url", "")
         
         # Skip items already tried this cycle (exact match on first 80 chars)
         if title.lower().strip()[:80] in exclude_set:
+            continue
+        
+        # Skip items whose source URL was already posted (PRIMARY dedup)
+        if url and url in posted_urls:
             continue
         
         interest = _score_interest(title, item.get("summary", ""))

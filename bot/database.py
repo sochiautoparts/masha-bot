@@ -374,6 +374,35 @@ class Database:
         )
         await self._conn.commit()
 
+    async def is_source_url_posted(self, source_url: str) -> bool:
+        """Check if a source URL has already been posted to the channel.
+
+        This is the PRIMARY dedup mechanism — if the same article URL was
+        already posted, we skip it regardless of what text the AI generates.
+        Prevents the same news being posted multiple times with different text.
+        """
+        if not source_url:
+            return False
+        assert self._conn is not None
+
+        # Check channel_posts table for this source URL
+        async with self._conn.execute(
+            "SELECT id FROM channel_posts WHERE source = ? LIMIT 1",
+            (source_url,)
+        ) as cur:
+            if await cur.fetchone():
+                return True
+
+        # Also check news_items table for is_used flag
+        async with self._conn.execute(
+            "SELECT id FROM news_items WHERE url = ? AND is_used = 1 LIMIT 1",
+            (source_url,)
+        ) as cur:
+            if await cur.fetchone():
+                return True
+
+        return False
+
     # ── Channel Posts ─────────────────────────────────────────────────────
 
     async def add_channel_post(
@@ -1166,6 +1195,15 @@ async def cleanup_old_fingerprints(max_age_days: int = 7) -> int:
     """Clean up old fingerprints and data. Returns number of rows deleted."""
     db = _get_db()
     return await db.cleanup_old_data(days=max_age_days)
+
+
+async def is_source_url_posted(source_url: str) -> bool:
+    """Check if a source URL has already been posted to the channel.
+
+    PRIMARY dedup: same article URL = skip regardless of AI-generated text.
+    """
+    db = _get_db()
+    return await db.is_source_url_posted(source_url)
 
 
 # ── Topic Registry ───────────────────────────────────────────────────────

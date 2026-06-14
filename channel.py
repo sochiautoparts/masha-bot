@@ -39,7 +39,7 @@ from bot.database import (
     add_channel_post, get_today_post_count, get_hourly_post_count, get_unposted_news,
     mark_news_posted, add_partner_post, get_today_partner_post_count,
     is_duplicate_post, add_post_fingerprint, cleanup_old_fingerprints,
-    get_recent_post_titles, DB_PATH,
+    get_recent_post_titles, is_source_url_posted, DB_PATH,
 )
 from ai.router import get_ai_router
 from bot.partners import partner_manager
@@ -949,15 +949,11 @@ class ChannelManager:
         return url
 
     async def _get_post_images(self, news_item: Dict, resolved_url: str = "") -> tuple:
-        """Get images for a news post — from curated news.json images.
+        """Get images for a news post — ONLY from curated news.json images.
 
-        v7.0: COMPLETELY REWORKED — images come from curated news.json.
+        v8.0: USE ONLY PHOTOS FROM NEWS.JSON — no more article scraping.
         Each news item in news.json has a pre-curated `images[]` list
         with direct, high-quality image URLs. No more scraping, no more junk.
-
-        Steps:
-        1. Download images from news_item["image_urls"] (curated from news.json)
-        2. FALLBACK: Scrape article page ONLY if curated images yield nothing
 
         The curated source already filters out thumbnails, logos, icons, etc.
         These are REAL article photos selected by the news curator.
@@ -981,25 +977,8 @@ class ChannelManager:
             except Exception as e:
                 logger.debug(f"Curated image download failed: {e}")
 
-        # Step 2: FALLBACK — scrape article page ONLY if curated images yield nothing
-        # This is a safety net in case the curated images are all broken/unavailable
-        if not image_list:
-            article_url = resolved_url or news_item.get("url", "")
-            if article_url and not resolved_url:
-                article_url = await self._resolve_article_url(article_url, title=title)
-
-            if article_url:
-                try:
-                    scraped = await self._scrape_article_images(
-                        article_url,
-                        max_count=3  # Limited — only as fallback
-                    )
-                    if scraped:
-                        image_list.extend(scraped)
-                        source = "article_fallback"
-                        logger.info(f"Fallback: scraped {len(scraped)} images from article: {title[:50]}")
-                except Exception as e:
-                    logger.debug(f"Article scraping fallback failed: {e}")
+        # No fallback to article scraping — curated images ONLY
+        # If no curated images available, the post will be text-only
 
         # Hard limit
         image_list = image_list[:MAX_IMAGES_PER_POST]
@@ -1153,19 +1132,30 @@ class ChannelManager:
                     return False
 
                 title = news_item.get("title", "")
+                source_url = news_item.get("url", "")
 
-                # Check dedup — if blocked, add to tried list and try next article
+                # ── PRIMARY DEDUP: Source URL ──
+                # If the same article URL was already posted, skip it
+                # regardless of what text the AI generates. This prevents
+                # the same news being posted multiple times with different text.
+                if source_url and await is_source_url_posted(source_url):
+                    logger.info(f"Source URL already posted (attempt {attempt+1}): {source_url[:60]}")
+                    tried_titles.append(title)
+                    continue
+
+                # ── SECONDARY DEDUP: Generated text hash ──
                 if await is_duplicate_post(title, hours=48):
                     logger.info(f"Duplicate post (attempt {attempt+1}): {title[:60]}")
                     tried_titles.append(title)
                     continue
 
+                # ── TERTIARY DEDUP: Semantic similarity ──
                 if _is_semantically_duplicate(title):
                     logger.info(f"Semantic duplicate (attempt {attempt+1}): {title[:60]}")
                     tried_titles.append(title)
                     continue
 
-                # Entity dedup
+                # ── ENTITY DEDUP: Topic registry ──
                 entity_key = _extract_entities(title)
                 if _is_topic_covered(entity_key):
                     logger.info(f"Topic already covered (attempt {attempt+1}): {entity_key}")
@@ -1181,7 +1171,6 @@ class ChannelManager:
 
             # v7.0: news.json URLs are already direct — no need to resolve Google News redirects.
             # Only resolve if the URL is actually a Google redirect (rare for news.json).
-            source_url = news_item.get("url", "")
             resolved_url = source_url
             if source_url and 'news.google.com' in source_url:
                 resolved_url = await self._resolve_article_url(source_url, title=title)

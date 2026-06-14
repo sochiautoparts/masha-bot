@@ -66,6 +66,7 @@ def _is_thumbnail_url(url: str) -> bool:
     simple_patterns = [
         '/thumb/', '/thumbnail/', '/thumbs/', '/tiny/',
         '_thumb.', '-thumb.', '_tiny.', '-tiny.',
+        '_thumb-', '-thumb-',  # v7.1: Also catch -thumb- and _thumb-
         'car_review_image_190',
     ]
     for pattern in simple_patterns:

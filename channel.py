@@ -311,31 +311,36 @@ def _validate_post_text(text: str) -> bool:
             logger.warning(f"Post BLOCKED (non-BMW brand '{keyword}')")
             return False
 
-    # AUTO-RELEVANCE CHECK — BMW-focused
-    _auto_required_keywords = [
+    # AUTO-RELEVANCE CHECK — STRICTLY BMW-focused
+    # The bot is about BMW. Non-BMW auto content should NOT pass.
+    _bmw_required_keywords = [
         # BMW-specific
         "bmw", "бмв", "бимер", "баварец", "///m", "m power", "mpower",
-        "m5", "m3", "m4", "m2", "m8", "x5", "x3", "x6", "x7",
-        "s63", "s58", "s55", "b58", "n55", "n54", "s68",
+        "m5", "m3", "m4", "m2", "m8", "x5", "x3", "x6", "x7", "x1", "x2", "x4",
+        "s63", "s58", "s55", "b58", "n55", "n54", "s68", "b48", "b46", "b38",
         "vanos", "valvetronic", "xdrive", "alpina",
         "bimmercode", "ista", "realoem",
-        # General auto
-        "авто", "автомобиль", "машина", "мотор", "двигатель", "кузов", "салон",
-        "транспорт", "запчас", "ремонт", "сервис", "шин", "колес",
-        "бензин", "дизел", "электромобиль", "гибрид",
-        "продаж", "авторынок", "автосалон", "дилер",
-        "тест-драйв", "обзор", "концепт", "рестайлинг",
-        "гонк", "ралли", "формул", "F1",
-        # Car brand names
-        "Mercedes", "Audi", "Porsche", "Ferrari", "Lamborghini",
-        "Tesla", "Volkswagen", "Toyota", "Honda", "Lexus",
-        "car", "auto", "vehicle", "motor", "engine",
-        "SUV", "sedan", "coupe", "EV", "PHEV",
-        "recall", "redesign", "launch", "debut",
+        # BMW electric
+        "ix3", "ix1", "ix2", "i4", "i5", "i7", "i3", "i8", "im3",
+        # BMW platforms / concepts
+        "neue klasse", "m sport", "m performance",
+        # BMW model codes
+        "g20", "g80", "g82", "g87", "g60", "g70", "g65",
+        "f90", "f80", "f82", "f87", "f30", "f10",
+        "e46", "e39", "e30", "e36", "e28",
+        # BMW Group brands
+        "mini cooper", "mini countryman", "rolls-royce",
+        # BMW in Russian
+        "баварский моторный", "баварец",
+        # BMW-specific design terms
+        "kidney grille", "hofmeister kink", "angel eyes",
+        # BMW racing
+        "bmw m motorsport", "bmw m team", "bmw m hybrid",
+        "bmw art car",
     ]
-    has_auto_keyword = any(kw.lower() in text_lower for kw in _auto_required_keywords)
-    if not has_auto_keyword:
-        logger.warning(f"Post BLOCKED (no auto-relevant keywords)")
+    has_bmw_keyword = any(kw.lower() in text_lower for kw in _bmw_required_keywords)
+    if not has_bmw_keyword:
+        logger.warning(f"Post BLOCKED (no BMW-relevant keywords)")
         return False
 
     return True

@@ -39,6 +39,57 @@ from bot.sources.rss_fetcher import (
     BMW_BLOCKLIST,
     URGENT_BMW_KEYWORDS,
 )
+from bot.bmw_knowledge import is_bmw_topic
+
+
+# ── Extended BMW relevance keywords for news.json filtering ─────────────────────
+# These supplement is_bmw_topic() to catch items that mention BMW models/tech
+# but might not use the exact phrases in BMW_AUTO_KEYWORDS_EN/RU.
+_EXTRA_BMW_KEYWORDS: list[str] = [
+    # Neue Klasse platform
+    "neue klasse", "neueklasse",
+    # Electric BMW models
+    "ix3", "ix1", "ix2", "i4", "i5", "i7", "i3", "i8", "im3",
+    # BMW Group brands (MINI, Rolls-Royce) — still BMW Group
+    "mini cooper", "mini countryman", "rolls-royce",
+    # BMW-specific terms
+    "kidney grille", "hofmeister kink", "angel eyes",
+    "m sport", "m performance", "competition package",
+    # BMW racing
+    "bmw m motorsport", "bmw m team", "bmw m hybrid",
+    "bmw m4 gt3", "bmw m4 gt4", "bmw m2 csr",
+    # Common model codes
+    "g20", "g80", "g82", "g87", "g60", "g70", "g65",
+    "f90", "f80", "f82", "f87", "f30", "f10", "e46", "e39", "e30", "e36",
+    # Russian BMW terms
+    "баварский моторный", "баварец", "бимер",
+    # BMW sub-brands
+    "alpina", "diniz", "ac schnitzer",
+    # BMW concepts / events
+    "concept neue klasse", "le mans bmw", "bmw art car",
+]
+
+
+def _is_bmw_relevant(text: str) -> bool:
+    """Check if text is relevant to BMW — used as HARD filter on news.json.
+
+    Two-stage check:
+    1. is_bmw_topic() from bmw_knowledge (BMW_AUTO_KEYWORDS_EN + RU)
+    2. Extended keyword list for models/tech not in the main list
+
+    If EITHER matches, the item is considered BMW-relevant.
+    """
+    # Stage 1: Main BMW topic check
+    if is_bmw_topic(text):
+        return True
+
+    # Stage 2: Extended keywords
+    text_lower = text.lower()
+    for kw in _EXTRA_BMW_KEYWORDS:
+        if kw in text_lower:
+            return True
+
+    return False
 
 
 async def fetch_news_json(limit: int = 100) -> list[dict[str, Any]]:
@@ -78,6 +129,10 @@ async def fetch_news_json(limit: int = 100) -> list[dict[str, Any]]:
                 logger.warning("news.json is not a list: %s", type(data))
                 return items
 
+            skipped_blocklist = 0
+            skipped_not_bmw = 0
+            total_raw = len(data)
+
             for entry in data:
                 title = entry.get("title", "")
                 url = entry.get("url", "")
@@ -91,9 +146,24 @@ async def fetch_news_json(limit: int = 100) -> list[dict[str, Any]]:
                 if not title or not url:
                     continue
 
-                # Basic relevance check — still filter for BMW/auto content
-                combined = f"{title} {summary}".lower()
-                if any(bl in combined for bl in BMW_BLOCKLIST):
+                # ── HARD BMW-RELEVANCE FILTER ──
+                # The source news.json contains ~23% non-BMW articles
+                # (Chery, Nissan, Ferrari, Reddit community posts, etc.)
+                # We ONLY allow BMW-relevant content into the pipeline.
+                combined = f"{title} {summary}"
+
+                # 1) Blocklist — hard block for junk brands
+                combined_lower = combined.lower()
+                if any(bl in combined_lower for bl in BMW_BLOCKLIST):
+                    skipped_blocklist += 1
+                    logger.debug(f"Blocked by blocklist: {title[:60]}")
+                    continue
+
+                # 2) BMW relevance — MUST contain BMW-related keywords
+                #    Uses is_bmw_topic() from bmw_knowledge + extra keywords
+                if not _is_bmw_relevant(combined):
+                    skipped_not_bmw += 1
+                    logger.debug(f"Skipped (not BMW-relevant): {title[:60]}")
                     continue
 
                 # Convert images list to image_urls (the field name used in the pipeline)
@@ -132,9 +202,10 @@ async def fetch_news_json(limit: int = 100) -> list[dict[str, Any]]:
             items.sort(key=lambda x: x.get("published_time", 0), reverse=True)
 
             logger.info(
-                "Loaded %d items from news.json (%d with images)",
-                len(items),
+                "Loaded %d/%d items from news.json (%d with images) — blocked: %d, not-BMW: %d",
+                len(items), total_raw,
                 sum(1 for i in items if i.get("image_urls")),
+                skipped_blocklist, skipped_not_bmw,
             )
 
     except httpx.TimeoutException:

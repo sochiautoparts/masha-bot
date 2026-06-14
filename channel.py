@@ -1453,13 +1453,12 @@ class ChannelManager:
     async def _get_partner_image(self, program) -> Optional[bytes]:
         """Get image for a partner post — from admitad_ads.json image URLs.
 
-        Strategy:
-        1. Try downloading raster image (jpg/png/webp) from partner's image_url
-        2. If SVG — convert to PNG, then create a branded card
-        3. If raster — create a branded card with the logo
-        4. Fallback: text-only post
+        v8.2: SIMPLE — just download the image from the source, no branded cards.
+        If SVG → convert to PNG (Telegram doesn't support SVG).
+        If raster (jpg/png/webp) → use as-is.
+        No overlays, no cards, no branding — just the raw image.
 
-        Returns image bytes (always JPEG for Telegram) or None.
+        Returns image bytes (JPEG or PNG) or None.
         """
         # Collect all image URLs from the partner program
         image_urls = []
@@ -1488,28 +1487,18 @@ class ChannelManager:
                     content_type = resp.headers.get("content-type", "").lower()
                     url_lower = url.lower()
 
-                    # ── Case 1: Raster image (jpg/png/webp) → create branded card ──
+                    # ── Case 1: Raster image (jpg/png/webp) → use as-is ──
                     if any(ft in content_type for ft in ["image/jpeg", "image/png", "image/webp", "image/gif"]) or \
                        any(url_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
-                        # Create a branded card with the logo
-                        card = self._create_partner_card(content, program.name, getattr(program, 'category', ''))
-                        if card:
-                            logger.info(f"Partner card created from raster: {program.name} ({len(card)} bytes)")
-                            return card
-                        # If card creation fails, use the raw image (if big enough)
-                        if len(content) > 2000:
-                            logger.info(f"Using raw partner image: {program.name} ({len(content)} bytes)")
-                            return content
-                        continue
+                        logger.info(f"Partner image downloaded: {program.name} ({len(content)} bytes)")
+                        return content
 
-                    # ── Case 2: SVG → convert to PNG → create branded card ──
+                    # ── Case 2: SVG → convert to PNG (Telegram doesn't support SVG) ──
                     if "svg" in content_type or url_lower.endswith('.svg'):
-                        png_data = self._svg_to_png(content, width=400, height=300)
+                        png_data = self._svg_to_png(content, width=800, height=600)
                         if png_data:
-                            card = self._create_partner_card(png_data, program.name, getattr(program, 'category', ''))
-                            if card:
-                                logger.info(f"Partner card created from SVG: {program.name} ({len(card)} bytes)")
-                                return card
+                            logger.info(f"Partner SVG→PNG: {program.name} ({len(png_data)} bytes)")
+                            return png_data
                         continue
 
             except Exception as e:
@@ -1522,8 +1511,8 @@ class ChannelManager:
     async def post_partner_content(self) -> bool:
         """Post partner content to the channel.
 
-        v8.0: Uses images from admitad_ads.json — SVG logos are converted to PNG
-        and wrapped in a branded BMW-themed partner card.
+        v8.2: Uses raw images from admitad_ads.json — SVG→PNG conversion only.
+        No branded cards — just the partner image as-is.
         Always tries to post WITH an image for maximum engagement.
         """
         if not partner_manager.should_post_partner():

@@ -1,7 +1,7 @@
 """AI Router v11.0 — LOCAL-FIRST MULTI-PROVIDER FAILOVER for masha-bot.
 
 FAILOVER CHAIN (5 levels before static fallback):
-  Level 0: Local Model (Qwen3-4B GGUF, CPU) — CHAT & COMMENT routes first
+  Level 0: Local Model (RuadaptQwen3-4B-Instruct GGUF, CPU) — CHAT & COMMENT routes first
   Level 1: Pollinations (with API key) → KEY1 → KEY2
   Level 2: Pollinations FREE API (text.pollinations.ai, no auth)
   Level 3: Cloudflare Workers AI (@cf/mistralai/mistral-small-3.1-24b-instruct)
@@ -253,7 +253,7 @@ class AIRouter:
 
         Called when ALL cloud providers (Pollinations, Cloudflare, HuggingFace)
         are unavailable or have exhausted their rate limits. Uses a SIMPLIFIED
-        prompt optimized for the Qwen3-4B 4B-parameter model running on CPU.
+        prompt optimized for the RuadaptQwen3-4B 4B-parameter model running on CPU.
 
         Key differences from generate_channel_post():
           - Much shorter system prompt (4B model needs concise instructions)
@@ -649,7 +649,7 @@ class AIRouter:
         )
         models = list(set(CHAT_MODELS + VISION_MODELS + CONTENT_MODELS + IMAGE_MODELS + REASONING_MODELS))
         if self._local and self._local.is_available():
-            models.append("local-qwen3-4b")
+            models.append("local-ruadapt-qwen3-4b")
         return models
 
     def get_model_categories(self) -> dict[str, list[str]]:
@@ -667,7 +667,7 @@ class AIRouter:
             "image": list(IMAGE_MODELS),
             "cloudflare": [CF_TEXT_MODEL] if self._manager.cloudflare else [],
             "cloudflare_image": list(CF_IMAGE_MODELS) if self._manager.cloudflare else [],
-            "local": ["local-qwen3-4b"] if self._local and self._local.is_available() else [],
+            "local": ["local-ruadapt-qwen3-4b"] if self._local and self._local.is_available() else [],
         }
 
     def is_available(self) -> bool:
@@ -699,12 +699,12 @@ class AIRouter:
         if self._local:
             from bot.config import config
             if config.ENABLE_LOCAL_MODEL:
-                logger.info("Pre-loading local model (Qwen3-4B)...")
+                logger.info("Pre-loading local model (RuadaptQwen3-4B-Instruct)...")
                 import asyncio
                 loop = asyncio.get_event_loop()
                 loaded = await loop.run_in_executor(None, self._local._load_model)
                 if loaded:
-                    providers.append(f"Local (Qwen3-4B, LOADED)")
+                    providers.append(f"Local (RuadaptQwen3-4B-Instruct, LOADED)")
                 else:
                     providers.append("Local (FAILED — cloud-only mode)")
             else:

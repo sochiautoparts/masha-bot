@@ -1,10 +1,12 @@
-"""Local LLM Provider — Qwen3-4B via llama-cpp-python (GGUF).
+"""Local LLM Provider — RuadaptQwen3-4B-Instruct via llama-cpp-python (GGUF).
 
 Provides local inference for Masha Bot using llama-cpp-python with:
-  - Qwen3-4B-Instruct Q4_K_M quantization (~2.5GB)
+  - RuadaptQwen3-4B-Instruct Q4_K_M quantization (~2.5GB)
+  - Russian-adapted Qwen3-4B — better Russian quality than base Qwen3-4B
+  - Extended tokenizer with 48k Russian tokens for efficient Russian generation
   - CPU-only inference (GitHub Actions compatible)
   - Thread-configurable for performance
-  - Chat template formatting for instruction models
+  - Chat template formatting (ChatML, same as Qwen3)
   - Automatic /no_think prefix for fast non-reasoning responses
   - Memory management with context window sizing
   - Fallback to cloud providers on failure
@@ -34,7 +36,7 @@ TOKEN LIMITS (route-aware, enforced by ProviderManager):
   LOCAL-ONLY:    max 1024 tokens (last-resort posting via local model)
   
   Internal cap: max_tokens capped at 1024 in _generate() to prevent
-  slow CPU inference. Qwen3-4B on CPU generates ~5-10 tokens/sec,
+  slow CPU inference. RuadaptQwen3-4B on CPU generates ~5-10 tokens/sec,
   so 1024 tokens = ~100-200 seconds maximum generation time.
 """
 
@@ -63,7 +65,8 @@ QWEN3_END = "<|im_end|>\n"
 class LocalProvider(BaseAIProvider):
     """Local LLM provider using llama-cpp-python for GGUF models.
 
-    Supports Qwen3-4B-Instruct with ChatML template formatting.
+    Supports RuadaptQwen3-4B-Instruct with ChatML template formatting.
+    Russian-adapted version of Qwen3-4B with extended tokenizer.
     CPU-only, designed for GitHub Actions runners (ubuntu-latest).
     """
 
@@ -88,7 +91,7 @@ class LocalProvider(BaseAIProvider):
         """Download the GGUF model from HuggingFace if auto-download is enabled.
 
         Uses HF_TOKEN environment variable for authenticated downloads
-        (required for gated models like Qwen3-4B-GGUF).
+        (RuadaptQwen3-4B-Instruct-GGUF is NOT gated, but token still useful for rate limits).
         Returns True if download succeeded or file already exists.
         """
         config = self._get_config()
@@ -291,7 +294,7 @@ class LocalProvider(BaseAIProvider):
 
             logger.info(
                 f"Local model loaded in {elapsed:.1f}s "
-                f"(Qwen3-4B Q4_K_M, ctx={n_ctx}, threads={n_threads})"
+                f"(RuadaptQwen3-4B-Instruct Q4_K_M, ctx={n_ctx}, threads={n_threads})"
             )
             return True
 
@@ -358,7 +361,7 @@ class LocalProvider(BaseAIProvider):
         if not self._load_model():
             return AIResponse(
                 text="",
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
                 provider=self.name,
                 error="Local model not available (not loaded or not enabled)",
             )
@@ -378,7 +381,7 @@ class LocalProvider(BaseAIProvider):
                         logger.error("Local model reinitialize failed — entering cooldown")
                 return AIResponse(
                     text="",
-                    model="local-qwen3-4b",
+                    model="local-ruadapt-qwen3-4b",
                     provider=self.name,
                     error=f"Local model in cooldown ({self._consecutive_errors} consecutive errors)",
                 )
@@ -427,7 +430,7 @@ class LocalProvider(BaseAIProvider):
                 self._last_error_time = time.time()
                 return AIResponse(
                     text="",
-                    model="local-qwen3-4b",
+                    model="local-ruadapt-qwen3-4b",
                     provider=self.name,
                     error="Empty or too short response from local model",
                 )
@@ -446,7 +449,7 @@ class LocalProvider(BaseAIProvider):
 
             return AIResponse(
                 text=text,
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
                 provider=self.name,
             )
 
@@ -457,7 +460,7 @@ class LocalProvider(BaseAIProvider):
             logger.error(f"Local model error: {e}")
             return AIResponse(
                 text="",
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
                 provider=self.name,
                 error=str(e),
             )
@@ -572,7 +575,7 @@ class LocalProvider(BaseAIProvider):
         return AIResponse(
             error="Local model does not support image generation",
             provider=self.name,
-            model="local-qwen3-4b",
+            model="local-ruadapt-qwen3-4b",
         )
 
     def is_available(self) -> bool:
@@ -600,7 +603,7 @@ class LocalProvider(BaseAIProvider):
             "provider": self.name,
             "status": "LOADED" if self._model_loaded else "NOT_LOADED",
             "available": self.is_available(),
-            "model": "Qwen3-4B-Q4_K_M",
+            "model": "RuadaptQwen3-4B-Instruct-Q4_K_M",
             "ctx": config.MODEL_N_CTX,
             "threads": config.MODEL_N_THREADS,
             "requests": self._total_requests,

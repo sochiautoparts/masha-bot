@@ -10,7 +10,7 @@ ROUTE STRATEGY (LOCAL-FIRST):
   IMAGE generation           → Pollinations → Cloudflare → HuggingFace
   LOCAL-ONLY (last resort)   → Local model directly — when ALL cloud providers are down/exhausted
 
-Level 0: Local Model (Qwen3-4B GGUF, CPU) — chat & comments FIRST
+Level 0: Local Model (RuadaptQwen3-4B-Instruct GGUF, CPU) — chat & comments FIRST
   CHAT route local limit: 1024 tokens (fast user answers on CPU)
   COMMENT route local limit: 256 tokens (short group comments, must be fast)
   FUNCTION route local limit: 1024 tokens (fallback for posts, VIN, diagnostics)
@@ -105,7 +105,7 @@ class ProviderManager:
                     local_max = min(max_tokens, 1024) if route_type == ROUTE_CHAT else min(max_tokens, 256)
                     result = await self.local.chat(
                         messages=messages,
-                        model="local-qwen3-4b",
+                        model="local-ruadapt-qwen3-4b",
                         temperature=temperature,
                         max_tokens=local_max,
                         **kwargs,
@@ -179,7 +179,7 @@ class ProviderManager:
                 local_max = min(max_tokens, 1024)
                 result = await self.local.chat(
                     messages=messages,
-                    model="local-qwen3-4b",
+                    model="local-ruadapt-qwen3-4b",
                     temperature=temperature,
                     max_tokens=local_max,
                     **kwargs,
@@ -228,7 +228,7 @@ class ProviderManager:
         or have exhausted their rate limits. This ensures the bot can ALWAYS
         generate content for the channel, even if quality is lower.
 
-        The local model (Qwen3-4B) is less creative than cloud models but
+        The local model (RuadaptQwen3-4B-Instruct) is less creative than cloud models but
         can produce acceptable short posts with simplified prompts.
 
         Args:
@@ -243,7 +243,7 @@ class ProviderManager:
             return AIResponse(
                 error="Local model not configured",
                 provider="none",
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
             )
 
         if not self.local.is_available():
@@ -254,13 +254,13 @@ class ProviderManager:
                     return AIResponse(
                         error="Local model not available (load failed)",
                         provider="none",
-                        model="local-qwen3-4b",
+                        model="local-ruadapt-qwen3-4b",
                     )
             except Exception as e:
                 return AIResponse(
                     error=f"Local model load error: {e}",
                     provider="none",
-                    model="local-qwen3-4b",
+                    model="local-ruadapt-qwen3-4b",
                 )
 
         # Cap at 1024 tokens for CPU inference speed
@@ -269,7 +269,7 @@ class ProviderManager:
         try:
             result = await self.local.chat(
                 messages=messages,
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
                 temperature=temperature,
                 max_tokens=actual_max,
             )
@@ -286,7 +286,7 @@ class ProviderManager:
             return AIResponse(
                 error=f"Local-only chat failed: {exc}",
                 provider="local",
-                model="local-qwen3-4b",
+                model="local-ruadapt-qwen3-4b",
             )
 
     async def _chat_cloud_only(

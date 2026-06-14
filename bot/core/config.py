@@ -79,13 +79,15 @@ class BotConfig:
     SEARCH_MAX_RESULTS: int = 5
     SEARCH_TIMEOUT_SECONDS: int = 15
 
-    # Local model (Qwen3-4B GGUF, CPU inference via llama-cpp-python)
+    # Local model (RuadaptQwen3-4B-Instruct GGUF, CPU inference via llama-cpp-python)
+    # Russian-adapted Qwen3-4B — better Russian language quality than base Qwen3-4B
+    # Extended tokenizer with 48k Russian tokens for more efficient Russian generation
     # Optimized for GitHub Actions (2 vCPU, 7GB RAM):
     #   n_ctx=4096 — enough for system prompt + history + output, saves ~2GB RAM vs 8192
     #   n_threads=2 — matches GitHub Actions 2 vCPU (more threads = contention)
     #   max_tokens=1024 — cap for CPU speed; ProviderManager sets route-aware limits
     ENABLE_LOCAL_MODEL: bool = os.getenv("ENABLE_LOCAL_MODEL", "false").lower() in ("true", "1", "yes")
-    MODEL_PATH: str = os.getenv("MODEL_PATH", "models/Qwen3-4B-Q4_K_M.gguf") if ENABLE_LOCAL_MODEL else ""
+    MODEL_PATH: str = os.getenv("MODEL_PATH", "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf") if ENABLE_LOCAL_MODEL else ""
     MODEL_N_CTX: int = int(os.getenv("MODEL_N_CTX", "4096"))
     MODEL_N_THREADS: int = int(os.getenv("MODEL_N_THREADS", "2"))
     MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "1024"))
@@ -93,7 +95,7 @@ class BotConfig:
     MODEL_AUTO_DOWNLOAD: bool = os.getenv("MODEL_AUTO_DOWNLOAD", "true").lower() in ("true", "1", "yes")
     MODEL_DOWNLOAD_URL: str = os.getenv(
         "MODEL_DOWNLOAD_URL",
-        "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+        "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf",
     )
     HF_TOKEN: str = os.getenv("HF_TOKEN", "")
 

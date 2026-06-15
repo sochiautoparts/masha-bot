@@ -198,9 +198,9 @@ def _is_topic_covered(entity_key: str) -> bool:
     IMPORTANT: Brand-only keys (e.g. "bmw") are SKIPPED — they would block
     an entire channel's content. Only compound keys like "bmw_m5" are checked.
     
-    v8.3: Brand+model keys (e.g. "bmw_m3") use a SHORTER TTL (2 hours)
-    because they block ALL articles about that model. In a BMW-focused channel,
-    multiple M3 articles per day are valid and should not be blocked.
+    v8.4: Brand+model keys (e.g. "bmw_m3") use a SHORTER TTL (1 hour)
+    and allow up to 3 posts per day. In a BMW-focused channel, multiple
+    M3 articles per day are valid and should not be blocked.
     Full compound keys (e.g. "bmw_m3_recall") use the full TTL.
     """
     if not entity_key:
@@ -215,6 +215,7 @@ def _is_topic_covered(entity_key: str) -> bool:
     if not entry:
         return False
     age_hours = (time.time() - entry["last_posted"]) / 3600
+    post_count = entry.get("post_count", 1)
     
     # Brand+model keys (like "bmw_m3") are still too broad — use shorter TTL
     # They block ALL articles about that model, which is too aggressive for
@@ -225,7 +226,11 @@ def _is_topic_covered(entity_key: str) -> bool:
     # If key is just brand+model (2 parts with BMW, or 3 parts like "bmw_x5_m")
     # use a much shorter TTL to allow more variety
     if has_bmw and part_count <= 3:
-        max_age = 2  # 2 hours — enough to avoid same-model spam, but allows multiple M3 posts per day
+        max_age = 1  # 1 hour — allows multiple M3 posts per day
+        # Allow up to 3 posts per day for brand+model keys without event context
+        # (e.g. "bmw_m3" is fine 3 times/day, but "bmw_m3_recall" is more specific)
+        if post_count >= 3:
+            max_age = _REGISTRY_MAX_AGE_HOURS  # After 3 posts, apply full TTL to prevent spam
     else:
         max_age = _REGISTRY_MAX_AGE_HOURS  # Full TTL for specific keys like "bmw_m3_recall_s58"
     

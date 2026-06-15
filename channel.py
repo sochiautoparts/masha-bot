@@ -1230,8 +1230,11 @@ class ChannelManager:
                 # Found a non-duplicate item! Proceed with posting.
                 break
             else:
-                # All retries exhausted
-                logger.info(f"All {max_retries} attempts blocked by dedup")
+                # All retries exhausted — try evergreen/BMW fact fallback
+                logger.info(f"All {max_retries} attempts blocked by dedup, trying evergreen fallback")
+                evergreen_result = await self._post_evergreen_fallback()
+                if evergreen_result:
+                    return evergreen_result
                 return False
 
             # v7.0: news.json URLs are already direct — no need to resolve Google News redirects.
@@ -1711,6 +1714,89 @@ class ChannelManager:
                 return True
         except Exception as e:
             logger.error(f"Partner post error: {e}")
+
+        return False
+
+    async def _post_evergreen_fallback(self) -> bool | dict:
+        """Post evergreen/BMW fact content when all news items are blocked by dedup.
+
+        This prevents the bot from reporting "3 consecutive empty cycles" and sending
+        false alerts. When dedup blocks everything, we post a BMW fact or evergreen
+        content instead of returning False.
+        """
+        try:
+            # Try loading the evergreen pool
+            import json
+            from pathlib import Path
+            evergreen_path = Path(__file__).parent / "data" / "evergreen_pool.json"
+            if not evergreen_path.exists():
+                logger.debug("Evergreen pool not found, skipping fallback")
+                return False
+
+            with open(evergreen_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pool = data.get("evergreen_pool", [])
+            if not pool:
+                logger.debug("Evergreen pool empty, skipping fallback")
+                return False
+
+            # Pick a random evergreen item
+            import random as _rand
+            item = _rand.choice(pool)
+            topic = item.get("topic", "")
+            context = item.get("context", "")
+            content_type = item.get("content_type", "lore/history")
+            character_hint = item.get("character_hint", "Маша")
+
+            if not topic:
+                return False
+
+            # Build a simple evergreen news_item-like dict for post generation
+            evergreen_item = {
+                "title": topic,
+                "summary": context,
+                "url": "",
+                "content_type": content_type,
+                "lang": "ru",
+            }
+
+            # Generate post text using AI
+            post_text = await self._generate_post_text(
+                evergreen_item, has_media=False, media_count=0, resolved_url=""
+            )
+            if not post_text:
+                # Even AI failed — post a simple static BMW fact
+                post_text = f"🏎️ {topic}\n\n{context}\n\n#BMW #BMWMpower #МашаБМВ"
+
+            # Clean and validate
+            post_text = _clean_post_text(post_text)
+            if not _validate_post_text(post_text):
+                logger.warning("Evergreen post validation failed")
+                return False
+
+            # Enforce text limit (no media for evergreen)
+            if len(post_text) > config.TELEGRAM_TEXT_LIMIT:
+                post_text = _enforce_char_limit(post_text, has_media=False)
+
+            # Send as text-only post
+            sent = await self._bot.send_message(
+                chat_id=config.CHANNEL_ID,
+                text=post_text,
+            )
+            if sent:
+                await add_channel_post(
+                    content=post_text[:500],
+                    message_id=sent.message_id,
+                    post_type=content_type,
+                    source_url="evergreen",
+                )
+                # Add reaction
+                await self._add_reaction(config.CHANNEL_ID, sent.message_id)
+                logger.info(f"Evergreen post published: {topic[:50]}")
+                return evergreen_item
+
+        except Exception as e:
+            logger.error(f"Evergreen fallback error: {e}")
 
         return False
 

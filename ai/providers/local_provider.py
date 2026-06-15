@@ -484,6 +484,12 @@ class LocalProvider(BaseAIProvider):
             return ""
 
         try:
+            # Race condition guard: self._llm may have been set to None by
+            # unload() between the lock acquisition and this call.
+            if self._llm is None:
+                logger.error("Local model: self._llm is None after lock acquisition (race with unload())")
+                return ""
+
             # Reset KV cache before each call to prevent stale state
             try:
                 self._llm.reset()

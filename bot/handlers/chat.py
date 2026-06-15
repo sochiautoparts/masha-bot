@@ -951,10 +951,15 @@ async def _process_text_message(message: Message, text: str):
                 chat_messages.append({"role": "user", "content": f"Контекст:\n{extra_context}"})
             chat_messages.append({"role": "user", "content": text})
 
+            # Use ROUTE_COMMENT for group/supergroup messages (Local-first for faster responses)
+            # Use ROUTE_CHAT for private messages (full cloud pipeline)
+            is_group = message.chat.type in ("group", "supergroup")
+            route = ROUTE_COMMENT if is_group else ROUTE_CHAT
+
             response = await get_ai_router().chat(
                 messages=chat_messages,
                 use_cache=True,
-                route_type=ROUTE_CHAT,
+                route_type=route,
             )
     except Exception as e:
         logger.error(f"AI router error: {e}")

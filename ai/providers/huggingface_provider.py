@@ -219,6 +219,8 @@ class HuggingFaceProvider(BaseAIProvider):
                                             model=endpoint["name"],
                                             provider=self.name,
                                         )
+                    else:
+                        logger.debug("Gradio Space %s returned 200 but no valid image data", endpoint["name"])
                 elif resp.status == 429:
                     logger.debug("Gradio Space %s rate limited", endpoint["name"])
                 else:

@@ -2,12 +2,12 @@ name: Masha Bot — LOCAL-FIRST v11 — Маша + Редакция + Local-Only
 
 on:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 concurrency:
   group: masha-bot-single
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -51,7 +51,7 @@ env:
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
   # Schedule settings
   NEWS_INTERVAL_MINUTES: "30"
-  CHANNEL_POST_INTERVAL_MINUTES: "30"
+  CHANNEL_POST_INTERVAL_MINUTES: "60"
   PARTNER_POST_INTERVAL_HOURS: "4"
 
 jobs:

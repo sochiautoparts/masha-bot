@@ -73,7 +73,7 @@ _MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # ── Topic Registry ─────────────────────────────────────────────────────────────
 _topic_registry: Dict[str, Dict] = {}
-_REGISTRY_MAX_AGE_HOURS = 24  # Reduced from 72 — too long for focused channel
+_REGISTRY_MAX_AGE_HOURS = 6  # Reduced from 24 — model-level keys like "bmw_m3" block all M3 articles for too long
 
 # BMW-focused brands for entity extraction
 _AUTO_BRANDS = [
@@ -197,6 +197,11 @@ def _is_topic_covered(entity_key: str) -> bool:
     
     IMPORTANT: Brand-only keys (e.g. "bmw") are SKIPPED — they would block
     an entire channel's content. Only compound keys like "bmw_m5" are checked.
+    
+    v8.3: Brand+model keys (e.g. "bmw_m3") use a SHORTER TTL (2 hours)
+    because they block ALL articles about that model. In a BMW-focused channel,
+    multiple M3 articles per day are valid and should not be blocked.
+    Full compound keys (e.g. "bmw_m3_recall") use the full TTL.
     """
     if not entity_key:
         return False
@@ -210,7 +215,21 @@ def _is_topic_covered(entity_key: str) -> bool:
     if not entry:
         return False
     age_hours = (time.time() - entry["last_posted"]) / 3600
-    if age_hours > _REGISTRY_MAX_AGE_HOURS:
+    
+    # Brand+model keys (like "bmw_m3") are still too broad — use shorter TTL
+    # They block ALL articles about that model, which is too aggressive for
+    # a BMW-focused channel where multiple M3/X5/i4 articles per day are normal.
+    key_parts = entity_key.split("_")
+    has_bmw = any(p in ("bmw", "mini", "rolls-royce", "alpina") for p in key_parts)
+    part_count = len(key_parts)
+    # If key is just brand+model (2 parts with BMW, or 3 parts like "bmw_x5_m")
+    # use a much shorter TTL to allow more variety
+    if has_bmw and part_count <= 3:
+        max_age = 2  # 2 hours — enough to avoid same-model spam, but allows multiple M3 posts per day
+    else:
+        max_age = _REGISTRY_MAX_AGE_HOURS  # Full TTL for specific keys like "bmw_m3_recall_s58"
+    
+    if age_hours > max_age:
         del _topic_registry[entity_key]
         return False
     return True

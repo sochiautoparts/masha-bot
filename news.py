@@ -264,18 +264,30 @@ def _filter_curated_images(images: list[str]) -> list[str]:
         if url.startswith('data:'):
             continue
 
-        # ── Google News generic thumbnail ──
-        # Google News articles all use the SAME generic icon:
+        # ── Google News images via googleusercontent.com ──
+        # Google News articles use googleusercontent.com as a CDN proxy for
+        # article images. The URL format is:
         #   https://lh3.googleusercontent.com/...=s0-w300-rw
-        # This is NOT an article image — it's just the Google News logo.
-        # Block ALL googleusercontent images with size markers like =s0-w300-rw
+        # The size suffix (=s0-w300-rw, =w300, etc.) controls the served size,
+        # but the ORIGINAL image may be much larger.
+        # Strategy: Instead of blocking, STRIP the size suffix to get the
+        # full-resolution version. Then the image passes through to download.
         if 'googleusercontent.com' in url_lower:
-            # Size markers in Google image URLs: =s0-w300-rw, =w300, =h200, etc.
-            if re.search(r'=[sw]\d+', url_lower) or re.search(r'-w\d+-rw', url_lower):
-                continue
-            # Also block if it has query params with small dimensions
-            if re.search(r'[?&]w=\d+', url_lower) or re.search(r'[?&]h=\d+', url_lower):
-                continue
+            # Strip Google size parameters to get full-resolution image
+            # =s0-w300-rw → remove to get original
+            # =w300 → remove to get original
+            # =s640 → remove to get original
+            url = re.sub(r'=[sw]\d+[-\w]*$', '', url)
+            url_lower = url.lower()
+            # Also strip from middle of URL (less common but possible)
+            url = re.sub(r'-w\d+-rw', '', url)
+            url_lower = url.lower()
+            # Strip query params with dimensions
+            url = re.sub(r'[?&]w=\d+', '', url)
+            url = re.sub(r'[?&]h=\d+', '', url)
+            url_lower = url.lower()
+            # If URL is now just the base googleusercontent URL without params,
+            # it should serve the original full-size image
 
         # ── Motorsport.com wrong-car images ──
         # motorsport.com images often show wrong cars in filename

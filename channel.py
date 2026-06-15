@@ -1187,7 +1187,7 @@ class ChannelManager:
 
             # Build list of titles to exclude (passed in + any we try and fail)
             tried_titles = list(exclude_titles) if exclude_titles else []
-            max_retries = 5  # Try up to 5 different articles before giving up
+            max_retries = 10  # Try up to 10 different articles — dedup may block several
 
             for attempt in range(max_retries):
                 # Get best news item — pass exclude_titles to avoid re-selecting

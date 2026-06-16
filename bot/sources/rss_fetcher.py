@@ -96,7 +96,7 @@ BMW_RELEVANCE_KEYWORDS: list[str] = [
     "x5", "x7", "x3", "x4", "x1", "x2", "x6",
     "3 series", "5 series", "7 series", "4 series",
     "g20", "g80", "g82", "f90", "g60", "g70",
-    "ix", "i4", "i5", "i7", "ix1", "ix2", "ix3",
+    "ix1", "ix2", "ix3", "i4", "i5", "i7", "i3", "i8", "bmw ix",  # "bmw ix" avoids bare "ix" false positives
     "alpina", "m performance",
     "nürburgring", "nurburgring",
     "interlagos", "individual",

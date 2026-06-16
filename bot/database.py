@@ -354,7 +354,8 @@ class Database:
                         item["image_urls"] = json.loads(item["image_urls"])
                     except (json.JSONDecodeError, TypeError):
                         item["image_urls"] = []
-                elif "image_urls" not in item:
+                elif "image_urls" not in item or not item.get("image_urls"):
+                    # Empty string "" or missing → empty list
                     item["image_urls"] = []
             return items
 
@@ -1096,7 +1097,8 @@ async def get_unposted_news(limit: int = 10) -> list[dict[str, Any]]:
                 item["image_urls"] = json.loads(item["image_urls"])
             except (json.JSONDecodeError, TypeError):
                 item["image_urls"] = []
-        elif "image_urls" not in item:
+        elif "image_urls" not in item or not item.get("image_urls"):
+            # Empty string "" or missing → empty list
             item["image_urls"] = []
     return items
 

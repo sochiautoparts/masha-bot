@@ -47,6 +47,7 @@ _EXTRA_BMW_KEYWORDS: list[str] = [
     "neue klasse", "neueklasse",
     # Electric BMW models
     "ix3", "ix1", "ix2", "i4", "i5", "i7", "i3", "i8", "im3",
+    "bmw ix",  # BMW iX SUV — use "bmw ix" instead of bare "ix" to avoid false positives ("fix", "mix", etc.)
     # BMW Group brands (MINI, Rolls-Royce) — still BMW Group
     "mini cooper", "mini countryman", "rolls-royce",
     # BMW-specific terms

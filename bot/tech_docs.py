@@ -62,7 +62,6 @@ TECH_DOC_SOURCES = {
         "e90post.com",
     ],
     "tsb_recalls": [
-        "nhhtsa.gov",
         "nhtsa.gov",
         "carcomplaints.com",
         "arfc.org",

@@ -138,8 +138,9 @@ class AIRouter:
 
         if response.ok and use_cache:
             self._cache[key] = response
-            # Keep cache bounded
+            # Keep cache bounded — LRU eviction (re-insert moves to end)
             if len(self._cache) > 500:
+                # Remove oldest 100 entries (by insertion/access order)
                 oldest = list(self._cache.keys())[:100]
                 for k in oldest:
                     del self._cache[k]

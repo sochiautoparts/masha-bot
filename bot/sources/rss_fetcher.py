@@ -315,7 +315,7 @@ class BMWRSSFetcher:
         Checks enclosures, media:content, media:thumbnail,
         and <img> tags in content/summary.
         """
-        from .image_fetcher import extract_rss_images, _is_junk_url
+        from .image_fetcher import extract_rss_images
         return extract_rss_images(entry)
 
     def _get_theme_keywords(self, theme_name: str) -> list[str]:

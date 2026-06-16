@@ -466,6 +466,7 @@ class PollinationsProvider(BaseAIProvider):
     ) -> AIResponse | None:
         """Generate image via gen.pollinations.ai with API key."""
         url = f"{GEN_BASE_URL}/v1/images/generations"
+        start = time.monotonic()
 
         for attempt in range(len(self._keys)):
             key = self._get_next_key()
@@ -494,7 +495,7 @@ class PollinationsProvider(BaseAIProvider):
                             b64 = d.get("b64_json", "")
                             img_url = d.get("url", "")
                             if b64 or img_url:
-                                elapsed = (time.monotonic() - (self._last_time or time.monotonic())) * 1000
+                                elapsed = (time.monotonic() - start) * 1000
                                 return AIResponse(
                                     image_b64=b64 or None,
                                     image_url=img_url or None,

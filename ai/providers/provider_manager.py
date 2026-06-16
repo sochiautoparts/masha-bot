@@ -103,6 +103,11 @@ class ProviderManager:
                     #   COMMENT: up to 256 (short group/channel comments — must be fast)
                     # Capped lower than cloud to keep CPU inference fast
                     local_max = min(max_tokens, 1024) if route_type == ROUTE_CHAT else min(max_tokens, 256)
+                    if max_tokens > local_max:
+                        logger.debug(
+                            "Local model token limit: %d → %d (route=%s)",
+                            max_tokens, local_max, route_type,
+                        )
                     result = await self.local.chat(
                         messages=messages,
                         model="local-ruadapt-qwen3-4b",
@@ -415,6 +420,7 @@ class ProviderManager:
             "deepseek-r1": "deepseek",
             "llama": "llama",
             "qwen-coder": "mistral",
+            "searchgpt": "mistral",
         }
         return mapping.get(model)
 

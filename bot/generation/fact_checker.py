@@ -13,8 +13,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from ...ai.router import AIRouter
-from ...ai.providers.pollinations_provider import PollinationsProvider
+from ...ai.router import get_ai_router
 from ...bot.knowledge.bmw_base import (
     BMW_M_MODELS,
     BMW_ENGINES,
@@ -25,7 +24,6 @@ from ...bot.knowledge.bmw_base import (
     get_engine_for_model,
     validate_hp_for_model,
 )
-from ...bot.core.config import get_config
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +31,9 @@ logger = logging.getLogger(__name__)
 class BMWFactChecker:
     """Validates BMW-related claims in generated content."""
 
-    def __init__(self) -> None:
-        self._router: Optional[AIRouter] = None
-
-    def _get_router(self) -> AIRouter:
-        if self._router is None:
-            config = get_config()
-            provider = PollinationsProvider(
-                api_key=config.pollinations_api_key,
-                api_key_2=config.pollinations_api_key_2,
-            )
-            self._router = AIRouter(provider=provider)
-        return self._router
+    def _get_router(self):
+        """Get the global AI router singleton — shares failover chain with main bot."""
+        return get_ai_router()
 
     async def check_post(self, text: str) -> list[dict[str, Any]]:
         """Check a post for BMW-related factual errors.
@@ -237,7 +226,5 @@ class BMWFactChecker:
 
         return []
 
-    async def close(self) -> None:
-        """Clean up resources."""
-        if self._router:
-            await self._router.provider.close()
+    # No close() needed — we use the global router singleton,
+    # which is cleaned up by the main bot lifecycle.

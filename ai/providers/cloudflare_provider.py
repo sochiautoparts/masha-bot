@@ -126,11 +126,16 @@ class CloudflareProvider(BaseAIProvider):
                 return self._accounts[0]
             return None
 
-        # Round-robin among available
-        self._account_index %= len(available)
-        account = available[self._account_index]
-        self._account_index += 1
-        return account
+        # Simple round-robin: increment index mod total accounts,
+        # then find the next available one
+        for _ in range(len(self._accounts)):
+            account = self._accounts[self._account_index % len(self._accounts)]
+            self._account_index += 1
+            if account.is_available:
+                return account
+
+        # Fallback: return first available
+        return available[0]
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:

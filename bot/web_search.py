@@ -315,7 +315,6 @@ PART_SHOPS = [
     "zzap.ru",
     "partcost.ru",
     "avtoall.ru",
-    "autodoc-ru",
     "zapravka.ru",
     "ixora-auto.ru",
     "part-review.ru",
@@ -460,9 +459,9 @@ async def search_google_news_rss(query: str, max_results: int = 5) -> List[Searc
             if response.status_code == 200:
                 feed = feedparser.parse(response.text)
                 for entry in feed.entries[:max_results]:
-                    title = entry.get("title", "").strip()
-                    link = entry.get("link", "").strip()
-                    summary = entry.get("summary", "").strip()
+                    title = getattr(entry, "title", "").strip()
+                    link = getattr(entry, "link", "").strip()
+                    summary = getattr(entry, "summary", "").strip()
                     if title and link:
                         clean_summary = re.sub(r'<[^>]+>', '', summary)[:500]
                         results.append(SearchResult(

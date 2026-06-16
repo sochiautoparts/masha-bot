@@ -4,12 +4,14 @@ Handles news posts, partner posts, scheduled content, reactions,
 media, polls, and internet news search.
 Properly enforces Telegram character limits: 1024 with media, 4096 without.
 
-v7.0 KEY CHANGES:
-- SINGLE NEWS SOURCE: curated news.json replaces ALL RSS feeds + web search
-  - Pre-curated images — no more junk/thumbnail/logo photos!
+v8.0 KEY CHANGES:
+- NEWS SOURCE: bmw-news.json from sochiautoparts/nws (hourly-updated BMW news)
+  - BMW-pre-filtered content from 36 RSS sources
+  - Single image per article (pre-curated, no junk/thumbnail/logo photos!)
   - Direct article URLs — no Google News redirects to resolve
   - Consistent data format, no broken feeds, no rate limits
-- Image pipeline: images from curated news.json → fallback to article scrape
+- Fallback: RSS (15+ feeds) → Web Search when bmw-news.json unavailable
+- Image pipeline: images from bmw-news.json → fallback to article scrape → AI generation
 - Dedup: 5-layer protection (DB unique, fingerprint, semantic Jaccard, entity, title)
 - Support up to 10 media files per Telegram post
 """

@@ -1,15 +1,16 @@
 """News fetching from curated news.json source for masha-bot.
 
-v8.0: MULTI-SOURCE — tries curated news.json first, then falls back to
+v9.0: MULTI-SOURCE — BMW News from sochiautoparts/nws repo, then falls back to
   RSS feeds and web search when news.json is unavailable (404/down).
 
 Source priority:
-  1. Curated news.json (preferred — pre-curated images, consistent format)
+  1. Curated bmw-news.json from sochiautoparts/nws (preferred — BMW-filtered, with images)
   2. RSS fallback (15+ BMW/automotive RSS feeds via BMWRSSFetcher)
   3. Web search fallback (Google News RSS + DDG + SearXNG)
 
-v7.0 was: Single source — news.json only. Broke when repo went 404.
-v8.0: Added RSS + web search fallbacks so the bot never goes silent.
+v8.0 was: Single source from creastudioai-beep/nebm (repo went 404).
+v9.0: Switched to sochiautoparts/nws — hourly-updated BMW news with better filtering.
+      Handles new JSON format: {kind, items: [{id, title, summary, url, image, source, source_url, published}]}
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ── The ONLY news source ──────────────────────────────────────────────────────
-NEWS_JSON_URL = "https://raw.githubusercontent.com/creastudioai-beep/nebm/main/data/news.json"
+NEWS_JSON_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
 
 # Reuse BMW relevance/blocklist keywords from rss_fetcher for any filtering
 from bot.sources.rss_fetcher import (
@@ -96,20 +97,33 @@ def _is_bmw_relevant(text: str) -> bool:
 
 
 async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
-    """Fetch news from the curated news.json file.
+    """Fetch news from the curated bmw-news.json file (sochiautoparts/nws repo).
 
     Returns items with the same field names used throughout the codebase:
       title, url, summary, source, published, category, image_urls, lang, etc.
 
-    Each news.json item has:
-      - title: article headline
-      - url: direct article URL
-      - summary: article excerpt
-      - published: RFC 2822 date string
-      - source: source name (e.g. "BMW Blog")
-      - lang: language code ("en" or "ru")
-      - images: list of direct image URLs — PRE-CURATED, no junk!
-      - fetched_at: ISO timestamp when the JSON was generated
+    The bmw-news.json format (v9.0) is:
+      {
+        "kind": "bmw",
+        "generated_at": "ISO timestamp",
+        "total_items": int,
+        "sources_used": [...],
+        "items": [
+          {
+            "id": "sha256[:16]",
+            "title": "...",
+            "summary": "...",
+            "url": "...",
+            "image": "single_url_or_empty",   ← single string, not list!
+            "source": "BMW Blog",
+            "source_url": "https://bmwblog.com",
+            "published": "ISO 8601"
+          }
+        ]
+      }
+
+    Also supports the old flat-array format from creastudioai-beep/nebm for
+    backward compatibility.
 
     Returns empty list if news.json is unavailable (404, timeout, etc.).
     Callers should fall back to fetch_news_rss_fallback() or
@@ -135,31 +149,70 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
                 return items
 
             data = response.json()
-            if not isinstance(data, list):
-                logger.warning("news.json is not a list: %s", type(data))
+
+            # ── Detect JSON format ──
+            # New format (sochiautoparts/nws): {"kind": "bmw", "items": [...]}
+            # Old format (creastudioai-beep/nebm): [...] (flat array)
+            if isinstance(data, dict) and "items" in data:
+                news_list = data["items"]
+                meta_info = (
+                    f"kind={data.get('kind', '?')}, "
+                    f"total_items={data.get('total_items', '?')}, "
+                    f"generated_at={data.get('generated_at_human', data.get('generated_at', '?'))}"
+                )
+                logger.info("Parsed bmw-news.json (%s)", meta_info)
+            elif isinstance(data, list):
+                # Old format — flat array
+                news_list = data
+                logger.info("Parsed legacy news.json (flat array, %d items)", len(news_list))
+            else:
+                logger.warning("news.json has unexpected format: %s", type(data))
                 return items
 
             skipped_blocklist = 0
             skipped_not_bmw = 0
-            total_raw = len(data)
+            total_raw = len(news_list)
 
-            for entry in data:
+            for entry in news_list:
                 title = entry.get("title", "")
                 url = entry.get("url", "")
                 summary = entry.get("summary", "")
                 published = entry.get("published", "")
                 source_name = entry.get("source", "news_json")
-                lang = entry.get("lang", "en")
-                images = entry.get("images", [])
+
+                # ── Handle image field differences ──
+                # New format: "image" (single string or empty)
+                # Old format: "images" (list of URLs)
+                image_field = entry.get("image", "")
+                images_field = entry.get("images", [])
+
+                if image_field and isinstance(image_field, str) and image_field.startswith("http"):
+                    # New format: single image URL → convert to list
+                    images = [image_field]
+                elif isinstance(images_field, list) and images_field:
+                    # Old format: list of image URLs
+                    images = images_field
+                else:
+                    images = []
+
+                # ── Detect language ──
+                # New format has no "lang" field — detect from content
+                lang = entry.get("lang", "")
+                if not lang:
+                    # Detect Cyrillic characters in title or summary
+                    text_for_lang = f"{title} {summary}"
+                    lang = "ru" if any(
+                        0x0400 <= ord(c) <= 0x04FF for c in text_for_lang
+                    ) else "en"
 
                 # Skip empty entries
                 if not title or not url:
                     continue
 
                 # ── HARD BMW-RELEVANCE FILTER ──
-                # The source news.json contains ~23% non-BMW articles
-                # (Chery, Nissan, Ferrari, Reddit community posts, etc.)
-                # We ONLY allow BMW-relevant content into the pipeline.
+                # Even though sochiautoparts/nws pre-filters for BMW content,
+                # some items may slip through (comparative articles, etc.)
+                # We keep the filter as a safety net.
                 combined = f"{title} {summary}"
 
                 # 1) Blocklist — hard block for junk brands
@@ -181,9 +234,14 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
                 image_urls = _filter_curated_images(images)
 
                 # Compute fingerprint for dedup
-                fingerprint = hashlib.sha256(
-                    (title + url).encode()
-                ).hexdigest()[:16]
+                # Prefer the item's "id" field if available (sochiautoparts/nws format)
+                item_id = entry.get("id", "")
+                if item_id:
+                    fingerprint = item_id
+                else:
+                    fingerprint = hashlib.sha256(
+                        (title + url).encode()
+                    ).hexdigest()[:16]
 
                 # Check if urgent
                 is_urgent = any(kw.lower() in combined for kw in URGENT_BMW_KEYWORDS)
@@ -206,6 +264,8 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
                     "is_urgent": is_urgent,
                     # Keep the raw images list too for reference
                     "_raw_images": images,
+                    # Store source_url from new format for reference
+                    "_source_url": entry.get("source_url", ""),
                 })
 
             # Sort by published date (newest first)
@@ -407,23 +467,29 @@ def _has_dimension_suffix(url: str) -> bool:
 def _parse_published_time(published: str) -> float:
     """Parse a published date string to Unix timestamp.
 
-    Supports RFC 2822 format from news.json:
-      "Sat, 13 Jun 2026 16:50:40 +0000"
+    Supports:
+      - ISO 8601 format (primary, from sochiautoparts/nws):
+          "2026-06-16T12:50:20+00:00"
+          "2026-06-16T12:50:20Z"
+      - RFC 2822 format (legacy, from old creastudioai-beep/nebm):
+          "Sat, 13 Jun 2026 16:50:40 +0000"
     """
     if not published:
         return 0
+    # Try ISO 8601 first (primary format from sochiautoparts/nws)
+    try:
+        dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        pass
+    # Try RFC 2822 as fallback (legacy format)
     try:
         from email.utils import parsedate_to_datetime
         dt = parsedate_to_datetime(published)
         return dt.timestamp()
     except Exception:
         pass
-    try:
-        # Try ISO format as fallback
-        dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-        return dt.timestamp()
-    except Exception:
-        return 0
+    return 0
 
 
 def is_urgent(text: str) -> bool:
@@ -611,19 +677,19 @@ async def fetch_news_multi_source(limit: int = 500) -> list[dict[str, Any]]:
     """Fetch news with multi-source fallback chain.
 
     Priority:
-      1. Curated news.json (preferred — best data quality)
+      1. Curated bmw-news.json from sochiautoparts/nws (preferred — BMW-filtered)
       2. RSS feeds (15+ BMW/automotive sources)
       3. Web search (Google News RSS + DDG + SearXNG)
 
     Returns items in the same format as fetch_news_json().
     """
-    # Source 1: Curated news.json
+    # Source 1: Curated bmw-news.json
     items = await fetch_news_json(limit=limit)
     if items:
-        logger.info("Multi-source: using news.json (%d items)", len(items))
+        logger.info("Multi-source: using bmw-news.json (%d items)", len(items))
         return items
 
-    logger.warning("news.json returned 0 items — trying RSS fallback")
+    logger.warning("bmw-news.json returned 0 items — trying RSS fallback")
 
     # Source 2: RSS feeds
     items = await fetch_news_rss_fallback(limit=limit)

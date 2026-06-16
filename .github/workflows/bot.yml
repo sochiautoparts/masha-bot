@@ -1,4 +1,4 @@
-name: Masha Bot — LOCAL-FIRST v12 — Multi-Source News + Stable Workflow
+name: Masha Bot — LOCAL-FIRST v13 — BMW News from sochiautoparts/nws
 
 on:
   schedule:
@@ -164,8 +164,8 @@ jobs:
 
       - name: Run Masha Bot with auto-restart
         run: |
-          echo "=== Starting Masha Bot v12.0 — Multi-Source News + Stable Workflow ==="
-          echo "NEWS SOURCES: news.json → RSS (15+ feeds) → Web Search (Google News + DDG + SearXNG)"
+          echo "=== Starting Masha Bot v13.0 — BMW News from sochiautoparts/nws ==="
+          echo "NEWS SOURCES: bmw-news.json (sochiautoparts/nws) → RSS (15+ feeds) → Web Search"
           echo "ARCHITECTURE: Local-First 5-Level Failover + Local-Only Post Fallback"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
           echo ""

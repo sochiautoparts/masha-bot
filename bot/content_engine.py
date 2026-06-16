@@ -669,11 +669,11 @@ async def ai_discover_news() -> List[Dict]:
 async def search_auto_news() -> List[Dict]:
     """Fetch automotive/BMW news with multi-source fallback.
 
-    v8.0: MULTI-SOURCE — tries curated news.json first, then falls back
-    to RSS feeds and web search when news.json is unavailable.
+    v9.0: MULTI-SOURCE — tries curated bmw-news.json first, then falls back
+    to RSS feeds and web search when bmw-news.json is unavailable.
 
     Source priority:
-      1. Curated news.json (preferred — best images, consistent format)
+      1. Curated bmw-news.json from sochiautoparts/nws (preferred — BMW-filtered, with images)
       2. RSS feeds (15+ BMW/automotive sources via BMWRSSFetcher)
       3. Web search (Google News RSS + DDG + SearXNG)
 

@@ -423,7 +423,7 @@ async def main():
     dp.shutdown.register(on_shutdown)
 
     # Run polling
-    logger.info("=== Masha Bot Starting (v10.0 — LOCAL-FIRST Multi-Provider) ===")
+    logger.info("=== Masha Bot Starting (v13.0 — LOCAL-FIRST Multi-Provider, BMW News from sochiautoparts/nws) ===")
     try:
         await dp.start_polling(bot)
     except KeyboardInterrupt:

@@ -1,20 +1,15 @@
 """News fetching from curated news.json source for masha-bot.
 
-v7.0: SINGLE SOURCE — loads news ONLY from the curated news.json file:
-  https://raw.githubusercontent.com/creastudioai-beep/nebm/refs/heads/main/data/news.json
+v8.0: MULTI-SOURCE — tries curated news.json first, then falls back to
+  RSS feeds and web search when news.json is unavailable (404/down).
 
-This file is regularly updated with fresh BMW/automotive news, each item
-includes title, url, summary, images[], source, lang, published date.
+Source priority:
+  1. Curated news.json (preferred — pre-curated images, consistent format)
+  2. RSS fallback (15+ BMW/automotive RSS feeds via BMWRSSFetcher)
+  3. Web search fallback (Google News RSS + DDG + SearXNG)
 
-BENEFITS over RSS:
-  - Images are pre-curated (no more junk/thumbnail/logo photos!)
-  - No broken RSS feeds, no 404s, no rate limits
-  - Consistent data format
-  - Direct article URLs (no Google News redirects)
-  - Language detection included
-
-v6.0 was: Replaced Reddit feeds with TopGear. Saved image_urls to DB.
-v7.0: Complete rewrite — single curated source replaces all RSS + web search.
+v7.0 was: Single source — news.json only. Broke when repo went 404.
+v8.0: Added RSS + web search fallbacks so the bot never goes silent.
 """
 
 from __future__ import annotations
@@ -115,6 +110,10 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
       - lang: language code ("en" or "ru")
       - images: list of direct image URLs — PRE-CURATED, no junk!
       - fetched_at: ISO timestamp when the JSON was generated
+
+    Returns empty list if news.json is unavailable (404, timeout, etc.).
+    Callers should fall back to fetch_news_rss_fallback() or
+    fetch_news_multi_source() for automatic fallback.
     """
     items: list[dict[str, Any]] = []
 
@@ -129,7 +128,10 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
         ) as client:
             response = await client.get(NEWS_JSON_URL)
             if response.status_code != 200:
-                logger.warning("news.json returned status %d", response.status_code)
+                logger.warning(
+                    "news.json returned status %d — will need fallback",
+                    response.status_code,
+                )
                 return items
 
             data = response.json()
@@ -430,21 +432,233 @@ def is_urgent(text: str) -> bool:
     return any(kw.lower() in text_lower for kw in URGENT_BMW_KEYWORDS)
 
 
-async def run_news_cycle() -> int:
-    """Run one news fetch cycle — load from news.json, store to DB.
+async def fetch_news_rss_fallback(limit: int = 200) -> list[dict[str, Any]]:
+    """Fetch news from RSS feeds as a fallback when news.json is unavailable.
 
+    Uses the existing BMWRSSFetcher class with 15+ BMW/automotive RSS sources.
+    Converts RSS items to the same format as news.json items so downstream
+    pipeline code works without modification.
+    """
+    items: list[dict[str, Any]] = []
+
+    try:
+        from bot.database import _get_db
+        from bot.sources.rss_fetcher import BMWRSSFetcher
+
+        db = _get_db()
+        fetcher = BMWRSSFetcher(db)
+        try:
+            rss_items = await fetcher._fetch_all_sources()
+        finally:
+            await fetcher.close()
+
+        for entry in rss_items:
+            title = entry.get("title", "")
+            url = entry.get("url", "")
+            summary = entry.get("summary", "")
+            published = entry.get("published", "")
+            source_name = entry.get("source", "rss")
+            image_urls = entry.get("image_urls", []) or []
+
+            # Skip empty entries
+            if not title or not url:
+                continue
+
+            # ── BMW-RELEVANCE FILTER (same as news.json path) ──
+            combined = f"{title} {summary}"
+            combined_lower = combined.lower()
+
+            if any(bl in combined_lower for bl in BMW_BLOCKLIST):
+                logger.debug(f"RSS blocked by blocklist: {title[:60]}")
+                continue
+
+            if not _is_bmw_relevant(combined):
+                logger.debug(f"RSS skipped (not BMW-relevant): {title[:60]}")
+                continue
+
+            # Ensure image_urls is always a list
+            if not isinstance(image_urls, list):
+                image_urls = []
+
+            # Compute fingerprint (same method as news.json items)
+            fingerprint = hashlib.sha256(
+                (title + url).encode()
+            ).hexdigest()[:16]
+
+            # Check urgency (same method as news.json items)
+            is_urgent_flag = any(kw.lower() in combined for kw in URGENT_BMW_KEYWORDS)
+
+            # Parse published time (same method as news.json items)
+            published_time = _parse_published_time(str(published) if published else "")
+
+            # Determine language from source
+            lang = "ru" if any(
+                ru_marker in source_name.lower()
+                for ru_marker in ["ru", "russian", "русск"]
+            ) else "en"
+
+            items.append({
+                "source": f"rss:{source_name}",
+                "title": title,
+                "summary": summary[:500] if summary else "",
+                "url": url,
+                "published": str(published) if published else "",
+                "published_time": published_time,
+                "category": "auto",
+                "content_type": "news+reaction",
+                "fingerprint": fingerprint,
+                "image_urls": image_urls,
+                "lang": lang,
+                "is_urgent": is_urgent_flag,
+            })
+
+        # Sort by published date (newest first)
+        items.sort(key=lambda x: x.get("published_time", 0), reverse=True)
+
+        logger.info(
+            "RSS fallback: loaded %d items from %d RSS sources",
+            len(items), len(rss_items) if rss_items else 0,
+        )
+
+    except Exception as exc:
+        logger.error("RSS fallback error: %s", exc)
+
+    return items[:limit]
+
+
+async def fetch_news_web_search_fallback(limit: int = 100) -> list[dict[str, Any]]:
+    """Fetch news from web search as a last-resort fallback.
+
+    Uses Google News RSS, DDG, and SearXNG from bot.web_search.
+    Converts search results to the same format as news.json items.
+    """
+    items: list[dict[str, Any]] = []
+
+    try:
+        from bot.web_search import search_news, SearchResult
+
+        # Search both English and Russian BMW news
+        queries = [
+            "BMW news latest",
+            "BMW M Power news",
+            "BMW новости",
+            "BMW M новости",
+        ]
+
+        seen_urls: set[str] = set()
+
+        for query in queries:
+            try:
+                results: list[SearchResult] = await search_news(query, max_results=10)
+                for r in results:
+                    if not r.title or not r.url:
+                        continue
+                    # Dedup by URL
+                    if r.url in seen_urls:
+                        continue
+                    seen_urls.add(r.url)
+
+                    combined = f"{r.title} {r.snippet}"
+                    combined_lower = combined.lower()
+
+                    # BMW relevance check
+                    if any(bl in combined_lower for bl in BMW_BLOCKLIST):
+                        continue
+                    if not _is_bmw_relevant(combined):
+                        continue
+
+                    fingerprint = hashlib.sha256(
+                        (r.title + r.url).encode()
+                    ).hexdigest()[:16]
+
+                    is_urgent_flag = any(kw.lower() in combined for kw in URGENT_BMW_KEYWORDS)
+
+                    # Determine language from query
+                    lang = "ru" if any(
+                        ord(c) > 0x0400 for c in r.title  # Cyrillic chars
+                    ) else "en"
+
+                    items.append({
+                        "source": f"web:{r.source}",
+                        "title": r.title,
+                        "summary": r.snippet[:500] if r.snippet else "",
+                        "url": r.url,
+                        "published": "",
+                        "published_time": time.time(),  # Fresh from web search
+                        "category": "auto",
+                        "content_type": "news+reaction",
+                        "fingerprint": fingerprint,
+                        "image_urls": [],  # No images from web search
+                        "lang": lang,
+                        "is_urgent": is_urgent_flag,
+                    })
+            except Exception as exc:
+                logger.debug("Web search query '%s' failed: %s", query, exc)
+                continue
+
+        # Sort newest first (web search results have same timestamp)
+        items.sort(key=lambda x: x.get("published_time", 0), reverse=True)
+
+        logger.info("Web search fallback: loaded %d items", len(items))
+
+    except Exception as exc:
+        logger.error("Web search fallback error: %s", exc)
+
+    return items[:limit]
+
+
+async def fetch_news_multi_source(limit: int = 500) -> list[dict[str, Any]]:
+    """Fetch news with multi-source fallback chain.
+
+    Priority:
+      1. Curated news.json (preferred — best data quality)
+      2. RSS feeds (15+ BMW/automotive sources)
+      3. Web search (Google News RSS + DDG + SearXNG)
+
+    Returns items in the same format as fetch_news_json().
+    """
+    # Source 1: Curated news.json
+    items = await fetch_news_json(limit=limit)
+    if items:
+        logger.info("Multi-source: using news.json (%d items)", len(items))
+        return items
+
+    logger.warning("news.json returned 0 items — trying RSS fallback")
+
+    # Source 2: RSS feeds
+    items = await fetch_news_rss_fallback(limit=limit)
+    if items:
+        logger.info("Multi-source: using RSS fallback (%d items)", len(items))
+        return items
+
+    logger.warning("RSS fallback returned 0 items — trying web search fallback")
+
+    # Source 3: Web search
+    items = await fetch_news_web_search_fallback(limit=limit)
+    if items:
+        logger.info("Multi-source: using web search fallback (%d items)", len(items))
+        return items
+
+    logger.error("All news sources failed — no items available")
+    return []
+
+
+async def run_news_cycle() -> int:
+    """Run one news fetch cycle — load from multiple sources, store to DB.
+
+    Uses multi-source fallback: news.json → RSS → web search.
     Returns the number of new items added.
     """
     try:
         from bot.database import _get_db
         db = _get_db()
 
-        items = await fetch_news_json(limit=500)
+        items = await fetch_news_multi_source(limit=500)
         new_count = 0
 
         for item in items:
             try:
-                image_urls = item.get("image_urls", [])
+                image_urls = item.get("image_urls", []) or []
 
                 added = await db.add_news_item(
                     source=item.get("source", "news_json"),
@@ -467,7 +681,7 @@ async def run_news_cycle() -> int:
                 logger.debug("Failed to store news item: %s", exc)
 
         if new_count > 0:
-            logger.info("News cycle: %d new items out of %d from news.json", new_count, len(items))
+            logger.info("News cycle: %d new items out of %d", new_count, len(items))
         else:
             logger.info("News cycle: 0 new items (all already in DB)")
 

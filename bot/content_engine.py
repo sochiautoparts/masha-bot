@@ -667,26 +667,26 @@ async def ai_discover_news() -> List[Dict]:
 
 
 async def search_auto_news() -> List[Dict]:
-    """Fetch automotive/BMW news from the curated news.json source.
+    """Fetch automotive/BMW news with multi-source fallback.
 
-    v7.0: SINGLE SOURCE — loads ONLY from the curated news.json file.
-    This replaces all RSS feeds, web search, and Google News RSS.
+    v8.0: MULTI-SOURCE — tries curated news.json first, then falls back
+    to RSS feeds and web search when news.json is unavailable.
 
-    The curated news.json provides:
-    - Pre-curated image URLs (no more junk/thumbnail/logo photos!)
-    - Direct article URLs (no Google News redirects to resolve)
-    - Language detection already included
-    - Consistent, reliable data format
+    Source priority:
+      1. Curated news.json (preferred — best images, consistent format)
+      2. RSS feeds (15+ BMW/automotive sources via BMWRSSFetcher)
+      3. Web search (Google News RSS + DDG + SearXNG)
 
-    No more: broken RSS feeds, 404 errors, rate limits, Google redirects.
+    This ensures the bot never goes silent even if the primary source
+    goes down (404/timeout/etc).
     """
     try:
-        from news import fetch_news_json
-        items = await fetch_news_json(limit=500)
-        logger.info(f"Loaded {len(items)} items from curated news.json")
+        from news import fetch_news_multi_source
+        items = await fetch_news_multi_source(limit=500)
+        logger.info(f"Loaded {len(items)} items via multi-source fallback")
         return items
     except Exception as e:
-        logger.error(f"Curated news.json fetch failed: {e}")
+        logger.error(f"Multi-source news fetch failed: {e}")
         return []
 
 

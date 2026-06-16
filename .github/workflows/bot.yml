@@ -191,10 +191,14 @@ jobs:
             echo "ENABLE_LOCAL_MODEL=false" >> $GITHUB_ENV
           fi
 
-          # v14: limited restart count (was 10 — too many, fed the cancel loop).
-          # 3 retries is enough to recover from a transient crash; if the bot
-          # keeps crashing, the hourly cron will start a fresh run soon anyway.
-          MAX_RESTARTS=3
+          # v14.1: ONE bot run per workflow (was 3 — but with a 55-min bot
+          # timeout and 65-min workflow timeout, the 2nd/3rd restarts were
+          # always killed by the workflow timeout, producing a misleading
+          # "cancelled" conclusion even though the first run posted fine).
+          # With MAX_RESTARTS=1 the bot runs once for ~55 min, the loop exits
+          # cleanly, Save DB runs, and the run concludes "success". If the bot
+          # crashes, the hourly cron starts a fresh run within the hour.
+          MAX_RESTARTS=1
           RESTART_COUNT=0
 
           while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do

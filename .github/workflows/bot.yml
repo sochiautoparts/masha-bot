@@ -1,12 +1,19 @@
-name: Masha Bot — LOCAL-FIRST v13 — BMW News from sochiautoparts/nws
+name: Masha Bot — LOCAL-FIRST v14 — BMW News from sochiautoparts/nws
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    # v14: hourly cron — provides a fresh run every hour as a safety net.
+    # The bot runs ~55 min per cycle (5 news + 1 partner post), then exits
+    # before the next cron fires. No self-re-dispatch (was causing a cancel
+    # loop with cancel-in-progress: false).
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: masha-bot-single
+  # v14: keep false — never interrupt a running bot mid-post.
+  # With hourly cron + 55-min timeout there is no overlap, so no queue
+  # buildup and no cancel loop.
   cancel-in-progress: false
 
 permissions:
@@ -49,7 +56,10 @@ env:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # v14: 65 min — allows ~5 min setup + 55 min bot run + 5 min save/cleanup.
+    # Was 330 min (5.5h) which overlapped with the 3-hour cron and fed the
+    # cancel loop.
+    timeout-minutes: 65
 
     steps:
       - name: Checkout repository
@@ -162,11 +172,12 @@ jobs:
             sed -i '/masha_bot\.db/d' .gitignore
           fi
 
-      - name: Run Masha Bot with auto-restart
+      - name: Run Masha Bot
         run: |
-          echo "=== Starting Masha Bot v13.0 — BMW News from sochiautoparts/nws ==="
+          echo "=== Starting Masha Bot v14.0 — BMW News from sochiautoparts/nws ==="
           echo "NEWS SOURCES: bmw-news.json (sochiautoparts/nws) → RSS (15+ feeds) → Web Search"
-          echo "ARCHITECTURE: Local-First 5-Level Failover + Local-Only Post Fallback"
+          echo "ARCHITECTURE: Local-First 5-Level Failover + Local-Only Post Fallback + Evergreen Fallback"
+          echo "WORKFLOW: hourly cron, 55-min run, no self-re-dispatch (fixes cancel loop)"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
           echo ""
 
@@ -180,42 +191,38 @@ jobs:
             echo "ENABLE_LOCAL_MODEL=false" >> $GITHUB_ENV
           fi
 
-          MAX_RESTARTS=10
+          # v14: limited restart count (was 10 — too many, fed the cancel loop).
+          # 3 retries is enough to recover from a transient crash; if the bot
+          # keeps crashing, the hourly cron will start a fresh run soon anyway.
+          MAX_RESTARTS=3
           RESTART_COUNT=0
 
           while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
             echo "=== Bot start attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS ==="
 
-            timeout 18000 python -m bot.main || EXIT_CODE=$?
-            EXIT_CODE=${EXIT_CODE:-0}
+            # v14: RESET EXIT_CODE before each run (was not reset — a previous
+            # crash code leaked into the next iteration's logic, misclassifying
+            # successful runs as crashes).
+            EXIT_CODE=0
+            timeout 3300 python -m bot.main || EXIT_CODE=$?
 
             echo "Bot exited with code: $EXIT_CODE"
 
-            # Check if this run was cancelled by concurrency
-            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-              # Check if there's a newer pending run — if so, don't restart
-              PENDING=$(curl -s -H "Authorization: token ${{ secrets.GH_PAT_TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/runs?status=waiting&per_page=1" | \
-                python3 -c "import json,sys; print(len(json.load(sys.stdin).get('workflow_runs',[])))" 2>/dev/null || echo 0)
-              if [ "$PENDING" -gt 0 ]; then
-                echo "Another run is waiting — exiting to avoid queue buildup"
-                break
-              fi
+            # Exit code 0 = normal exit, 124 = timeout (both OK, just restart)
+            if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
+              echo "Bot process ended (timeout or normal exit)"
+            else
+              echo "Bot crashed with error code $EXIT_CODE"
             fi
 
-            if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
-              echo "Bot process ended (timeout or normal exit), restarting..."
-              RESTART_COUNT=$((RESTART_COUNT + 1))
-              sleep 5
-            else
-              echo "Bot crashed with error code $EXIT_CODE, restarting..."
-              RESTART_COUNT=$((RESTART_COUNT + 1))
+            RESTART_COUNT=$((RESTART_COUNT + 1))
+            # Brief pause before retry to avoid hammering on a crash loop
+            if [ $RESTART_COUNT -lt $MAX_RESTARTS ]; then
               sleep 10
             fi
           done
 
-          echo "Max restarts reached or stopping — will save DB and re-dispatch."
+          echo "Bot run complete ($RESTART_COUNT attempts). Hourly cron will start the next run."
 
       - name: Save database
         if: always()
@@ -229,18 +236,9 @@ jobs:
             git push || true
           fi
 
-      - name: Re-dispatch workflow for 24/7 operation
-        if: always()
-        run: |
-          # Only re-dispatch if this was a scheduled or manual run, not if cancelled
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Re-dispatching workflow for continuous operation..."
-            sleep 30
-            curl -X POST \
-              -H "Authorization: token ${{ secrets.GH_PAT_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/sochiautoparts/masha-bot/actions/workflows/bot.yml/dispatches" \
-              -d '{"ref":"main"}' || echo "Re-dispatch failed, will retry on next schedule"
-          else
-            echo "Skipping re-dispatch (not a scheduled or manual trigger)"
-          fi
+      # v14: REMOVED "Re-dispatch workflow" step.
+      # The old self-re-dispatch + cancel-in-progress: false caused an infinite
+      # cancel loop: each run's re-dispatch created a queued run that cancelled
+      # the previous queued run, and the in-progress run's PENDING check broke
+      # the bot loop early — so the bot never ran for its full timeout and no
+      # posts were made. Hourly cron now provides scheduling instead.

@@ -1189,14 +1189,32 @@ class ChannelManager:
 
             # Build list of titles to exclude (passed in + any we try and fail)
             tried_titles = list(exclude_titles) if exclude_titles else []
-            max_retries = 10  # Try up to 10 different articles — dedup may block several
+            max_retries = 10  # Try up to 10 different articles — dedup/AI may block several
+
+            # v14.0 FIX: Restructured loop — AI text generation now happens INSIDE the loop
+            # so that if generation fails for one item, the next item is tried (was: returned
+            # False immediately, causing the bot to retry the SAME highest-scoring item
+            # forever). Also: when get_best_news_item returns None (no items / all posted),
+            # we now fall through to the evergreen fallback instead of returning False
+            # (was: bot went silent for hours when the 71-item news pool was exhausted).
+
+            selected_item: Optional[Dict] = None
+            post_text: Optional[str] = None
+            image_data_list: list = []
+            image_source: str = ""
+            has_media: bool = False
+            media_count: int = 0
+            resolved_url: str = ""
+            entity_key: str = ""
 
             for attempt in range(max_retries):
                 # Get best news item — pass exclude_titles to avoid re-selecting
                 news_item = await get_best_news_item(exclude_titles=tried_titles)
                 if not news_item:
-                    logger.info("No suitable news item found after exclusions")
-                    return False
+                    # No items available (HTTP fail or all 71 URLs already posted)
+                    # — break out and try evergreen fallback below
+                    logger.info("No suitable news item found after exclusions — will try evergreen fallback")
+                    break
 
                 title = news_item.get("title", "")
                 source_url = news_item.get("url", "")
@@ -1229,34 +1247,56 @@ class ChannelManager:
                     tried_titles.append(title)
                     continue
 
-                # Found a non-duplicate item! Proceed with posting.
-                break
+                # Found a non-duplicate item! Now try to actually generate the post text.
+                # v7.0: news.json URLs are already direct — no need to resolve Google News redirects.
+                # Only resolve if the URL is actually a Google redirect (rare for news.json).
+                resolved_url = source_url
+                if source_url and 'news.google.com' in source_url:
+                    resolved_url = await self._resolve_article_url(source_url, title=title)
+                    news_item["_resolved_url"] = resolved_url
+
+                # v4.0: Get images FIRST so AI knows the char limit (1024 with media, 4096 without)
+                image_data_list, image_source = await self._get_post_images(news_item, resolved_url=resolved_url)
+                has_media = len(image_data_list) > 0
+                media_count = len(image_data_list) if has_media else 0
+
+                # Generate post text — now knows about media attachment, uses pre-resolved URL
+                attempt_text = await self._generate_post_text(
+                    news_item, has_media=has_media, media_count=media_count, resolved_url=resolved_url
+                )
+
+                if attempt_text:
+                    # Success! Keep this item and its generated text.
+                    selected_item = news_item
+                    post_text = attempt_text
+                    break
+
+                # AI generation failed for THIS item — add to tried_titles so the next
+                # iteration picks a DIFFERENT article (was: returned False, same item
+                # retried forever on the next cycle).
+                logger.info(
+                    f"AI generation failed for (attempt {attempt+1}): {title[:60]} — trying next item"
+                )
+                tried_titles.append(title)
+                continue
             else:
                 # All retries exhausted — try evergreen/BMW fact fallback
-                logger.info(f"All {max_retries} attempts blocked by dedup, trying evergreen fallback")
+                logger.info(f"All {max_retries} attempts blocked by dedup or AI failure, trying evergreen fallback")
+
+            # ── EVERGREEN FALLBACK ──
+            # Reached when: (a) get_best_news_item returned None (no items available),
+            # (b) all 10 attempts were deduped, or (c) all 10 attempts failed AI generation.
+            # In ALL these cases the bot previously returned False and went silent for
+            # hours. Now we fall through to evergreen content so the channel keeps
+            # receiving posts.
+            if not selected_item or not post_text:
+                logger.info("Trying evergreen fallback (no news item could be posted)")
                 evergreen_result = await self._post_evergreen_fallback()
                 if evergreen_result:
                     return evergreen_result
                 return False
 
-            # v7.0: news.json URLs are already direct — no need to resolve Google News redirects.
-            # Only resolve if the URL is actually a Google redirect (rare for news.json).
-            resolved_url = source_url
-            if source_url and 'news.google.com' in source_url:
-                resolved_url = await self._resolve_article_url(source_url, title=title)
-                news_item["_resolved_url"] = resolved_url
-
-            # v4.0: Get images FIRST so AI knows the char limit (1024 with media, 4096 without)
-            image_data_list, image_source = await self._get_post_images(news_item, resolved_url=resolved_url)
-            has_media = len(image_data_list) > 0
-            media_count = len(image_data_list) if has_media else 0
-
-            # Generate post text — now knows about media attachment, uses pre-resolved URL
-            post_text = await self._generate_post_text(
-                news_item, has_media=has_media, media_count=media_count, resolved_url=resolved_url
-            )
-            if not post_text:
-                return False
+            news_item = selected_item
 
             # Clean and validate
             post_text = _clean_post_text(post_text)

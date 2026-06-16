@@ -478,9 +478,15 @@ class LocalProvider(BaseAIProvider):
         cause segfaults (exit code 139). We use a global lock to ensure
         only one generation runs at a time.
         """
-        acquired = _llama_lock.acquire(timeout=120)  # Wait up to 2 min
+        # v14.0 FIX: increased lock timeout from 120s → 300s.
+        # RuadaptQwen3-4B on CPU generates ~5-10 tokens/sec, so 1024 tokens can
+        # take up to ~200s. The old 120s timeout was shorter than a worst-case
+        # generation, which caused concurrent callers to timeout, increment
+        # _consecutive_errors, and trip the circuit breaker — disabling the
+        # local model exactly when it was needed most. 300s gives a safe margin.
+        acquired = _llama_lock.acquire(timeout=300)  # Wait up to 5 min
         if not acquired:
-            logger.error("Local model: could not acquire lock (timeout 120s)")
+            logger.error("Local model: could not acquire lock (timeout 300s)")
             return ""
 
         try:

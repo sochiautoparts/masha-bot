@@ -117,21 +117,22 @@ jobs:
       - name: Create data directory
         run: mkdir -p data models
 
-      - name: Download Admitad partner data
+      - name: Download partner data (partners.json)
         run: |
           mkdir -p data
-          # Try downloading admitad data — don't save if the URL returns an error
-          HTTP_CODE=$(curl -sL -o /tmp/admitad_check.json -w "%{http_code}" "https://raw.githubusercontent.com/creastudioai-beep/pr/main/data/admitad_ads.json")
+          # Download partners.json from sochiautoparts.ru (the single source of truth)
+          HTTP_CODE=$(curl -sL -o /tmp/partners_check.json -w "%{http_code}" "https://sochiautoparts.ru/partners.json")
           if [ "$HTTP_CODE" = "200" ]; then
-            # Validate it's actually JSON (not an error page)
-            if python3 -c "import json; json.load(open('/tmp/admitad_check.json'))" 2>/dev/null; then
-              cp /tmp/admitad_check.json data/admitad_ads.json
-              echo "Admitad data downloaded successfully"
+            # Validate it's actually JSON with a `campaigns` array
+            if python3 -c "import json,sys; d=json.load(open('/tmp/partners_check.json')); assert isinstance(d.get('campaigns'), list) and d['campaigns'], 'no campaigns'" 2>/dev/null; then
+              cp /tmp/partners_check.json data/partners.json
+              CAMPAIGNS=$(python3 -c "import json; print(len(json.load(open('data/partners.json'))['campaigns']))")
+              echo "Partner data downloaded successfully: $CAMPAIGNS campaigns"
             else
-              echo "WARNING: Downloaded file is not valid JSON, skipping"
+              echo "WARNING: Downloaded file is not valid partners.json, skipping"
             fi
           else
-            echo "Failed to download admitad data (HTTP $HTTP_CODE), partner posts will be skipped"
+            echo "Failed to download partners.json (HTTP $HTTP_CODE), partner posts will be skipped"
           fi
 
       - name: Restore database cache
@@ -253,7 +254,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # Database
           DB_PATH: masha_bot.db
-          ADMITAD_ADS_FILE: data/admitad_ads.json
+          ADMITAD_ADS_FILE: data/partners.json
           LOG_LEVEL: INFO
           # Schedule settings — aligned with asya-bot intervals
           NEWS_FETCH_INTERVAL: 900      # 15 min

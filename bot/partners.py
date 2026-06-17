@@ -1,19 +1,23 @@
 """
-Admitad Partner Program Integration v3.0 — Masha Bot Edition
+Partner Program Integration v4.0 — Masha Bot Edition
 
-Loads partner data from remote admitad_ads.json (updateable file!).
+Loads partner data from remote partners.json (updateable file!).
+Source: https://sochiautoparts.ru/partners.json
 Uses goto_link EXACTLY as-is — no subid additions, no modifications.
 The goto_links are ready for both posts and user dialogs.
 
-Key features from Asya-bot integration:
-- Downloads admitad_ads.json from remote GitHub URL
+Key features:
+- Downloads partners.json from sochiautoparts.ru (NEW SOURCE)
 - Auto-refreshes every 6 hours (file is updateable!)
 - Uses goto_link EXACTLY as provided — NO subid additions
-- Regional filtering by allowed_regions
-- For article searches, modifies ulp parameter in goto_link
+- Regional filtering by the `regions` field ("00" = worldwide)
+- Logo extraction from the `logo` field for partner post images
+- Maps the human-readable `categories` array to internal category keys
+  (autoparts, tires, tools, autoinsurance, checkauto, autorent, coupons, other)
+  via a reliable domain-based mapping with a category-name fallback
 - Proper formatting: "Name (category description): goto_link"
 - BMW-friendly category descriptions
-- Keyword matching across categories
+- Keyword + domain matching across categories
 - Partner context generation for AI
 
 Masha's BMW persona voice preserved in all templates.
@@ -36,12 +40,10 @@ from .core.config import get_config, get_persona
 
 logger = logging.getLogger(__name__)
 
-# Remote admitad_ads.json URL (updateable file!)
-ADMITAD_JSON_URL = (
-    "https://raw.githubusercontent.com/creastudioai-beep/pr/main/data/admitad_ads.json"
-)
-ADMITAD_LOCAL_CACHE = "data/admitad_ads.json"
-ADMITAD_REFRESH_INTERVAL = 6 * 3600  # Refresh every 6 hours
+# Remote partners.json URL (updateable file!) — sochiautoparts.ru source
+PARTNERS_JSON_URL = "https://sochiautoparts.ru/partners.json"
+PARTNERS_LOCAL_CACHE = "data/partners.json"
+PARTNERS_REFRESH_INTERVAL = 6 * 3600  # Refresh every 6 hours
 
 # Default region for partner filtering
 DEFAULT_REGION = "RU"
@@ -50,9 +52,55 @@ DEFAULT_REGION = "RU"
 
 PARTNER_ORDER = ["Rossko", "Autopiter", "AvtoALL"]
 
+# ── Domain → internal category mapping ────────────────────────────────────────
+# Maps partner site domains to internal category keys used by the bot.
+# This is the most reliable mapping since partners.json `categories` are
+# human-readable Russian strings that are often too generic
+# (e.g. "Интернет-магазины" appears on almost every campaign).
+DOMAIN_CATEGORY_MAP: Dict[str, List[str]] = {
+    "rossko.ru": ["autoparts"],
+    "autopiter.ru": ["autoparts"],
+    "autopiter.kz": ["autoparts"],
+    "avtoall.ru": ["autoparts", "tools"],
+    "mirdvornikov.ru": ["autoparts"],
+    "lukoil-shop.com": ["autoparts"],
+    "hyperauto.ru": ["autoparts", "checkauto"],
+    "koleso.ru": ["autoparts", "tires"],
+    "euro-diski.ru": ["tires"],
+    "bs-tyres.ru": ["tires"],
+    "avtocod.ru": ["checkauto"],
+    "petrolplus.ru": ["autoinsurance"],
+    "localrent.com": ["autorent"],
+    "discovercars.com": ["autorent"],
+    "aviasales.ru": ["autorent"],
+    "aliexpress.ru": ["coupons"],
+    "aliexpress.com": ["coupons"],
+    "alibaba.com": ["coupons"],
+    "geekbuying.com": ["coupons"],
+    "xistore.by": ["coupons"],
+    "globaldrive.ru": ["coupons"],
+    "raketacn.ru": ["coupons"],
+    "globalyo.com": ["other"],
+    "skyeng.ru": ["other"],
+    "real-avto.com": ["other"],
+}
+
+# Human-readable category (from partners.json `categories`) → internal keys.
+# Used as a fallback when the domain is not in DOMAIN_CATEGORY_MAP.
+CATEGORY_NAME_KEYWORDS: Dict[str, List[str]] = {
+    "autoparts": ["товары для авто", "автомобили и мотоциклы"],
+    "tires": [],
+    "tools": [],
+    "autoinsurance": [],
+    "checkauto": ["авто"],
+    "autorent": ["аренда машин", "билеты на самолеты", "туризм, путешествия"],
+    "coupons": ["маркетплейс"],
+    "other": [],
+}
+
 
 class PartnerProgram:
-    """Represents a single partner program from admitad."""
+    """Represents a single partner program from partners.json."""
 
     def __init__(self, data: Dict[str, Any]) -> None:
         self.id: str = str(data.get("id", data.get("name", "unknown")))
@@ -73,6 +121,7 @@ class PartnerProgram:
         self.image: str = data.get(
             "image", data.get("image_url", data.get("logo", data.get("brand_logo", "")))
         )
+        # Source `categories` array (human-readable Russian strings)
         self.categories: list[str] = (
             [data.get("category", "general")]
             if data.get("category")
@@ -83,10 +132,54 @@ class PartnerProgram:
         self.promo_text: str = data.get("ad_text", data.get("promo_text", ""))
         self.promo_code: str = data.get("promo_code", "")
         self.discount: str = data.get("discount", "")
-        self.allowed_regions: list[str] = data.get("allowed_regions", [])
+        # NEW SOURCE uses `regions`; legacy admitad_ads.json used `allowed_regions`
+        self.allowed_regions: list[str] = data.get(
+            "regions", data.get("allowed_regions", [])
+        )
         self.rating: str = data.get("rating", "")
         self.raw = data
+        # Map to internal category keys (autoparts, tires, tools, etc.)
+        self._internal_categories: set[str] = self._compute_internal_categories()
+        if not self.category or self.category == "general":
+            self.category = next(iter(sorted(self._internal_categories)), "general")
+        if not self.category_name:
+            self.category_name = self._get_category_description()
         self.bmw_relevant: bool = self._check_bmw_relevance()
+
+    # ── Internal category mapping ──────────────────────────────────────────
+
+    def _compute_internal_categories(self) -> set[str]:
+        """Determine internal category keys from domain + source categories.
+
+        Domain-based mapping is primary (most reliable). The human-readable
+        `categories` array from partners.json is used as a fallback.
+        """
+        cats: set[str] = set()
+
+        # 1. Domain-based mapping (most reliable)
+        if self.site_url:
+            domain = (
+                urlparse(self.site_url).netloc.replace("www.", "").lower().rstrip("/")
+            )
+            if domain in DOMAIN_CATEGORY_MAP:
+                cats.update(DOMAIN_CATEGORY_MAP[domain])
+
+        # 2. Category-name keyword mapping (fallback / supplement)
+        if not cats:
+            combined = " ".join(self.categories).lower()
+            for internal_cat, keywords in CATEGORY_NAME_KEYWORDS.items():
+                if any(kw in combined for kw in keywords):
+                    cats.add(internal_cat)
+
+        # 3. Legacy explicit category field
+        if self.category and self.category != "general":
+            cats.add(self.category)
+
+        # 4. Default fallback
+        if not cats:
+            cats.add("other")
+
+        return cats
 
     # ── Region / category / keyword matching ────────────────────────────────
 
@@ -104,9 +197,15 @@ class PartnerProgram:
         return region_upper in [r.upper() for r in self.allowed_regions]
 
     def has_category(self, category: str) -> bool:
-        """Check if program belongs to a category."""
+        """Check if program belongs to a category.
+
+        Checks the primary internal category, the full set of internal
+        categories, and the human-readable category name.
+        """
         cat_lower = category.lower()
         if cat_lower == self.category.lower():
+            return True
+        if cat_lower in self._internal_categories:
             return True
         if cat_lower in self.category_name.lower():
             return True
@@ -236,7 +335,7 @@ class PartnerProgram:
             "tools": "автоинструменты",
             "autoinsurance": "автострахование",
             "checkauto": "проверка авто",
-            "autorent": "аренда авто",
+            "autorent": "аренда авто и путешествия",
             "coupons": "скидки и промокоды",
             "other": "рекомендую",
         }
@@ -261,7 +360,7 @@ class PartnerProgram:
 class PartnerManager:
     """Manages all partner programs — loading, matching, posting.
 
-    v3.0: Downloads admitad_ads.json from remote URL, auto-refreshes.
+    v4.0: Downloads partners.json from sochiautoparts.ru, auto-refreshes.
     Uses goto_link EXACTLY as-is — NO subid additions!
     Masha BMW persona voice in all templates.
     """
@@ -292,12 +391,12 @@ class PartnerManager:
         return self._load_from_local()
 
     async def _load_from_remote(self) -> int:
-        """Download admitad_ads.json from GitHub URL with httpx."""
+        """Download partners.json from sochiautoparts.ru with httpx."""
         try:
             async with httpx.AsyncClient(
                 timeout=30.0, follow_redirects=True
             ) as client:
-                response = await client.get(ADMITAD_JSON_URL)
+                response = await client.get(PARTNERS_JSON_URL)
                 if response.status_code == 200:
                     data = response.json()
                     count = self._parse_programs(data)
@@ -311,13 +410,13 @@ class PartnerManager:
                         return count
         except Exception as e:
             logger.warning(
-                "Failed to load admitad_ads.json from remote: %s", e
+                "Failed to load partners.json from remote: %s", e
             )
         return 0
 
     def _load_from_local(self) -> int:
         """Load from local cache file."""
-        for filepath in [ADMITAD_LOCAL_CACHE, "admitad_ads.json"]:
+        for filepath in [PARTNERS_LOCAL_CACHE, "partners.json"]:
             path = Path(filepath)
             if path.exists():
                 try:
@@ -333,8 +432,8 @@ class PartnerManager:
                     )
                     return count
                 except Exception as e:
-                    logger.error("Error loading local admitad cache: %s", e)
-        logger.warning("No admitad_ads.json found locally or remotely")
+                    logger.error("Error loading local partners cache: %s", e)
+        logger.warning("No partners.json found locally or remotely")
         self._loaded = True
         return 0
 
@@ -343,9 +442,9 @@ class PartnerManager:
         filepath = filepath or self.config.ADMITAD_ADS_FILE
         path = Path(filepath)
         if not path.exists():
-            path = Path(ADMITAD_LOCAL_CACHE)
+            path = Path(PARTNERS_LOCAL_CACHE)
         if not path.exists():
-            path = Path("admitad_ads.json")
+            path = Path("partners.json")
 
         if not path.exists():
             logger.warning("Partner ads file not found")
@@ -366,7 +465,11 @@ class PartnerManager:
             return 0
 
     def _parse_programs(self, data: Any) -> int:
-        """Parse programs from JSON data and build site_map."""
+        """Parse programs from JSON data and build site_map.
+
+        Supports the new partners.json format (`campaigns` array) as well as
+        legacy formats (`programs` / `items` / `results` / bare array).
+        """
         self._programs = []
         self._site_map = {}
 
@@ -374,7 +477,10 @@ class PartnerManager:
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            items = data.get("programs", data.get("items", data.get("results", [])))
+            items = data.get(
+                "campaigns",
+                data.get("programs", data.get("items", data.get("results", []))),
+            )
             if not isinstance(items, list):
                 items = []
 
@@ -398,12 +504,12 @@ class PartnerManager:
     def _save_cache(self, data: Any) -> None:
         """Save data to local cache."""
         try:
-            cache_path = Path(ADMITAD_LOCAL_CACHE)
+            cache_path = Path(PARTNERS_LOCAL_CACHE)
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
         except Exception as e:
-            logger.warning("Failed to save admitad cache: %s", e)
+            logger.warning("Failed to save partners cache: %s", e)
 
     # ── Loading lifecycle ───────────────────────────────────────────────────
 
@@ -415,7 +521,7 @@ class PartnerManager:
     async def maybe_refresh(self) -> None:
         """Refresh from remote if enough time has passed."""
         if not self._loaded or (
-            time.time() - self._last_load_time > ADMITAD_REFRESH_INTERVAL
+            time.time() - self._last_load_time > PARTNERS_REFRESH_INTERVAL
         ):
             await self.load_async()
 
@@ -643,10 +749,12 @@ class PartnerManager:
         for p in self._programs:
             if not p.has_region(region):
                 continue
-            if any(
-                kw.lower() in p.name.lower() or kw.lower() in p.category.lower()
-                for kw in travel_keywords
-            ):
+            # Match by internal category, name, or human-readable category name
+            if "autorent" in p._internal_categories:
+                links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
+                continue
+            haystack = f"{p.name} {p.category} {p.category_name}".lower()
+            if any(kw.lower() in haystack for kw in travel_keywords):
                 links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
         return links[:5]
 
@@ -661,10 +769,12 @@ class PartnerManager:
         for p in self._programs:
             if not p.has_region(region):
                 continue
-            if any(
-                kw.lower() in p.name.lower() or kw.lower() in p.category.lower()
-                for kw in tools_keywords
-            ):
+            # Match by internal category, name, or human-readable category name
+            if "tools" in p._internal_categories:
+                links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
+                continue
+            haystack = f"{p.name} {p.category} {p.category_name}".lower()
+            if any(kw.lower() in haystack for kw in tools_keywords):
                 links.append({"name": p.name, "url": p.goto_link or p.affiliate_url})
         return links[:5]
 
@@ -676,7 +786,7 @@ class PartnerManager:
         """Generate context about matching partner programs for AI to reference
         naturally in its response.
 
-        Uses goto_link from admitad_ads.json EXACTLY as-is.
+        Uses goto_link from partners.json EXACTLY as-is.
         No subid additions — the link is ready!
         """
         self.ensure_loaded()
@@ -733,7 +843,7 @@ class PartnerManager:
 
         lines.append("")
         lines.append(
-            "ВАЖНО: Ссылки выше — ПАРТНЁРСКИЕ (goto_link из admitad_ads.json). "
+            "ВАЖНО: Ссылки выше — ПАРТНЁРСКИЕ (goto_link из partners.json). "
             "Используй их КАК ЕСТЬ, ничего не добавляй и не меняй!"
         )
 

@@ -1632,7 +1632,7 @@ class ChannelManager:
             return None
 
     async def _get_partner_image(self, program) -> Optional[bytes]:
-        """Get image for a partner post — from admitad_ads.json image URLs.
+        """Get image for a partner post — from partners.json logo URLs.
 
         v8.2: SIMPLE — just download the image from the source, no branded cards.
         If SVG → convert to PNG (Telegram doesn't support SVG).
@@ -1692,7 +1692,7 @@ class ChannelManager:
     async def post_partner_content(self) -> bool:
         """Post partner content to the channel.
 
-        v8.2: Uses raw images from admitad_ads.json — SVG→PNG conversion only.
+        v8.2: Uses raw images from partners.json — SVG→PNG conversion only.
         No branded cards — just the partner image as-is.
         Always tries to post WITH an image for maximum engagement.
         """
@@ -1708,7 +1708,7 @@ class ChannelManager:
         if not _validate_post_text_partner(post_content):
             return False
 
-        # Get partner image — from admitad_ads.json (SVG→PNG conversion built-in)
+        # Get partner image — from partners.json (SVG→PNG conversion built-in)
         image_data = await self._get_partner_image(program)
 
         try:

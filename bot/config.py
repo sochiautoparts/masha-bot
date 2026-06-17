@@ -57,8 +57,8 @@ class BotConfig:
     TELEGRAM_CAPTION_LIMIT: int = 1024    # Max chars for media caption
     TELEGRAM_MAX_MEDIA_PER_POST: int = 10  # Max photos/videos per post
 
-    # Partner / admitad — SAME as Asya
-    ADMITAD_ADS_FILE: str = os.getenv("ADMITAD_ADS_FILE", "admitad_ads.json")
+    # Partner programs — source: https://sochiautoparts.ru/partners.json
+    ADMITAD_ADS_FILE: str = os.getenv("ADMITAD_ADS_FILE", "data/partners.json")
     PARTNER_POST_INTERVAL_HOURS: int = int(os.getenv("PARTNER_POST_INTERVAL_HOURS", "1"))
     PARTNER_DAILY_LIMIT: int = 24  # 1 partner post per hour x 24 hours
     # Rossko professional parts selection

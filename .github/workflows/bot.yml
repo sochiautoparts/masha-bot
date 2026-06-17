@@ -1,67 +1,90 @@
-name: Masha Bot — LOCAL-FIRST v14 — BMW News from sochiautoparts/nws
+name: Masha Bot — LOCAL-FIRST v15 — BMW News from sochiautoparts/nws
+
+# ═══════════════════════════════════════════════════════════════
+# Masha Bot v15.0 — LOCAL-FIRST RuadaptQwen3-4B + CLOUD FAILOVER
+# Aligned with asya-bot architecture for proven stability.
+#
+#   - LOCAL MODEL: RuadaptQwen3-4B-Instruct Q4_K_M (~2.5GB GGUF, CPU inference)
+#   - LOCAL-FIRST for chat/comments (saves cloud balance!)
+#   - CLOUD-FIRST for function routes (posts, VIN, diagnostics)
+#   - 4-LEVEL FAILOVER: Local -> Pollinations(key) -> Pollinations(free) -> Cloudflare -> Local-Only/Static
+#   - Model caching via actions/cache@v4
+#   - HF_TOKEN for authenticated HuggingFace download
+#   - libopenblas-dev for fast CPU inference via llama-cpp-python
+#   - Pollinations.ai (44+ models, dual-key failover) — ALL routes
+#   - Cloudflare Workers AI (mistral-small-3.1, dual-account failover)
+#   - asyncio.Lock on llama-cpp to prevent segfaults
+#
+# Schedule (UTC, Moscow = UTC+3):
+#   Every 5 hours: 00:00, 05:00, 10:00, 15:00, 20:00
+# ═══════════════════════════════════════════════════════════════
 
 on:
   schedule:
-    # v14: hourly cron — provides a fresh run every hour as a safety net.
-    # The bot runs ~55 min per cycle (5 news + 1 partner post), then exits
-    # before the next cron fires. No self-re-dispatch (was causing a cancel
-    # loop with cancel-in-progress: false).
-    - cron: '0 * * * *'
+    - cron: '0 0 * * *'      # 00:00 UTC = 03:00 Moscow
+    - cron: '0 5 * * *'      # 05:00 UTC = 08:00 Moscow
+    - cron: '0 10 * * *'     # 10:00 UTC = 13:00 Moscow
+    - cron: '0 15 * * *'     # 15:00 UTC = 18:00 Moscow
+    - cron: '0 20 * * *'     # 20:00 UTC = 23:00 Moscow
   workflow_dispatch:
 
+# ═══ CRITICAL: Single concurrency group (aligned with asya-bot) ═══
 concurrency:
   group: masha-bot-single
-  # v14: keep false — never interrupt a running bot mid-post.
-  # With hourly cron + 55-min timeout there is no overlap, so no queue
-  # buildup and no cancel loop.
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
   actions: write
 
 env:
-  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-  OWNER_ID: ${{ secrets.OWNER_ID }}
-  CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-  CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
-  POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
-  POLLINATIONS_API_KEY_2: ${{ secrets.POLLINATIONS_API_KEY_2 }}
-  CF_ACCOUNT_ID_1: ${{ secrets.CF_ACCOUNT_ID_1 }}
-  CF_API_TOKEN_1: ${{ secrets.CF_API_TOKEN_1 }}
-  CF_ACCOUNT_ID_2: ${{ secrets.CF_ACCOUNT_ID_2 }}
-  CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
-  GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
-  GH_REPO: sochiautoparts/masha-bot
-  PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-  PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-  ADMITAD_ADS_FILE: data/admitad_ads.json
-  DB_PATH: masha_bot.db
   PYTHONUNBUFFERED: "1"
-  LOG_LEVEL: INFO
-  # Local model — ENABLED (RuadaptQwen3-4B-Instruct Q4_K_M, ~2.5GB)
-  ENABLE_LOCAL_MODEL: "true"
-  MODEL_PATH: "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf"
-  MODEL_N_CTX: "4096"
-  MODEL_N_THREADS: "2"
-  MODEL_MAX_TOKENS: "1024"
-  MODEL_AUTO_DOWNLOAD: "true"
-  MODEL_DOWNLOAD_URL: "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf"
-  HF_TOKEN: ${{ secrets.HF_TOKEN }}
-  # Schedule settings
-  NEWS_INTERVAL_MINUTES: "30"
-  CHANNEL_POST_INTERVAL_MINUTES: "60"
-  PARTNER_POST_INTERVAL_HOURS: "4"
+  # Force Node.js 24 for GitHub Actions — Node.js 20 deprecated since June 16, 2026
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # v14: 65 min — allows ~5 min setup + 55 min bot run + 5 min save/cleanup.
-    # Was 330 min (5.5h) which overlapped with the 3-hour cron and fed the
-    # cancel loop.
-    timeout-minutes: 65
+    # v15: ~5h45m (aligned with asya-bot). Allows setup + 5h bot run + save/cleanup.
+    timeout-minutes: 345
 
     steps:
+      # ── Kill conflicting runs (aligned with asya-bot) ──
+      # Prevents queue buildup when cron overlaps with a still-running bot.
+      # cancel-in-progress: true cancels in-progress; this step also clears queued.
+      - name: Cancel conflicting runs and wait
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+        run: |
+          echo "=== Checking for other running bot instances ==="
+          CURRENT_RUN=${{ github.run_id }}
+          REPO=${{ github.repository }}
+
+          for status in in_progress queued; do
+            RUNS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/runs?status=$status&per_page=10" \
+              | python3 -c '
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              for r in d.get("workflow_runs", []):
+                  if r["id"] != int(sys.argv[1]):
+                      print(r["id"])
+          except: pass
+          ' "$CURRENT_RUN")
+
+            for run_id in $RUNS; do
+              echo "Cancelling $status run: $run_id"
+              curl -s -X POST -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$REPO/actions/runs/$run_id/cancel" || true
+            done
+          done
+
+          echo "Waiting 60s for old bot instances to fully stop..."
+          sleep 60
+          echo "=== Ready to start ==="
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -73,25 +96,64 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           # Install system dependencies for llama-cpp-python (OpenBLAS for fast CPU inference)
           sudo apt-get update -qq && sudo apt-get install -y -qq libopenblas-dev
           # Install llama-cpp-python with CPU optimizations (OpenBLAS for fast inference)
-          CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" pip install llama-cpp-python>=0.3.0 --no-cache-dir
+          CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS" pip install 'llama-cpp-python>=0.3.0' --no-cache-dir
           # Install remaining dependencies
           pip install -r requirements.txt
+
+      - name: Clean Python cache and phantom files
+        run: |
+          find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          find . -type f -name "*.pyc" -delete 2>/dev/null || true
+          # Remove phantom file created by pip when parsing '>=0.3.0'
+          rm -f '=0.3.0'
+          echo "Python cache cleaned"
+
+      - name: Create data directory
+        run: mkdir -p data models
+
+      - name: Download Admitad partner data
+        run: |
+          mkdir -p data
+          # Try downloading admitad data — don't save if the URL returns an error
+          HTTP_CODE=$(curl -sL -o /tmp/admitad_check.json -w "%{http_code}" "https://raw.githubusercontent.com/creastudioai-beep/pr/main/data/admitad_ads.json")
+          if [ "$HTTP_CODE" = "200" ]; then
+            # Validate it's actually JSON (not an error page)
+            if python3 -c "import json; json.load(open('/tmp/admitad_check.json'))" 2>/dev/null; then
+              cp /tmp/admitad_check.json data/admitad_ads.json
+              echo "Admitad data downloaded successfully"
+            else
+              echo "WARNING: Downloaded file is not valid JSON, skipping"
+            fi
+          else
+            echo "Failed to download admitad data (HTTP $HTTP_CODE), partner posts will be skipped"
+          fi
+
+      - name: Restore database cache
+        uses: actions/cache@v4
+        with:
+          path: masha_bot.db
+          key: masha-bot-db-v3
+          restore-keys: |
+            masha-bot-db-
 
       - name: Cache local model
         uses: actions/cache@v4
         with:
           path: models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf
-          key: ruadapt-qwen3-4b-instruct-q4km-gguf-v1
+          key: ruadapt-qwen3-4b-instruct-q4km-masha-v1
           restore-keys: |
-            ruadapt-qwen3-4b-instruct-q4km-gguf-
+            qwen3-4b-
+            ruadapt-qwen3-4b-
 
       - name: Download local model (if not cached)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           mkdir -p models
           if [ -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
@@ -105,66 +167,54 @@ jobs:
           fi
 
           if [ ! -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
-            echo "Downloading RuadaptQwen3-4B-Instruct Q4_K_M (~2.5GB)..."
+            echo "Downloading RuadaptQwen3-4B-Instruct Q4_K_M (~2.3GB)..."
             if [ -n "$HF_TOKEN" ]; then
-              echo "Using HuggingFace token for authenticated download..."
-              pip install huggingface_hub -q
-              hf download --local-dir models --include "Q4_K_M.gguf" RefalMachine/RuadaptQwen3-4B-Instruct-GGUF --token "$HF_TOKEN"
+              echo "Using HF_TOKEN for authenticated download"
+              pip install -q huggingface_hub
+              huggingface-cli download RefalMachine/RuadaptQwen3-4B-Instruct-GGUF Q4_K_M.gguf --local-dir models --token "$HF_TOKEN" || true
+              # huggingface-cli saves as Q4_K_M.gguf, rename to expected name
               if [ -f "models/Q4_K_M.gguf" ] && [ ! -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
                 mv models/Q4_K_M.gguf models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf
               fi
+              # If still not available, try direct download with auth
+              if [ ! -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
+                echo "HF hub download failed, trying direct URL with auth..."
+                curl -L --retry 3 --max-time 600 \
+                  -H "Authorization: Bearer $HF_TOKEN" \
+                  -o models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf \
+                  "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf" || true
+              fi
+              # If still not available, try without auth
+              if [ ! -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
+                echo "Authenticated download failed, trying unauthenticated..."
+                curl -L --retry 3 --max-time 600 \
+                  -o models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf \
+                  "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf" || true
+              fi
             else
               echo "No HF_TOKEN set, trying unauthenticated download..."
-              curl -L --max-time 600 --retry 3 --retry-delay 10 \
+              curl -L --retry 3 --max-time 600 \
                 -o models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf \
-                "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf"
+                "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf" || true
             fi
           fi
 
-          # Verify
+          # Verify model file
           if [ -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
             SIZE=$(stat -c%s "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" 2>/dev/null || echo 0)
             SIZE_MB=$((SIZE / 1048576))
-            echo "Model file size: ${SIZE_MB} MB"
+            echo "Model file: ${SIZE_MB} MB"
             if [ "$SIZE_MB" -lt 100 ]; then
-              echo "ERROR: Model file too small or corrupted!"
+              echo "ERROR: Model file too small (${SIZE_MB} MB), likely corrupted!"
               rm -f models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf
-              echo "WARNING: Model download failed — bot will run in cloud-only mode"
               echo "ENABLE_LOCAL_MODEL=false" >> $GITHUB_ENV
+            else
+              echo "Model downloaded successfully!"
             fi
           else
-            echo "WARNING: Model download failed — bot will run in cloud-only mode"
+            echo "WARNING: Model download failed, running in cloud-only mode"
             echo "ENABLE_LOCAL_MODEL=false" >> $GITHUB_ENV
           fi
-
-      - name: Clean Python cache
-        run: |
-          find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-          find . -type f -name "*.pyc" -delete 2>/dev/null || true
-          echo "Python cache cleaned"
-
-      - name: Download Admitad partner data
-        run: |
-          echo "=== Downloading admitad partner data ==="
-          mkdir -p data
-          # Try primary source (may be down)
-          curl -sL "https://raw.githubusercontent.com/creastudioai-beep/pr/main/data/admitad_ads.json" \
-            -o data/admitad_ads.json 2>/dev/null || true
-          # Check if download succeeded and file is valid JSON
-          if [ -f data/admitad_ads.json ] && python3 -c "import json; json.load(open('data/admitad_ads.json'))" 2>/dev/null; then
-            echo "OK: admitad_ads.json downloaded ($(wc -c < data/admitad_ads.json) bytes)"
-          else
-            echo "WARNING: admitad_ads.json download failed or invalid — partner posts will be skipped"
-            rm -f data/admitad_ads.json 2>/dev/null || true
-          fi
-
-      - name: Restore database from cache
-        uses: actions/cache@v4
-        with:
-          path: masha_bot.db
-          key: masha-bot-db-v3
-          restore-keys: |
-            masha-bot-db-
 
       - name: Ensure .gitignore allows database
         run: |
@@ -172,77 +222,141 @@ jobs:
             sed -i '/masha_bot\.db/d' .gitignore
           fi
 
+      # ── Run the Bot — UNLIMITED AUTO-RESTART (aligned with asya-bot) ──
       - name: Run Masha Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
+          # Pollinations.ai — DUAL KEY FAILOVER
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}
+          POLLINATIONS_API_KEY_2: ${{ secrets.POLLINATIONS_API_KEY_2 }}
+          # Cloudflare Workers AI — FALLBACK
+          CF_ACCOUNT_ID_1: ${{ secrets.CF_ACCOUNT_ID_1 }}
+          CF_API_TOKEN_1: ${{ secrets.CF_API_TOKEN_1 }}
+          CF_ACCOUNT_ID_2: ${{ secrets.CF_ACCOUNT_ID_2 }}
+          CF_API_TOKEN_2: ${{ secrets.CF_API_TOKEN_2 }}
+          # GitHub PAT for self-dispatch
+          GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          GH_REPO: sochiautoparts/masha-bot
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          # Local model — ENABLED (RuadaptQwen3-4B-Instruct Q4_K_M, ~2.5GB)
+          ENABLE_LOCAL_MODEL: ${{ env.ENABLE_LOCAL_MODEL || 'true' }}
+          MODEL_PATH: "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf"
+          MODEL_N_CTX: "8192"
+          MODEL_N_THREADS: "4"
+          MODEL_MAX_TOKENS: "1024"
+          MODEL_AUTO_DOWNLOAD: "true"
+          MODEL_DOWNLOAD_URL: "https://huggingface.co/RefalMachine/RuadaptQwen3-4B-Instruct-GGUF/resolve/main/Q4_K_M.gguf"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Database
+          DB_PATH: masha_bot.db
+          ADMITAD_ADS_FILE: data/admitad_ads.json
+          LOG_LEVEL: INFO
+          # Schedule settings — aligned with asya-bot intervals
+          NEWS_FETCH_INTERVAL: 900      # 15 min
+          CHANNEL_POST_INTERVAL: 1200   # 20 min
+          NEWS_INTERVAL_MINUTES: "15"
+          CHANNEL_POST_INTERVAL_MINUTES: "20"
+          CHANNEL_NEWS_PER_HOUR: "6"
+          CHANNEL_PARTNER_PER_HOUR: "1"
+          PARTNER_POST_INTERVAL_HOURS: "4"
         run: |
-          echo "=== Starting Masha Bot v14.0 — BMW News from sochiautoparts/nws ==="
-          echo "NEWS SOURCES: bmw-news.json (sochiautoparts/nws) → RSS (15+ feeds) → Web Search"
-          echo "ARCHITECTURE: Local-First 5-Level Failover + Local-Only Post Fallback + Evergreen Fallback"
-          echo "WORKFLOW: hourly cron, 55-min run, no self-re-dispatch (fixes cancel loop)"
+          echo "=== Starting Masha Bot v15.0 — LOCAL-FIRST (aligned with asya-bot) ==="
+          echo "LOCAL MODEL: RuadaptQwen3-4B-Instruct Q4_K_M (Russian-optimized, PRIMARY for chat/comments)"
+          echo "CLOUD: Pollinations (44+ models, dual-key) + Cloudflare (mistral-small-3.1)"
+          echo "STRATEGY: LOCAL-first (chat/comments) / CLOUD-first (functions)"
+          echo "FAILOVER: Local -> Pollinations(key) -> Pollinations(free) -> Cloudflare -> Local-Only/Static"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
-          echo ""
+          echo "NEWS: BMW news from sochiautoparts/nws (bmw-news.json) -> RSS fallback -> Web search"
+          echo "SCHEDULE: News every 15min, Posts every 20min"
+          echo "=== Launching bot with UNLIMITED auto-restart ==="
 
-          # Verify model file before starting
-          if [ -f "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" ]; then
-            SIZE=$(stat -c%s "models/RuadaptQwen3-4B-Instruct-Q4_K_M.gguf" 2>/dev/null || echo 0)
-            SIZE_MB=$((SIZE / 1048576))
-            echo "LOCAL MODEL: Available (${SIZE_MB} MB)"
-          else
-            echo "LOCAL MODEL: NOT FOUND — running in cloud-only mode"
-            echo "ENABLE_LOCAL_MODEL=false" >> $GITHUB_ENV
-          fi
+          # UNLIMITED retries — bot MUST always be running! (aligned with asya-bot)
+          RETRY=0
+          while true; do
+            RETRY=$((RETRY+1))
+            echo "--- Attempt $RETRY ---"
 
-          # v14.1: ONE bot run per workflow (was 3 — but with a 55-min bot
-          # timeout and 65-min workflow timeout, the 2nd/3rd restarts were
-          # always killed by the workflow timeout, producing a misleading
-          # "cancelled" conclusion even though the first run posted fine).
-          # With MAX_RESTARTS=1 the bot runs once for ~55 min, the loop exits
-          # cleanly, Save DB runs, and the run concludes "success". If the bot
-          # crashes, the hourly cron starts a fresh run within the hour.
-          MAX_RESTARTS=1
-          RESTART_COUNT=0
+            python3 -m bot.main
+            EXIT_CODE=$?
+            echo "Bot exited with code $EXIT_CODE (attempt $RETRY)"
 
-          while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
-            echo "=== Bot start attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS ==="
-
-            # v14: RESET EXIT_CODE before each run (was not reset — a previous
-            # crash code leaked into the next iteration's logic, misclassifying
-            # successful runs as crashes).
-            EXIT_CODE=0
-            timeout 3300 python -m bot.main || EXIT_CODE=$?
-
-            echo "Bot exited with code: $EXIT_CODE"
-
-            # Exit code 0 = normal exit, 124 = timeout (both OK, just restart)
-            if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 124 ]; then
-              echo "Bot process ended (timeout or normal exit)"
-            else
-              echo "Bot crashed with error code $EXIT_CODE"
-            fi
-
-            RESTART_COUNT=$((RESTART_COUNT + 1))
-            # Brief pause before retry to avoid hammering on a crash loop
-            if [ $RESTART_COUNT -lt $MAX_RESTARTS ]; then
+            # Intelligent backoff based on exit code
+            if [ $EXIT_CODE -eq 2 ]; then
+              echo "Persistent conflicts — restarting in 10s..."
               sleep 10
+            elif [ $EXIT_CODE -eq 3 ]; then
+              echo "Health check failure — restarting in 20s..."
+              sleep 20
+            elif [ $EXIT_CODE -eq 0 ]; then
+              echo "Session timeout — restarting in 5s..."
+              sleep 5
+            else
+              if [ $RETRY -le 3 ]; then
+                SLEEP=10
+              elif [ $RETRY -le 6 ]; then
+                SLEEP=15
+              else
+                SLEEP=30
+              fi
+              echo "Bot crashed (code $EXIT_CODE) — restarting in ${SLEEP}s..."
+              sleep $SLEEP
             fi
           done
 
-          echo "Bot run complete ($RESTART_COUNT attempts). Hourly cron will start the next run."
+      - name: Save database cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: masha_bot.db
+          key: masha-bot-db-v3-${{ github.run_id }}
 
-      - name: Save database
+      - name: Save database to git
         if: always()
         run: |
           if [ -f masha_bot.db ]; then
             git config user.name "Masha Bot"
             git config user.email "masha-bot@users.noreply.github.com"
+            # Remove phantom file if it exists before committing
+            rm -f '=0.3.0'
             git add -f masha_bot.db || true
             git diff --staged --quiet || git commit -m "db: update $(date +%Y-%m-%d_%H:%M)" || true
+            # Stage all remaining changes before pulling to avoid "unstaged changes" error
+            git add -A || true
+            git stash --include-untracked || true
             git pull --rebase origin main || true
+            git stash pop || true
             git push || true
           fi
 
-      # v14: REMOVED "Re-dispatch workflow" step.
-      # The old self-re-dispatch + cancel-in-progress: false caused an infinite
-      # cancel loop: each run's re-dispatch created a queued run that cancelled
-      # the previous queued run, and the in-progress run's PENDING check broke
-      # the bot loop early — so the bot never ran for its full timeout and no
-      # posts were made. Hourly cron now provides scheduling instead.
+      # ── Self-dispatch for 24/7 (aligned with asya-bot) ──
+      - name: Re-dispatch workflow for continuous operation
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+        run: |
+          echo "=== Re-dispatching workflow for 24/7 uptime ==="
+          REPO=${{ github.repository }}
+          sleep 10
+          for i in 1 2 3; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/workflows/bot.yml/dispatches" \
+              -d '{"ref":"main"}')
+            if [ "$HTTP_CODE" = "204" ]; then
+              echo "Workflow re-dispatched successfully (attempt $i)"
+              break
+            fi
+            echo "Re-dispatch attempt $i failed (HTTP $HTTP_CODE), retrying in 10s..."
+            sleep 10
+          done
+          echo "=== Re-dispatch complete ==="
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "=== Bot session ended ==="

@@ -225,7 +225,7 @@ async def cmd_send_partner_post(message: Message):
             message_id=sent.message_id,
         )
 
-        partner_manager.mark_posted()
+        partner_manager.mark_posted(program)
         await message.answer(f"✅ Партнёрский пост опубликован: {program.name}")
 
         message.bot._pending_partner_post = None
@@ -395,9 +395,14 @@ async def cmd_switch_model(message: Message):
 
 @admin_router.message(Command("reload_partners"))
 async def cmd_reload_partners(message: Message):
-    """Reload partner programs from JSON file."""
+    """Reload partner programs — fetches fresh data from sochiautoparts.ru."""
     if not await _is_admin(message):
         return
 
-    count = partner_manager.load()
-    await message.answer(f"✅ Загружено {count} партнёрских программ.")
+    # Remote-first reload: pulls the latest partners.json from
+    # https://sochiautoparts.ru/partners.json (the single source of truth),
+    # then caches locally. Falls back to local file if remote is unreachable.
+    count = await partner_manager.load_async()
+    await message.answer(
+        f"✅ Загружено {count} партнёрских программ (обновлено из sochiautoparts.ru)."
+    )

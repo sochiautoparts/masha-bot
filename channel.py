@@ -1692,6 +1692,11 @@ class ChannelManager:
     async def post_partner_content(self) -> bool:
         """Post partner content to the channel.
 
+        v8.3: Topical partner selection — matches the partner to the topic of
+        the most recent channel news posts (brakes → autoparts, road trip →
+        rental, etc.). Falls back to a random program. Also dedups against
+        the last 8 posted partners so the same partner isn't repeated.
+        Uses goto_link from partners.json EXACTLY as-is.
         v8.2: Uses raw images from partners.json — SVG→PNG conversion only.
         No branded cards — just the partner image as-is.
         Always tries to post WITH an image for maximum engagement.
@@ -1699,7 +1704,19 @@ class ChannelManager:
         if not partner_manager.should_post_partner():
             return False
 
-        program = partner_manager.get_random_program()
+        # ── Topical selection: match partner to recent channel topics ─────
+        program = None
+        try:
+            from bot.database import get_recent_post_titles
+            titles = await get_recent_post_titles(hours=6, limit=5)
+            topical_text = " ".join(titles) if titles else ""
+            if topical_text:
+                program = partner_manager.get_topical_program(topical_text)
+        except Exception as e:
+            logger.debug(f"Topical partner selection skipped: {e}")
+
+        if not program:
+            program = partner_manager.get_random_program()
         if not program:
             return False
 
@@ -1751,7 +1768,7 @@ class ChannelManager:
                     post_content=post_content,
                     message_id=sent.message_id,
                 )
-                partner_manager.mark_posted()
+                partner_manager.mark_posted(program)
                 logger.info(f"Partner post published: {program.name} (with_image={image_data is not None})")
                 return True
         except Exception as e:

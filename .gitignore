@@ -54,5 +54,8 @@ bot/data/*.db
 # Image cache (downloaded original photos)
 data/image_cache/
 
+# Partner data cache (downloaded fresh from sochiautoparts.ru at runtime)
+data/partners.json
+
 # Local model files (too large for git)
 models/*.gguf

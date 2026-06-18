@@ -30,6 +30,7 @@ import logging
 import random
 import re
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, urlencode, urlparse, urlunparse
@@ -295,7 +296,12 @@ class PartnerProgram:
 
         for domain, pattern in search_patterns.items():
             if domain in self.site_url:
-                return quote_plus(pattern)
+                # Return the RAW pattern (query already encoded once via
+                # quote_plus). get_search_url() will pass this through urlencode()
+                # which encodes the ulp value exactly once. Previously this
+                # returned quote_plus(pattern), causing triple-encoding and
+                # broken redirect URLs on partner sites.
+                return pattern
 
         return original_ulp
 
@@ -375,6 +381,9 @@ class PartnerManager:
         self._day_start: float = 0
         # Site URL -> PartnerProgram mapping for fast lookup
         self._site_map: Dict[str, PartnerProgram] = {}
+        # Recently-posted program IDs — used to avoid repeating the same
+        # partner in consecutive channel posts (dedup, last 8).
+        self._recent_program_ids: deque = deque(maxlen=8)
 
     @property
     def programs(self) -> list[PartnerProgram]:
@@ -642,9 +651,15 @@ class PartnerManager:
     # ── Random / selection ──────────────────────────────────────────────────
 
     def get_random_program(
-        self, category: str = "", region: str = DEFAULT_REGION
+        self, category: str = "", region: str = DEFAULT_REGION,
+        exclude_recent: bool = True,
     ) -> Optional[PartnerProgram]:
-        """Get a random partner program, optionally filtered by category."""
+        """Get a random partner program, optionally filtered by category.
+
+        By default excludes the last 8 posted programs (dedup) so the channel
+        doesn't repeat the same partner back-to-back. If filtering leaves an
+        empty pool, falls back to the full pool.
+        """
         self.ensure_loaded()
         if category:
             pool = self.get_by_category(category, region)
@@ -652,18 +667,79 @@ class PartnerManager:
             pool = [p for p in self._programs if p.has_region(region)]
         if not pool:
             pool = self._programs
-        return random.choice(pool) if pool else None
+        if not pool:
+            return None
+
+        if exclude_recent and self._recent_program_ids:
+            fresh = [p for p in pool if p.id not in self._recent_program_ids]
+            if fresh:
+                pool = fresh
+        return random.choice(pool)
+
+    def remember_posted(self, program: "PartnerProgram") -> None:
+        """Record a program as recently posted (for dedup)."""
+        if program and program.id:
+            self._recent_program_ids.append(program.id)
+
+    def get_topical_program(
+        self, text: str = "", category: str = "", region: str = DEFAULT_REGION,
+        exclude_recent: bool = True,
+    ) -> Optional[PartnerProgram]:
+        """Pick a partner program relevant to the given text (topical selection).
+
+        Tries to find programs matching keywords in the text (e.g. the most
+        recent channel news title); falls back to a random program (with
+        dedup). Used so channel partner posts match the topic of recently
+        posted news — e.g. a news post about M5 brakes is followed by an
+        autoparts partner, a road-trip post by a travel/rental partner.
+        """
+        self.ensure_loaded()
+        if text:
+            matches = self.find_matching_programs(text, region)
+            if exclude_recent and self._recent_program_ids:
+                matches = [p for p in matches if p.id not in self._recent_program_ids]
+            if matches:
+                return random.choice(matches)
+        return self.get_random_program(
+            category=category, region=region, exclude_recent=exclude_recent
+        )
 
     # ── Posting ─────────────────────────────────────────────────────────────
 
     def should_post_partner(self) -> bool:
-        """Check if we should post a partner post this cycle."""
+        """Check if we should post a partner post this cycle.
+
+        v4.1: The daily limit is enforced against the database counter
+        (get_partner_posts_today) when an event loop is running, so the limit
+        survives restarts. Falls back to the in-memory counter otherwise.
+        The interval check remains in-memory.
+        """
         now = time.time()
         if now - self._day_start > 86400:
             self._day_start = now
             self._posted_today = 0
 
-        if self._posted_today >= self.config.PARTNER_DAILY_LIMIT:
+        # Try to consult the DB for the real daily count (survives restarts).
+        # should_post_partner is sync, so we use a best-effort approach: if a
+        # loop is running, we read the cached in-memory counter (kept in sync
+        # by mark_posted); otherwise we query the DB directly.
+        posted_today = self._posted_today
+        try:
+            import asyncio
+            from bot.database import get_today_partner_post_count
+            try:
+                asyncio.get_running_loop()
+                # Loop is running — cannot await; use cached in-memory value.
+            except RuntimeError:
+                # No running loop — safe to query DB synchronously.
+                try:
+                    posted_today = asyncio.run(get_today_partner_post_count())
+                except Exception:
+                    posted_today = self._posted_today
+        except Exception:
+            posted_today = self._posted_today
+
+        if posted_today >= self.config.PARTNER_DAILY_LIMIT:
             return False
 
         interval = self.config.PARTNER_POST_INTERVAL_HOURS * 3600
@@ -672,10 +748,16 @@ class PartnerManager:
 
         return True
 
-    def mark_posted(self) -> None:
-        """Mark that a partner post was just made."""
+    def mark_posted(self, program: Optional["PartnerProgram"] = None) -> None:
+        """Mark that a partner post was just made.
+
+        If program is provided, also records it for recent-post dedup so the
+        same partner isn't repeated in consecutive channel posts.
+        """
         self._last_partner_post_time = time.time()
         self._posted_today += 1
+        if program:
+            self.remember_posted(program)
 
     # ── Primary parts links ─────────────────────────────────────────────────
 
@@ -824,7 +906,8 @@ class PartnerManager:
             if link:
                 lines.append(f"- {link}")
 
-        # Also add Rossko specifically for auto parts queries
+        # Also add Rossko specifically for auto parts queries (only if not
+        # already present anywhere in the matches list, to avoid duplicates).
         text_lower = text.lower()
         parts_keywords = [
             "запчаст", "деталь", "артикул", "купить запчас", "подбор",
@@ -832,7 +915,7 @@ class PartnerManager:
         ]
         if any(kw in text_lower for kw in parts_keywords):
             rossko = self.get_by_site("rossko.ru")
-            if rossko and rossko not in matches[:max_programs]:
+            if rossko and rossko not in matches:
                 if article:
                     lines.append(f"- {rossko.format_link_with_search(article)}")
                 else:

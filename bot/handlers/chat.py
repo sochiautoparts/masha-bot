@@ -537,6 +537,26 @@ async def handle_photo(message: Message):
     except Exception:
         pass
 
+    # ── Partner context for photo analysis ───────────────────────────────
+    # Photos are often of parts / VIN documents / damages. Inject the primary
+    # parts links + cross-category partner context so the vision AI can
+    # recommend the correct goto_links (from partners.json) in its answer.
+    photo_partner_links: list = []
+    try:
+        await partner_manager.maybe_refresh()
+        primary_links = partner_manager.format_primary_parts_links()
+        if primary_links:
+            extra_context_parts.append(primary_links)
+        # Use the caption (or a generic parts hint) to find relevant partners
+        partner_query = caption or "запчасть деталь vin"
+        partner_ctx = partner_manager.generate_partner_context(partner_query, max_programs=3)
+        if partner_ctx:
+            extra_context_parts.append(partner_ctx)
+        for pl in partner_manager.get_all_relevant_links(partner_query, max_programs=5):
+            photo_partner_links.append((pl["name"], pl["url"]))
+    except Exception as e:
+        logger.debug(f"Photo partner context error: {e}")
+
     try:
         file_info = await message.bot.get_file(photo.file_id)
         if not file_info or not file_info.file_path:
@@ -573,6 +593,13 @@ async def handle_photo(message: Message):
                 reply_text = response.text
                 reply_text = _clean_markdown(reply_text)
                 reply_text = _replace_plain_urls_with_affiliate(reply_text)
+
+                # Append the “🔗 Где искать:” section with correct goto_links
+                if photo_partner_links:
+                    reply_text = _clean_raw_partner_urls(reply_text, photo_partner_links)
+                    partner_section = _format_partner_links_section(photo_partner_links)
+                    if partner_section:
+                        reply_text = reply_text.rstrip() + "\n\n" + partner_section
 
                 if len(reply_text) <= config.TELEGRAM_TEXT_LIMIT:
                     await message.answer(reply_text)
@@ -972,7 +999,12 @@ async def _process_text_message(message: Message, text: str):
 # ── Response formatting ────────────────────────────────────────────────────────
 
 async def _send_response(message: Message, response, status_msg: Message = None, partner_links: list = None):
-    """Send AI response to user with partner link formatting."""
+    """Send AI response to user with partner link formatting.
+
+    In groups/comments, partner links are sent as a SEPARATE reply so they
+    always remain visible (never cut off by the group char budget).
+    In private chat, partner links are appended inline after the answer.
+    """
     if not response or response.error or not response.text:
         await message.answer("Не получилось ответить 😅 Попробуй ещё раз!")
         if status_msg:
@@ -986,23 +1018,35 @@ async def _send_response(message: Message, response, status_msg: Message = None,
     text = _clean_markdown(text)
     text = _replace_plain_urls_with_affiliate(text)
 
-    # Add partner links section
-    if partner_links:
-        text = _clean_raw_partner_urls(text, partner_links)
-        partner_section = _format_partner_links_section(partner_links)
-        if partner_section:
-            text = text.rstrip() + "\n\n" + partner_section
+    is_group = message.chat.type in ("group", "supergroup")
+    max_chars = GROUP_MAX_CHARS if is_group else CHAT_MAX_CHARS
 
-    # Delete thinking status
+    # Delete thinking status before sending
     if status_msg:
         try:
             await status_msg.delete()
         except Exception:
             pass
 
-    # Split if too long
-    is_group = message.chat.type in ("group", "supergroup")
-    max_chars = GROUP_MAX_CHARS if is_group else CHAT_MAX_CHARS
+    partner_section = ""
+    if partner_links:
+        text = _clean_raw_partner_urls(text, partner_links)
+        partner_section = _format_partner_links_section(partner_links)
+
+    if is_group and partner_section:
+        # ── Group/comment path: send the answer, then partner links as a
+        # separate reply so they survive the group char budget and stay
+        # cleanly readable in the comment thread. ──
+        if len(text) > max_chars:
+            text = _truncate_at_boundary(text, max_chars)
+        if text.strip():
+            await message.answer(text)
+        await message.reply(partner_section)
+        return
+
+    # ── Private chat path: append partner section inline ──
+    if partner_section:
+        text = text.rstrip() + "\n\n" + partner_section
 
     if len(text) <= max_chars:
         await message.answer(text)
@@ -1012,6 +1056,20 @@ async def _send_response(message: Message, response, status_msg: Message = None,
         chunks = _split_message(text, max_length=config.TELEGRAM_TEXT_LIMIT)
         for chunk in chunks:
             await message.answer(chunk)
+
+
+def _truncate_at_boundary(text: str, max_chars: int) -> str:
+    """Truncate text at the last sentence/line boundary before max_chars."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    # Prefer breaking on a newline, then on a sentence end
+    pos = cut.rfind('\n')
+    if pos < max_chars // 2:
+        pos = cut.rfind('. ')
+    if pos < max_chars // 2:
+        pos = max_chars
+    return cut[:pos].rstrip() + "…"
 
 
 def _format_partner_links_section(links: list) -> str:
@@ -1034,14 +1092,26 @@ def _clean_raw_partner_urls(text: str, links: list) -> str:
 
 
 def _replace_plain_urls_with_affiliate(text: str) -> str:
-    """Replace plain partner site URLs with affiliate goto_links."""
+    """Replace plain partner site URLs with affiliate goto_links for ALL partners.
+
+    Iterates the full partner site_map (every campaign from partners.json), so
+    any plain merchant URL the AI emits — be it autoparts, tires, tools,
+    travel (aviasales/localrent), insurance, etc. — is rewritten to the correct
+    goto_link from the source. Uses goto_link EXACTLY as-is, no modifications.
+    """
     try:
-        for site_domain in ["rossko.ru", "autopiter.ru", "avtoall.ru"]:
-            prog = partner_manager.get_by_site(site_domain)
-            if prog and prog.goto_link:
-                # Don't replace if already has the affiliate link
-                if prog.goto_link not in text:
-                    text = text.replace(f"https://{site_domain}", prog.goto_link)
+        for site_domain, prog in partner_manager._site_map.items():
+            if not prog.goto_link or prog.goto_link in text:
+                continue
+            for variant in (
+                f"https://{site_domain}",
+                f"http://{site_domain}",
+                f"https://www.{site_domain}",
+                f"http://www.{site_domain}",
+            ):
+                if variant in text:
+                    text = text.replace(variant, prog.goto_link)
+                    break
     except Exception:
         pass
     return text

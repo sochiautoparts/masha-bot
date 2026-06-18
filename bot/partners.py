@@ -1050,15 +1050,97 @@ class PartnerManager:
     async def generate_partner_post_content(
         self, program: Optional[PartnerProgram] = None
     ) -> str:
-        """Generate a partner post text with Маша's BMW voice."""
+        """Generate a partner post text with Маша's BMW voice.
+
+        v5.0: AI-generated posts (varied, context-aware) with a template
+        fallback when all AI providers are unavailable. The goto_link is
+        injected into the AI prompt and re-appended if the AI omits it, so
+        the published post ALWAYS carries the correct partner link from
+        partners.json.
+        """
         if not program:
             program = self.get_random_program()
         if not program:
             return ""
+
+        # ── Try AI generation first ──
+        ai_text = await self._generate_partner_post_ai(program)
+        if ai_text:
+            return ai_text
+
+        # ── Fallback: template ──
         return self._build_partner_text(program)
 
+    async def _generate_partner_post_ai(self, program: PartnerProgram) -> str:
+        """Generate a partner post via AI using the editorial team voice.
+
+        Returns "" on any error so the caller can fall back to templates.
+        The goto_link is guaranteed to appear in the output (appended if the
+        AI omits it). Footer/signature is always appended.
+        """
+        try:
+            from ai.router import get_ai_router  # local import to avoid cycle
+            router = get_ai_router()
+        except Exception as e:
+            logger.debug(f"AI router unavailable for partner post: {e}")
+            return ""
+
+        link = program.goto_link  # used EXACTLY as-is
+        cat_label = program.category_name or "авто"
+        promo_line = ""
+        if program.promo_code:
+            promo_line = f"Промокод: {program.promo_code}"
+            if program.discount:
+                promo_line += f" — {program.discount}"
+        elif program.discount:
+            promo_line = f"Скидки до {program.discount}"
+
+        context_parts = [
+            f"Партнёр: {program.name}",
+            f"Категория: {cat_label}",
+            f"Сайт: {program.site_url}",
+            f"Описание: {program.description}" if program.description else "",
+            promo_line,
+            f"ПАРТНЁРСКАЯ ССЫЛКА (вставь В ИСХОДНОМ ВИДЕ, ничего не меняй): {link}",
+        ]
+        context = "\n".join(p for p in context_parts if p)
+
+        try:
+            response = await router.generate_channel_post(
+                topic=f"{program.name} — {cat_label}",
+                context=context,
+                content_type="partner",
+                has_media=True,  # partner posts always have an image
+                media_count=1,
+                extra_instructions=(
+                    "ВАЖНО: это ПАРТНЁРСКИЙ пост, не новость. Пиши как личная "
+                    "рекомендация Маши (или кого-то из редакции), живо и с "
+                    "характером, без рекламного тона. ОБЯЗАТЕЛЬНО включи "
+                    f"партнёрскую ссылку {link} в текст. В конце добавь подпись: "
+                    "Автор @asmasha_bot\\n@bmw_mpower_club\\n#bmw_mpower_club #bmwparts"
+                ),
+            )
+        except Exception as e:
+            logger.debug(f"AI partner post generation error: {e}")
+            return ""
+
+        if response.error or not response.text:
+            logger.debug(f"AI partner post failed: {response.error_message}")
+            return ""
+
+        text = response.text.strip()
+        # Guarantee the goto_link is present (re-append if AI omitted it)
+        if link and link not in text:
+            text = text.rstrip() + f"\n\n👉 {link}"
+        # Guarantee the signature
+        if "@bmw_mpower_club" not in text:
+            text = text.rstrip() + (
+                "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club #bmwparts"
+            )
+        return text
+
     def _build_partner_text(self, program: PartnerProgram) -> str:
-        """Build a partner post text in Маша's BMW voice."""
+        """Build a partner post text in Маша's BMW voice (template fallback)."""
         link = program.goto_link  # Use goto_link as-is!
         cat_label = program.category_name or "авто"
         discount_text = (

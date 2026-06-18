@@ -387,6 +387,69 @@ def _ensure_footer(text: str) -> str:
     return text
 
 
+# Keywords that make a news post parts/diagnostics-related → cross-promote a
+# partner link in the footer. Conservative list to avoid spamming every post.
+_PARTNER_FOOTER_KEYWORDS = [
+    "запчаст", "детал", "артикул", "масло", "фильтр", "колодк", "свеч",
+    "ремень", "тормоз", "двигател", "мотор", "ремонт", "сервис", "диагност",
+    "vin", "вин", "подбор", "купить", "стоимост", "цена", "кузов", "ходов",
+    "подвеск", "руль", "коробк", "сцеплен", "амортиз", "подшипн", "сальник",
+    "прокладк", "датчик", "реле", "насос", "стойка", "шины", "диски", "резин",
+    "инструмент", "гараж", "страхов", "осаго", "каск",
+]
+
+
+def _maybe_add_partner_footer_link(text: str, news_item: Dict, has_media: bool) -> str:
+    """Append a single topical partner link before the footer for parts-related news.
+
+    Detects whether the post text mentions parts/diagnostics/etc. and, if so,
+    selects ONE topical partner (matching the post keywords) and adds a clean
+    one-line "🔗 Запчасти/шины/...: <name> — <goto_link>" recommendation.
+
+    Skipped (returns text unchanged) when:
+      - partner_manager has no programs loaded
+      - the post text doesn't match any parts-related keyword
+      - adding the line would exceed the caption/text limit (media=1024)
+    Uses goto_link EXACTLY as-is from partners.json.
+    """
+    try:
+        from bot.partners import partner_manager
+        partner_manager.ensure_loaded()
+        if not partner_manager.programs:
+            return text
+    except Exception:
+        return text
+
+    haystack = f"{text} {news_item.get('title', '')} {news_item.get('summary', '')}".lower()
+    if not any(kw in haystack for kw in _PARTNER_FOOTER_KEYWORDS):
+        return text
+
+    # Pick a topical partner (matches post keywords; dedup against recent)
+    try:
+        program = partner_manager.get_topical_program(
+            f"{news_item.get('title', '')} {news_item.get('summary', '')}",
+            exclude_recent=True,
+        )
+    except Exception:
+        program = None
+    if not program or not program.goto_link:
+        return text
+
+    # Build a short label from the program's category description
+    try:
+        label = program._get_category_description() or "рекомендую"
+    except Exception:
+        label = "рекомендую"
+    line = f"🔗 {label.capitalize()}: {program.name} — {program.goto_link}"
+
+    # Respect the char budget — never let the footer link push the post over limit
+    limit = config.TELEGRAM_CAPTION_LIMIT if has_media else config.TELEGRAM_TEXT_LIMIT
+    candidate = text.rstrip() + "\n\n" + line
+    if len(candidate) > limit - 60:  # leave room for the footer
+        return text
+    return candidate
+
+
 def _enforce_char_limit(text: str, has_media: bool) -> str:
     """Smart character limit enforcement — always preserves footer.
 
@@ -1303,6 +1366,15 @@ class ChannelManager:
             if not _validate_post_text(post_text):
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
+
+            # ── Cross-promote: add a topical partner link for parts-related news ──
+            # Adds ONE clean "🔗 ...: <name> — <goto_link>" line before the footer
+            # when the post mentions parts/diagnostics/tires/etc. Skipped when the
+            # text doesn't match, or when it would push the post over the char limit.
+            try:
+                post_text = _maybe_add_partner_footer_link(post_text, news_item, has_media)
+            except Exception as e:
+                logger.debug(f"Partner footer link skipped: {e}")
 
             # ── MEDIA DECISION ──
             #

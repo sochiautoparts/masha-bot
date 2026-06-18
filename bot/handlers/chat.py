@@ -93,6 +93,118 @@ def _is_vin_query(text: str) -> bool:
     return any(kw in text_lower for kw in keywords)
 
 
+# ── Chat-context detection (Opt 6 / 7 / 8) ───────────────────────────────────
+#
+# Builds a list of context lines that tell the AI:
+#   - whether it's replying in a private chat or a group/comment thread
+#     (so it shapes the answer — short & punchy in groups, detailed in DMs);
+#   - when the user's message is a reply to a channel post in the linked
+#     discussion group, the ORIGINAL post text (so the reply is on-topic);
+#   - when the chat is a forum-style supergroup, the active topic
+#     (message_thread_id) so the AI is aware of the thread context.
+
+def _detect_chat_context(message: Message) -> list[str]:
+    """Detect chat-type / channel-comment / forum-topic context for the AI.
+
+    Returns a list of short lines to be joined and prepended to extra_context.
+    Never raises — always returns a (possibly empty) list.
+    """
+    parts: list[str] = []
+    try:
+        chat = message.chat
+        chat_type = getattr(chat, "type", "private")
+
+        # ── Opt 6: chat-type awareness ──
+        if chat_type in ("group", "supergroup"):
+            parts.append(
+                "Отвечаешь в ГРУППЕ/комментариях — пиши КОРОТКО и живо "
+                "(до ~600 символов), без длинных вступлений. Можно эмодзи."
+            )
+        else:
+            parts.append(
+                "Отвечаешь в ЛИЧКЕ — можно подробнее, развёрнуто и с примерами."
+            )
+
+        # ── Opt 8: forum topic awareness ──
+        # Forum supergroups carry is_forum=True; each topic has its own
+        # message_thread_id. The "General" topic uses thread_id == 1.
+        is_forum = bool(getattr(chat, "is_forum", False))
+        thread_id = getattr(message, "message_thread_id", None)
+        if is_forum and thread_id:
+            topic_name = _resolve_forum_topic_name(message, thread_id)
+            if topic_name:
+                parts.append(
+                    f"Это форум-супергруппа, тема «{topic_name}» "
+                    f"(thread_id={thread_id}). Отвечай по теме."
+                )
+            else:
+                parts.append(
+                    f"Это форум-супергруппа, тема thread_id={thread_id}. "
+                    "Отвечай строго по теме обсуждения."
+                )
+
+        # ── Opt 7: channel-post comment detection ──
+        # When a user replies to a channel post in the linked discussion group,
+        # message.reply_to_message is the forwarded/sent copy of that channel
+        # post. Use its text as context so the AI's reply is on-topic.
+        reply = getattr(message, "reply_to_message", None)
+        if reply is not None:
+            original_text = _extract_original_post_text(reply)
+            if original_text:
+                snippet = original_text[:500].replace("\n", " ")
+                parts.append(
+                    "Это ответ (комментарий) на пост в канале. "
+                    "Оригинальный пост:\n"
+                    f"«{snippet}»\n"
+                    "Отвечай по существу этого поста."
+                )
+    except Exception as e:
+        logger.debug(f"_detect_chat_context error: {e}")
+
+    return parts
+
+
+def _resolve_forum_topic_name(message: Message, thread_id: int) -> str:
+    """Best-effort resolve of a forum topic name by its thread_id.
+
+    aiogram doesn't expose the topic list directly on a Message, so we return
+    "" when unknown. A future enhancement could cache the forum's topic map via
+    bot.get_forum_topic_icon_set / bot.get_chat. For now, empty is fine — the
+    caller still passes thread_id to the AI.
+    """
+    # The "General" topic is conventionally thread_id == 1.
+    if thread_id == 1:
+        return "General"
+    return ""
+
+
+def _extract_original_post_text(reply: Message) -> str:
+    """Extract the text of the original channel post a reply is attached to.
+
+    Handles three cases in Telegram discussion groups:
+      1. reply is a forwarded copy of the channel post → reply.text / caption
+      2. reply was sent by the channel itself (reply.sender_chat is the channel)
+      3. reply is from the bot (reply.from_user.is_bot) quoting a channel post
+    Returns "" when the reply doesn't look like a channel-post reference.
+    """
+    try:
+        # Case: the reply itself has text/caption
+        candidate = (reply.text or reply.caption or "").strip()
+        if not candidate:
+            return ""
+        # Heuristic: treat as a channel-post reference if the reply's sender is
+        # the channel (sender_chat) or a bot (the bot reposting), OR if the chat
+        # is a supergroup (discussion groups are supergroups).
+        is_channel_sender = bool(getattr(reply, "sender_chat", None))
+        is_bot_sender = bool(getattr(reply.from_user, "is_bot", False)) if reply.from_user else False
+        is_supergroup = getattr(reply.chat, "type", "") == "supergroup"
+        if is_channel_sender or is_bot_sender or is_supergroup:
+            return candidate
+    except Exception:
+        pass
+    return ""
+
+
 # ── Gender detection from Russian first name ────────────────────────────────
 
 MALE_NAME_ENDINGS = ("й", "ь", "н", "л", "р", "с", "т", "в", "к", "м", "г", "б", "д", "п", "з", "ж", "х")
@@ -660,6 +772,13 @@ async def _process_text_message(message: Message, text: str):
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    # ── Detect chat context: group/private, channel-post comment, forum topic ──
+    # This context is injected into the AI prompt so responses adapt to where
+    # the conversation is happening (short & punchy in groups/comments, detailed
+    # in private; aware of the original channel post when replying in a
+    # discussion group; aware of the forum topic when in a forum supergroup).
+    chat_context_parts = _detect_chat_context(message)
+
     text_lower = text.lower()
     if any(kw in text_lower for kw in ["запчаст", "деталь", "артикул", "купить", "найти запчас", "подобрать", "vin", "вин"]):
         thinking_msg = random.choice(MASHA_PHRASES["part_search"])
@@ -679,6 +798,11 @@ async def _process_text_message(message: Message, text: str):
 
     extra_context_parts = []
     collected_partner_links = []
+
+    # Chat-context (group/private, channel-post comment, forum topic) FIRST,
+    # so the AI knows how to shape its answer before any other context.
+    if chat_context_parts:
+        extra_context_parts.append("\n".join(chat_context_parts))
 
     user_context = _get_user_persona_context(message)
     if user_context:
@@ -1004,9 +1128,11 @@ async def _send_response(message: Message, response, status_msg: Message = None,
     In groups/comments, partner links are sent as a SEPARATE reply so they
     always remain visible (never cut off by the group char budget).
     In private chat, partner links are appended inline after the answer.
+    Forum topics: replies are sent into the correct message_thread_id so they
+    land in the same topic the user wrote from.
     """
     if not response or response.error or not response.text:
-        await message.answer("Не получилось ответить 😅 Попробуй ещё раз!")
+        await _safe_reply(message, "Не получилось ответить 😅 Попробуй ещё раз!")
         if status_msg:
             try:
                 await status_msg.delete()
@@ -1040,8 +1166,8 @@ async def _send_response(message: Message, response, status_msg: Message = None,
         if len(text) > max_chars:
             text = _truncate_at_boundary(text, max_chars)
         if text.strip():
-            await message.answer(text)
-        await message.reply(partner_section)
+            await _safe_reply(message, text)
+        await _safe_reply(message, partner_section)
         return
 
     # ── Private chat path: append partner section inline ──
@@ -1049,13 +1175,30 @@ async def _send_response(message: Message, response, status_msg: Message = None,
         text = text.rstrip() + "\n\n" + partner_section
 
     if len(text) <= max_chars:
-        await message.answer(text)
+        await _safe_reply(message, text)
     elif len(text) <= config.TELEGRAM_TEXT_LIMIT:
-        await message.answer(text)
+        await _safe_reply(message, text)
     else:
         chunks = _split_message(text, max_length=config.TELEGRAM_TEXT_LIMIT)
         for chunk in chunks:
-            await message.answer(chunk)
+            await _safe_reply(message, chunk)
+
+
+async def _safe_reply(message: Message, text: str) -> None:
+    """Send a message that lands in the same forum topic / thread as `message`.
+
+    Uses message.reply() so the reply quote links back to the user's message
+    AND the message_thread_id is preserved in forum supergroups. For private
+    chats (no thread), reply() behaves identically to answer().
+    Falls back to message.answer() if reply() fails.
+    """
+    try:
+        await message.reply(text)
+    except Exception:
+        try:
+            await message.answer(text)
+        except Exception as e:
+            logger.debug(f"_safe_reply failed: {e}")
 
 
 def _truncate_at_boundary(text: str, max_chars: int) -> str:

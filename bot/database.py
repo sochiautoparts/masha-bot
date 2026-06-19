@@ -375,32 +375,85 @@ class Database:
         )
         await self._conn.commit()
 
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Normalize a URL for dedup comparison.
+
+        Strips trailing slash, lowercases host, removes common tracking query params.
+        This prevents the same article from being posted twice when the URL has
+        trivial differences (e.g. `url` vs `url/` vs `url?utm_source=...`).
+        """
+        if not url:
+            return ""
+        u = url.strip()
+        # Strip trailing slash (but keep root `/`)
+        if u.endswith("/") and u.count("/") > 3:
+            u = u.rstrip("/")
+        # Drop tracking query params
+        if "?" in u:
+            base, _, query = u.partition("?")
+            # Keep only meaningful params (drop utm_*, ref, source, etc.)
+            kept = []
+            for kv in query.split("&"):
+                if "=" in kv:
+                    k, _, _v = kv.partition("=")
+                    k = k.lower()
+                    if k.startswith("utm_") or k in ("ref", "source", "ref_src", "ref_url"):
+                        continue
+                    kept.append(kv)
+                else:
+                    kept.append(kv)
+            u = base + ("?" + "&".join(kept) if kept else "")
+        return u
+
     async def is_source_url_posted(self, source_url: str) -> bool:
         """Check if a source URL has already been posted to the channel.
 
         This is the PRIMARY dedup mechanism — if the same article URL was
         already posted, we skip it regardless of what text the AI generates.
         Prevents the same news being posted multiple times with different text.
+
+        v9.0: Normalizes the URL before checking (strips trailing slash,
+        removes tracking params) so trivially-different URLs are treated
+        as duplicates.
         """
         if not source_url:
             return False
         assert self._conn is not None
 
-        # Check channel_posts table for this source URL
-        async with self._conn.execute(
-            "SELECT id FROM channel_posts WHERE source = ? LIMIT 1",
-            (source_url,)
-        ) as cur:
-            if await cur.fetchone():
-                return True
+        normalized = self._normalize_url(source_url)
+        # Candidates: original AND normalized (in case DB stores either form)
+        candidates = [source_url, normalized]
+        # Also try with/without trailing slash
+        if normalized.endswith("/"):
+            candidates.append(normalized.rstrip("/"))
+        else:
+            candidates.append(normalized + "/")
+        # De-dup the list (preserving order)
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            if c and c not in seen:
+                seen.add(c)
+                unique_candidates.append(c)
+
+        # Check channel_posts table for any URL variant
+        for url_variant in unique_candidates:
+            async with self._conn.execute(
+                "SELECT id FROM channel_posts WHERE source = ? LIMIT 1",
+                (url_variant,)
+            ) as cur:
+                if await cur.fetchone():
+                    return True
 
         # Also check news_items table for is_used flag
-        async with self._conn.execute(
-            "SELECT id FROM news_items WHERE url = ? AND is_used = 1 LIMIT 1",
-            (source_url,)
-        ) as cur:
-            if await cur.fetchone():
-                return True
+        for url_variant in unique_candidates:
+            async with self._conn.execute(
+                "SELECT id FROM news_items WHERE url = ? AND is_used = 1 LIMIT 1",
+                (url_variant,)
+            ) as cur:
+                if await cur.fetchone():
+                    return True
 
         return False
 

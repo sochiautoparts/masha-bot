@@ -1854,62 +1854,210 @@ class ChannelManager:
         This prevents the bot from reporting "3 consecutive empty cycles" and sending
         false alerts. When dedup blocks everything, we post a BMW fact or evergreen
         content instead of returning False.
-        """
-        try:
-            # Try loading the evergreen pool
-            import json
-            from pathlib import Path
-            evergreen_path = Path(__file__).parent / "data" / "evergreen_pool.json"
-            if not evergreen_path.exists():
-                logger.debug("Evergreen pool not found, skipping fallback")
-                return False
 
+        v9.0 FIX: Previously used `Path(__file__).parent / "data" / "evergreen_pool.json"`
+        — but channel.py lives at the repo ROOT, so that path resolved to
+        `<repo>/data/evergreen_pool.json` which DOES NOT EXIST. The actual file is at
+        `<repo>/bot/data/evergreen_pool.json`. The fallback therefore ALWAYS returned
+        False silently (the `if not evergreen_path.exists()` branch), and the bot went
+        silent for hours whenever the news pool was exhausted.
+
+        v9.0 also:
+          - Logs every early-return path at INFO level (no more silent failures)
+          - Tries multiple random items (up to 5) so a single bad item doesn't kill it
+          - Falls back to a hard-coded static BMW fact if the JSON file is missing
+          - Still posts a static fact even if AI generation completely fails
+        """
+        import json
+        import random as _rand
+        from pathlib import Path
+
+        # ── Resolve evergreen_pool.json path ──
+        # channel.py is at the repo root, the data file is at bot/data/evergreen_pool.json
+        # Try multiple candidate locations for robustness.
+        _repo_root = Path(__file__).parent.resolve()
+        _candidate_paths = [
+            _repo_root / "bot" / "data" / "evergreen_pool.json",  # actual location
+            _repo_root / "data" / "evergreen_pool.json",            # legacy/alt location
+        ]
+        evergreen_path = None
+        for p in _candidate_paths:
+            if p.exists():
+                evergreen_path = p
+                break
+
+        if evergreen_path is None:
+            logger.warning(
+                "Evergreen pool file not found in any of: %s — using hard-coded static fact",
+                [str(p) for p in _candidate_paths],
+            )
+            # Last-resort: post a hard-coded BMW fact so the channel isn't silent
+            return await self._post_static_bmw_fact()
+
+        try:
             with open(evergreen_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             pool = data.get("evergreen_pool", [])
             if not pool:
-                logger.debug("Evergreen pool empty, skipping fallback")
-                return False
+                logger.warning("Evergreen pool empty at %s — using static fact", evergreen_path)
+                return await self._post_static_bmw_fact()
 
-            # Pick a random evergreen item
-            import random as _rand
-            item = _rand.choice(pool)
-            topic = item.get("topic", "")
-            context = item.get("context", "")
-            content_type = item.get("content_type", "lore/history")
-            character_hint = item.get("character_hint", "Маша")
-
-            if not topic:
-                return False
-
-            # Build a simple evergreen news_item-like dict for post generation
-            evergreen_item = {
-                "title": topic,
-                "summary": context,
-                "url": "",
-                "content_type": content_type,
-                "lang": "ru",
-            }
-
-            # Generate post text using AI
-            post_text = await self._generate_post_text(
-                evergreen_item, has_media=False, media_count=0, resolved_url=""
+            logger.info(
+                "Evergreen pool loaded: %d items from %s", len(pool), evergreen_path.name
             )
-            if not post_text:
-                # Even AI failed — post a simple static BMW fact
-                post_text = f"🏎️ {topic}\n\n{context}\n\n#BMW #BMWMpower #МашаБМВ"
 
-            # Clean and validate
-            post_text = _clean_post_text(post_text)
-            if not _validate_post_text(post_text):
-                logger.warning("Evergreen post validation failed")
-                return False
+            # Try up to 5 different random items — if one fails validation, try the next.
+            # Avoids the "single bad item blocks the whole fallback" failure mode.
+            tried_ids: set = set()
+            max_attempts = min(5, len(pool))
+            for attempt in range(max_attempts):
+                available = [it for it in pool if id(it) not in tried_ids]
+                if not available:
+                    break
+                item = _rand.choice(available)
+                tried_ids.add(id(item))
 
-            # Enforce text limit (no media for evergreen)
-            if len(post_text) > config.TELEGRAM_TEXT_LIMIT:
-                post_text = _enforce_char_limit(post_text, has_media=False)
+                topic = item.get("topic", "")
+                context = item.get("context", "")
+                content_type = item.get("content_type", "lore/history")
+                character_hint = item.get("character_hint", "Маша")
 
-            # Send as text-only post
+                if not topic:
+                    logger.info("Evergreen item has no topic, trying next (attempt %d/%d)", attempt + 1, max_attempts)
+                    continue
+
+                # Build a simple evergreen news_item-like dict for post generation
+                evergreen_item = {
+                    "title": topic,
+                    "summary": context,
+                    "url": "",
+                    "content_type": content_type,
+                    "lang": "ru",
+                }
+
+                # Try AI generation (may take 20-40s on local model)
+                post_text: Optional[str] = None
+                try:
+                    post_text = await self._generate_post_text(
+                        evergreen_item, has_media=False, media_count=0, resolved_url=""
+                    )
+                except Exception as ai_err:
+                    logger.warning(
+                        "Evergreen AI generation threw exception for %r: %s — using static text",
+                        topic[:50], ai_err,
+                    )
+
+                if not post_text:
+                    # AI failed or returned empty — use a deterministic static post
+                    post_text = (
+                        f"🏎️ {topic}\n\n"
+                        f"{context}\n\n"
+                        f"Автор @asmasha_bot\n"
+                        f"@bmw_mpower_club\n"
+                        f"#bmw_mpower_club #BMW #BMWMpower #МашаБМВ"
+                    )
+                    logger.info("Using static evergreen text for: %s", topic[:50])
+
+                # Clean and validate
+                post_text = _clean_post_text(post_text)
+                if not _validate_post_text(post_text):
+                    logger.warning(
+                        "Evergreen post validation failed (attempt %d/%d) for: %s — trying next item",
+                        attempt + 1, max_attempts, topic[:50],
+                    )
+                    continue
+
+                # Enforce text limit (no media for evergreen)
+                if len(post_text) > config.TELEGRAM_TEXT_LIMIT:
+                    post_text = _enforce_char_limit(post_text, has_media=False)
+
+                # Send as text-only post
+                try:
+                    sent = await self._bot.send_message(
+                        chat_id=config.CHANNEL_ID,
+                        text=post_text,
+                    )
+                except Exception as send_err:
+                    logger.error(f"Evergreen send_message failed: {send_err}")
+                    continue
+
+                if sent:
+                    await add_channel_post(
+                        content=post_text[:500],
+                        message_id=sent.message_id,
+                        post_type=content_type,
+                        source_url="evergreen",
+                    )
+                    # Add reaction
+                    try:
+                        await self._add_reaction(config.CHANNEL_ID, sent.message_id)
+                    except Exception as react_err:
+                        logger.debug(f"Reaction add failed (non-critical): {react_err}")
+                    logger.info(f"✅ Evergreen post published: {topic[:50]}")
+                    return evergreen_item
+
+            # All attempts failed
+            logger.warning(
+                "All %d evergreen attempts failed validation/send — using static fact", max_attempts
+            )
+            return await self._post_static_bmw_fact()
+
+        except Exception as e:
+            logger.error(f"Evergreen fallback error: {e}", exc_info=True)
+
+        return False
+
+    async def _post_static_bmw_fact(self) -> bool | dict:
+        """Last-resort fallback: post a hard-coded BMW fact when nothing else works.
+
+        This is called when:
+          - The evergreen_pool.json file is missing
+          - All evergreen items fail validation
+          - AI generation completely fails and no other fallback works
+        """
+        # A curated list of BMW facts — pick one at random
+        import random as _rand
+        facts = [
+            (
+                "🏆 E30 M3 — первый M-автомобиль BMW",
+                "E30 M3 (1986-1991) — создан для омологации DTM/Group A. "
+                "S14B23 2.3L I4, 192-238 л.с. Купе, кабриолет, седан и универсал. "
+                "Один из самых коллекционных BMW в истории."
+            ),
+            (
+                "🔥 S63 — король M-division",
+                "S63B44T4 — 4.4L V8 twin-turbo, ставился на M5 F90 (600-635 л.с.), "
+                "M8 F91/92/93 (600-625 л.с.), X5M/X6M G05/F96 (600-625 л.с.). "
+                "Базовый мотор для M-division с 2018 года."
+            ),
+            (
+                "⚡ Neue Klasse — будущее BMW",
+                "Neue Klasse — новая платформа BMW для электромобилей с 2025 года. "
+                "800V архитектура, round displays, новый дизайн интерьера. "
+                "Первый модельный ряд — i3 (седан) и iX3 (SUV)."
+            ),
+            (
+                "🔧 B58 — самый успешный мотор BMW",
+                "B58 (2015+) — 3.0L I6 single-turbo, преемник N55. Ставится на "
+                "M340i, M440i, M550i, M760i, Supra A90. 322-382 л.с. "
+                "Ward's 10 Best Engines 6 раз подряд."
+            ),
+            (
+                "🏁 M5 F90 Competition — самая быстрая Маша",
+                "M5 F90 Competition (2018-2023): S63B44T4 625 л.с., 750 Нм, "
+                "0-100 за 3.3с, xDrive M Mode, ZF 8HP M Steptronic. "
+                "M Dynamic Mode + карбон-керамика опционально."
+            ),
+        ]
+        topic, context = _rand.choice(facts)
+        post_text = (
+            f"🏎️ {topic}\n\n"
+            f"{context}\n\n"
+            f"Автор @asmasha_bot\n"
+            f"@bmw_mpower_club\n"
+            f"#bmw_mpower_club #BMW #BMWMpower #МашаБМВ"
+        )
+        try:
             sent = await self._bot.send_message(
                 chat_id=config.CHANNEL_ID,
                 text=post_text,
@@ -1918,17 +2066,23 @@ class ChannelManager:
                 await add_channel_post(
                     content=post_text[:500],
                     message_id=sent.message_id,
-                    post_type=content_type,
-                    source_url="evergreen",
+                    post_type="lore/history",
+                    source_url="evergreen-static",
                 )
-                # Add reaction
-                await self._add_reaction(config.CHANNEL_ID, sent.message_id)
-                logger.info(f"Evergreen post published: {topic[:50]}")
-                return evergreen_item
-
+                try:
+                    await self._add_reaction(config.CHANNEL_ID, sent.message_id)
+                except Exception:
+                    pass
+                logger.info(f"✅ Static BMW fact posted: {topic[:50]}")
+                return {
+                    "title": topic,
+                    "summary": context,
+                    "url": "",
+                    "content_type": "lore/history",
+                    "lang": "ru",
+                }
         except Exception as e:
-            logger.error(f"Evergreen fallback error: {e}")
-
+            logger.error(f"Static BMW fact post failed: {e}", exc_info=True)
         return False
 
 

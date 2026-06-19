@@ -29,9 +29,18 @@ on:
   workflow_dispatch:
 
 # ═══ CRITICAL: Single concurrency group (aligned with asya-bot) ═══
+# v9.0: Changed cancel-in-progress: true → false
+# Why: With cancel-in-progress: true, every new cron / self-dispatch was killing the
+# currently-running bot mid-cycle. This caused:
+#   - Bot process killed in the middle of AI generation (wasted API calls)
+#   - Database transactions interrupted (occasional corruption)
+#   - The "Re-dispatch workflow" step never running, so 24/7 coverage was lost
+#   - Logs showing dozens of runs cancelled within minutes of starting
+# With cancel-in-progress: false, new triggers are queued and run AFTER the current
+# run finishes naturally. The 5h45m timeout ensures the bot can't run forever.
 concurrency:
   group: masha-bot-single
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write

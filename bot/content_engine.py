@@ -725,7 +725,19 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
                 if is_posted:
                     posted_urls.add(url)
         if posted_urls:
-            logger.info(f"Source URL dedup: {len(posted_urls)} already-posted URLs filtered out")
+            unposted_count = len(items) - len(posted_urls)
+            logger.info(
+                f"Source URL dedup: {len(posted_urls)}/{len(items)} already-posted URLs filtered out "
+                f"({unposted_count} remaining)"
+            )
+            # v9.0: If ALL items are filtered out, log a few candidate URLs for debugging
+            if unposted_count == 0 and len(items) > 0:
+                sample = items[:3]
+                logger.info(
+                    "All %d news items already posted — first 3 examples: %s",
+                    len(items),
+                    [it.get("url", "")[:80] for it in sample],
+                )
     except Exception as e:
         logger.debug(f"Source URL pre-filter failed: {e}")
 

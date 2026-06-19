@@ -914,6 +914,117 @@ class ChannelManager:
             pass
         return images
 
+    async def _fetch_evergreen_image(self, topic: str) -> List[bytes]:
+        """Fetch a relevant BMW image for an evergreen topic.
+
+        v9.1: Evergreen posts were text-only, making the channel look bare.
+        This method matches keywords from the evergreen topic against
+        news.json items (which already have curated, high-quality images)
+        and downloads the first matching image.
+
+        Matching strategy:
+          1. Extract BMW-relevant keywords from the topic (M5, E30, VANOS, B58, etc.)
+          2. Search news.json items for any whose title/summary contains those keywords
+          3. Download the first matching image (1 image only — evergreen posts use 1 photo)
+
+        Returns:
+          List with one image bytes payload, or empty list if no match / download failed.
+        """
+        try:
+            # BMW model/engine keywords to match against news.json
+            # Order matters — more specific keywords first
+            match_keywords = [
+                # BMW models (specific chassis codes)
+                "e30", "e36", "e46", "e39", "e60", "e90", "f10", "f30", "f80", "f82", "f87", "f90",
+                "g20", "g80", "g82", "g87", "g90", "g60", "g70",
+                # BMW M models
+                "m1 ", "m2", "m3", "m4", "m5", "m6", "m8",
+                "x5m", "x6m", "x3m", "x4m",
+                # BMW engines
+                "s14", "s54", "s55", "s58", "s63", "s68",
+                "n54", "n55", "n63", "b48", "b58", "b46",
+                # BMW tech
+                "vanos", "valvetronic", "xdrive", "hpfp", "isc",
+                # BMW sub-brands
+                "alpina", "bovensiepen", "mini cooper", "rolls-royce",
+                # BMW electric
+                "neue klasse", "ix3", "ix1", "ix2", "i3", "i4", "i5", "i7", "i8", "im3", "ix ",
+                # BMW racing
+                "dtm", "lemans", "le mans", "m motorsport", "procar",
+                # Common BMW terms
+                "bimmercode", "ista", "realoem", "bimmer",
+                # Tools/services
+                "amg", "mercedes",
+                # v9.1.1: Generic fallback — almost all evergreen topics are about BMW,
+                # so if no specific keyword matched, just look for any BMW-relevant news.json
+                # item with images (used as last-resort, lower priority than specific matches)
+                "bmw", "бмв",
+                # Body styles
+                "wagon", "sedan", "coupe", "suv", "convertible", "touring",
+                # General automotive terms that may help match
+                "turbo", "hybrid", "electric", "diesel", "manual", "automatic",
+            ]
+
+            topic_lower = topic.lower()
+            # Find which keywords appear in the topic
+            matched = [kw for kw in match_keywords if kw in topic_lower]
+            if not matched:
+                logger.debug(f"No image-matchable keywords in evergreen topic: {topic[:50]}")
+                # Even with no keyword match, fall through to BMW fallback below
+                matched = ["bmw"]  # Always fall through with generic BMW
+
+            # Fetch news.json
+            try:
+                from news import fetch_news_json
+                items = await fetch_news_json(limit=500)
+            except Exception as e:
+                logger.debug(f"Could not fetch news.json for evergreen image: {e}")
+                return []
+
+            if not items:
+                return []
+
+            # Find a matching news item that has images
+            # Prefer items whose title contains MORE matched keywords (better relevance)
+            best_match = None
+            best_score = 0
+            for it in items:
+                title = (it.get("title", "") + " " + it.get("summary", "")).lower()
+                score = sum(1 for kw in matched if kw in title)
+                if score > best_score:
+                    images = it.get("images") or it.get("image_urls") or []
+                    if images and isinstance(images, list) and images[0]:
+                        best_score = score
+                        best_match = it
+
+            if not best_match or best_score == 0:
+                logger.debug(f"No news.json match for evergreen topic: {topic[:50]} (keywords: {matched[:3]})")
+                return []
+
+            images = best_match.get("images") or best_match.get("image_urls") or []
+            if not images:
+                return []
+
+            image_url = images[0]
+            logger.info(
+                f"Evergreen image match: '{topic[:40]}' ↔ news '{best_match.get('title', '')[:40]}' "
+                f"(score={best_score}, keywords={matched[:3]})"
+            )
+
+            # Download the image
+            try:
+                downloaded = await self._download_images([image_url], max_count=1, curated=True)
+                if downloaded:
+                    return downloaded
+            except Exception as e:
+                logger.debug(f"Evergreen image download failed: {e}")
+
+            return []
+
+        except Exception as e:
+            logger.debug(f"Evergreen image fetch error: {e}")
+            return []
+
     async def _resolve_article_url(self, url: str, title: str = "") -> str:
         """Resolve a news URL to a direct article link.
 
@@ -1935,11 +2046,27 @@ class ChannelManager:
                     "lang": "ru",
                 }
 
+                # ── v9.1: Try to attach a relevant image from news.json ──
+                # Evergreen posts were text-only, which made the channel look bare.
+                # Now we fetch a relevant BMW image from news.json (matched by keyword)
+                # so evergreen posts look like proper news posts with photos.
+                image_data_list: list = []
+                has_media = False
+                try:
+                    image_data_list = await self._fetch_evergreen_image(topic)
+                    has_media = len(image_data_list) > 0
+                except Exception as img_err:
+                    logger.debug(f"Evergreen image fetch failed (non-critical): {img_err}")
+
                 # Try AI generation (may take 20-40s on local model)
+                # Tell the AI whether media will be attached so it adjusts the length
                 post_text: Optional[str] = None
                 try:
                     post_text = await self._generate_post_text(
-                        evergreen_item, has_media=False, media_count=0, resolved_url=""
+                        evergreen_item,
+                        has_media=has_media,
+                        media_count=len(image_data_list) if has_media else 0,
+                        resolved_url="",
                     )
                 except Exception as ai_err:
                     logger.warning(
@@ -1967,19 +2094,81 @@ class ChannelManager:
                     )
                     continue
 
-                # Enforce text limit (no media for evergreen)
-                if len(post_text) > config.TELEGRAM_TEXT_LIMIT:
+                # Enforce text limit (caption limit if media, text limit if no media)
+                if has_media and len(post_text) > config.TELEGRAM_CAPTION_LIMIT:
+                    post_text = _enforce_char_limit(post_text, has_media=True)
+                elif not has_media and len(post_text) > config.TELEGRAM_TEXT_LIMIT:
                     post_text = _enforce_char_limit(post_text, has_media=False)
 
-                # Send as text-only post
+                # Ensure footer + final limit
+                post_text = _ensure_footer(post_text)
+                post_text = _enforce_char_limit(post_text, has_media)
+
+                # Send post — with image if available, text-only otherwise
+                sent = None
                 try:
-                    sent = await self._bot.send_message(
-                        chat_id=config.CHANNEL_ID,
-                        text=post_text,
-                    )
+                    if has_media and image_data_list:
+                        # Save image to temp file
+                        import tempfile
+                        import os as _os
+                        import time as _time
+                        tmp_path = _os.path.join(
+                            tempfile.gettempdir(),
+                            f"masha_evergreen_{int(_time.time())}.jpg",
+                        )
+                        # Resize/validate via PIL if available
+                        try:
+                            from PIL import Image
+                            import io
+                            img = Image.open(io.BytesIO(image_data_list[0]))
+                            w, h = img.size
+                            if w + h > 10000:
+                                scale = 8000 / (w + h)
+                                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                            if img.mode in ('RGBA', 'P', 'LA'):
+                                img = img.convert('RGB')
+                            buf = io.BytesIO()
+                            img.save(buf, format='JPEG', quality=90)
+                            image_data_list[0] = buf.getvalue()
+                        except Exception:
+                            pass  # Use image as-is
+
+                        with open(tmp_path, "wb") as f:
+                            f.write(image_data_list[0])
+                        try:
+                            photo = FSInputFile(tmp_path, filename="masha_evergreen.jpg")
+                            sent = await self._bot.send_photo(
+                                chat_id=config.CHANNEL_ID,
+                                photo=photo,
+                                caption=post_text,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        finally:
+                            try:
+                                _os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                    else:
+                        sent = await self._bot.send_message(
+                            chat_id=config.CHANNEL_ID,
+                            text=post_text,
+                        )
                 except Exception as send_err:
-                    logger.error(f"Evergreen send_message failed: {send_err}")
-                    continue
+                    logger.error(f"Evergreen send failed: {send_err}")
+                    # If photo failed, retry as text-only
+                    if has_media:
+                        try:
+                            logger.info("Evergreen photo failed — retrying as text-only")
+                            sent = await self._bot.send_message(
+                                chat_id=config.CHANNEL_ID,
+                                text=post_text,
+                            )
+                            has_media = False
+                        except Exception as e2:
+                            logger.error(f"Evergreen text-only retry also failed: {e2}")
+                            continue
+                    else:
+                        continue
 
                 if sent:
                     await add_channel_post(
@@ -1987,13 +2176,17 @@ class ChannelManager:
                         message_id=sent.message_id,
                         post_type=content_type,
                         source_url="evergreen",
+                        has_image=has_media,
+                        image_url="",
                     )
                     # Add reaction
                     try:
                         await self._add_reaction(config.CHANNEL_ID, sent.message_id)
                     except Exception as react_err:
                         logger.debug(f"Reaction add failed (non-critical): {react_err}")
-                    logger.info(f"✅ Evergreen post published: {topic[:50]}")
+                    logger.info(
+                        f"✅ Evergreen post published: {topic[:50]} (with_image={has_media})"
+                    )
                     return evergreen_item
 
             # All attempts failed
@@ -2057,23 +2250,85 @@ class ChannelManager:
             f"@bmw_mpower_club\n"
             f"#bmw_mpower_club #BMW #BMWMpower #МашаБМВ"
         )
+
+        # v9.1: Try to attach a relevant image from news.json
+        image_data_list: list = []
+        has_media = False
         try:
-            sent = await self._bot.send_message(
-                chat_id=config.CHANNEL_ID,
-                text=post_text,
-            )
+            image_data_list = await self._fetch_evergreen_image(topic)
+            has_media = len(image_data_list) > 0
+        except Exception:
+            pass
+
+        # Enforce caption limit if media attached
+        if has_media and len(post_text) > config.TELEGRAM_CAPTION_LIMIT:
+            post_text = _enforce_char_limit(post_text, has_media=True)
+
+        try:
+            sent = None
+            if has_media and image_data_list:
+                import tempfile
+                import os as _os
+                import time as _time
+                tmp_path = _os.path.join(
+                    tempfile.gettempdir(),
+                    f"masha_static_{int(_time.time())}.jpg",
+                )
+                # Resize/validate via PIL
+                try:
+                    from PIL import Image
+                    import io
+                    img = Image.open(io.BytesIO(image_data_list[0]))
+                    w, h = img.size
+                    if w + h > 10000:
+                        scale = 8000 / (w + h)
+                        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                    if img.mode in ('RGBA', 'P', 'LA'):
+                        img = img.convert('RGB')
+                    buf = io.BytesIO()
+                    img.save(buf, format='JPEG', quality=90)
+                    image_data_list[0] = buf.getvalue()
+                except Exception:
+                    pass
+
+                with open(tmp_path, "wb") as f:
+                    f.write(image_data_list[0])
+                try:
+                    photo = FSInputFile(tmp_path, filename="masha_static.jpg")
+                    sent = await self._bot.send_photo(
+                        chat_id=config.CHANNEL_ID,
+                        photo=photo,
+                        caption=post_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                finally:
+                    try:
+                        _os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+            if not sent:
+                # Text-only fallback (no image, or photo failed)
+                sent = await self._bot.send_message(
+                    chat_id=config.CHANNEL_ID,
+                    text=post_text,
+                )
+                has_media = False
+
             if sent:
                 await add_channel_post(
                     content=post_text[:500],
                     message_id=sent.message_id,
                     post_type="lore/history",
                     source_url="evergreen-static",
+                    has_image=has_media,
+                    image_url="",
                 )
                 try:
                     await self._add_reaction(config.CHANNEL_ID, sent.message_id)
                 except Exception:
                     pass
-                logger.info(f"✅ Static BMW fact posted: {topic[:50]}")
+                logger.info(f"✅ Static BMW fact posted: {topic[:50]} (with_image={has_media})")
                 return {
                     "title": topic,
                     "summary": context,

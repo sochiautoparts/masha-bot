@@ -515,7 +515,15 @@ def get_date_context() -> str:
 
 
 def get_editorial_aside() -> str:
-    """Get a random editorial aside from persona config."""
+    """Get a random editorial aside from persona config.
+
+    v11.0: Reduced frequency — jokes were taking up to half of each post.
+    Now returns empty ~80% of the time (was: ALWAYS returned a joke).
+    Only ~20% of posts get an editorial aside, keeping posts informative.
+    """
+    # 80% chance of no aside — posts stay informative
+    if random.random() < 0.80:
+        return ""
     if persona.editorial_asides:
         return random.choice(persona.editorial_asides)
     return ""

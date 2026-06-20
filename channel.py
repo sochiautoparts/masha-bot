@@ -63,6 +63,37 @@ POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///
 # Telegram allows up to 10 media per post.
 MAX_IMAGES_PER_POST = 10
 
+# ── Image URL dedup cache — prevents same image across consecutive posts ────
+# v11.0: Tracks recently-used image URLs (by URL stem) so the same photo
+# doesn't appear in multiple consecutive posts. This was the root cause of
+# "bot puts the same images on the last posts" — _fetch_evergreen_image()
+# always picked the highest-scoring news.json item, which was often the SAME
+# item for similar evergreen topics (e.g. "BMW B58 Engine" and "BMW X5 M"
+# both matched the same "X5 M dragrace" article → same image).
+_RECENT_IMAGE_URLS: list[str] = []  # ring buffer of recently-used URL stems
+_RECENT_IMAGE_URLS_MAX = 30  # remember last 30 images (~15 hours of posts)
+
+
+def _mark_image_url_used(url: str) -> None:
+    """Record an image URL as 'used' so it won't be picked again soon."""
+    if not url:
+        return
+    stem = url.split("?")[0].lower().strip()
+    if stem and stem not in _RECENT_IMAGE_URLS:
+        _RECENT_IMAGE_URLS.append(stem)
+        # Trim to max size (ring buffer)
+        if len(_RECENT_IMAGE_URLS) > _RECENT_IMAGE_URLS_MAX:
+            del _RECENT_IMAGE_URLS[: len(_RECENT_IMAGE_URLS) - _RECENT_IMAGE_URLS_MAX]
+
+
+def _is_image_url_recently_used(url: str) -> bool:
+    """Check if an image URL was used recently (within the last N posts)."""
+    if not url:
+        return False
+    stem = url.split("?")[0].lower().strip()
+    return stem in _RECENT_IMAGE_URLS
+
+
 # ── Evergreen / static-fallback dedup ───────────────────────────────────────
 # An evergreen (or static BMW fact) topic may not be reposted within this window.
 # 2 hours comfortably eliminates the observed 3–30 minute repeats while still
@@ -257,6 +288,86 @@ def _clean_post_text(text: str) -> str:
     text = text.strip()
 
     return text
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# EXCESSIVE-JOKE FILTER — keeps posts informative by trimming joke overload
+# ════════════════════════════════════════════════════════════════════════════
+# v11.0: Detects when a post has too many editorial-joke lines and removes
+# the excess so the news content remains the focus. Posts should be
+# INFORMATIVE first, with at most ONE short editorial aside.
+
+# Markers that identify editorial-joke lines (vs. news content)
+_EDITORIAL_JOKE_MARKERS = [
+    # Editorial team characters (Masha's team)
+    "Кинг-Конг", "кинг-конг", "Доктор Ван Дамм", "доктор ван дамм",
+    "Ван Дамм", "ван дамм", "Серёга", "серёга", "Серёгу", "серёгу",
+    "Костя", "костя", "Косте", "косте", "Лена", "лена", "Лену", "лену",
+    # Editorial office / BimmerService jokes
+    "в редакции", "В редакции", "BimmerService", "bimmerservice",
+    "редакция в шоке", "Редакция в шоке", "редакция не спит",
+    "редакция единоглас", "Редакция единоглас",
+    "кофе", "эспрессо", "кофемашина", "карандаш", "дедлайн",
+    # Editorial debate phrases
+    "редакция разделилась", "пол-редакции", "спорили полчаса",
+    "мы в редакции уже спорим", "редакция работает в ритме",
+    # Editorial aside prefix (added by writer.py)
+    "💬",
+]
+
+
+def _is_editorial_joke_line(line: str) -> bool:
+    """Return True if a line looks like an editorial joke/aside (not news content)."""
+    if not line or not line.strip():
+        return False
+    line_lower = line.lower()
+    # A line is a "joke line" if it contains a known editorial marker
+    # AND is relatively short (jokes are usually 1 short sentence)
+    for marker in _EDITORIAL_JOKE_MARKERS:
+        if marker.lower() in line_lower:
+            # Short joke lines are typically < 200 chars
+            if len(line.strip()) < 220:
+                return True
+    return False
+
+
+def _trim_excessive_jokes(text: str) -> str:
+    """If a post has more than ONE editorial-joke line, keep only the first
+    and remove the rest. This ensures jokes never dominate the post.
+
+    Called after post generation. Posts with 0 or 1 joke line are unchanged.
+    Posts with 2+ joke lines keep only the first joke line.
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    joke_line_indices = [i for i, line in enumerate(lines) if _is_editorial_joke_line(line)]
+
+    # If 0 or 1 joke lines — no trimming needed
+    if len(joke_line_indices) <= 1:
+        return text
+
+    # Keep only the FIRST joke line, remove the rest
+    first_joke = joke_line_indices[0]
+    new_lines = []
+    for i, line in enumerate(lines):
+        if i == first_joke:
+            new_lines.append(line)  # keep the first joke
+        elif i in joke_line_indices:
+            # skip subsequent joke lines
+            logger.info(
+                f"Trimmed excessive joke line #{i}: {line[:60]}... "
+                f"(post had {len(joke_line_indices)} joke lines)"
+            )
+            continue
+        else:
+            new_lines.append(line)
+
+    text = '\n'.join(new_lines)
+    # Clean up any triple-newlines left by removed lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 def _validate_post_text(text: str) -> bool:
@@ -925,15 +1036,19 @@ class ChannelManager:
     async def _fetch_evergreen_image(self, topic: str) -> List[bytes]:
         """Fetch a relevant BMW image for an evergreen topic.
 
-        v9.1: Evergreen posts were text-only, making the channel look bare.
-        This method matches keywords from the evergreen topic against
-        news.json items (which already have curated, high-quality images)
-        and downloads the first matching image.
+        v11.0: FIXED same-image bug. Previously always picked the single
+        highest-scoring news.json item, which was often the SAME item for
+        similar evergreen topics (e.g. "BMW B58 Engine" and "BMW X5 M"
+        both matched the same "X5 M dragrace" article → same image repeated).
 
-        Matching strategy:
+        New strategy:
           1. Extract BMW-relevant keywords from the topic (M5, E30, VANOS, B58, etc.)
-          2. Search news.json items for any whose title/summary contains those keywords
-          3. Download the first matching image (1 image only — evergreen posts use 1 photo)
+          2. Score ALL news.json items by keyword match count
+          3. Take the TOP-N matches (N=8) as candidates
+          4. FILTER OUT items whose image URL was used recently (dedup cache)
+          5. Pick RANDOMLY from remaining candidates (variety!)
+          6. If all top-N were recently used, expand to top-20, then top-50
+          7. Mark the picked image URL as used before returning
 
         Returns:
           List with one image bytes payload, or empty list if no match / download failed.
@@ -992,40 +1107,70 @@ class ChannelManager:
             if not items:
                 return []
 
-            # Find a matching news item that has images
-            # Prefer items whose title contains MORE matched keywords (better relevance)
-            best_match = None
-            best_score = 0
+            # v11.0: Score ALL items and collect candidates with images
+            # (was: only tracked the single best match → same image for similar topics)
+            candidates: list[tuple[int, dict, str]] = []  # (score, item, image_url)
             for it in items:
                 title = (it.get("title", "") + " " + it.get("summary", "")).lower()
                 score = sum(1 for kw in matched if kw in title)
-                if score > best_score:
-                    images = it.get("images") or it.get("image_urls") or []
-                    if images and isinstance(images, list) and images[0]:
-                        best_score = score
-                        best_match = it
+                if score == 0:
+                    continue
+                images = it.get("images") or it.get("image_urls") or []
+                if not images or not isinstance(images, list) or not images[0]:
+                    continue
+                candidates.append((score, it, images[0]))
 
-            if not best_match or best_score == 0:
+            if not candidates:
                 logger.debug(f"No news.json match for evergreen topic: {topic[:50]} (keywords: {matched[:3]})")
                 return []
 
-            images = best_match.get("images") or best_match.get("image_urls") or []
-            if not images:
-                return []
+            # Sort by score descending (highest relevance first)
+            candidates.sort(key=lambda x: x[0], reverse=True)
 
-            image_url = images[0]
+            # v11.0: Take TOP-N candidates and pick randomly among unused ones.
+            # This prevents the same image being picked for similar topics.
+            # Progressive expansion: try top-8, then top-20, then top-50, then all.
+            for pool_size in (8, 20, 50, len(candidates)):
+                pool = candidates[:pool_size]
+                # Filter out recently-used images
+                fresh = [(s, it, url) for (s, it, url) in pool if not _is_image_url_recently_used(url)]
+                if fresh:
+                    # Pick RANDOMLY among the fresh candidates (top-scored ones)
+                    # Weighted: higher score = higher chance, but not guaranteed.
+                    # Take top half of fresh pool, then random pick from those.
+                    fresh.sort(key=lambda x: x[0], reverse=True)
+                    top_half = fresh[: max(1, len(fresh) // 2)]
+                    best_score, best_match, image_url = random.choice(top_half)
+                    break
+            else:
+                # All candidates were recently used — take the highest-scoring one anyway
+                best_score, best_match, image_url = candidates[0]
+
             logger.info(
                 f"Evergreen image match: '{topic[:40]}' ↔ news '{best_match.get('title', '')[:40]}' "
-                f"(score={best_score}, keywords={matched[:3]})"
+                f"(score={best_score}, keywords={matched[:3]}, pool={pool_size})"
             )
+
+            # v11.0: Mark this image URL as used BEFORE downloading so concurrent
+            # calls don't pick the same image.
+            _mark_image_url_used(image_url)
 
             # Download the image
             try:
                 downloaded = await self._download_images([image_url], max_count=1, curated=True)
                 if downloaded:
                     return downloaded
+                # Download failed — UN-mark so it can be tried again later
+                # (remove from recently-used list)
+                stem = image_url.split("?")[0].lower().strip()
+                if stem in _RECENT_IMAGE_URLS:
+                    _RECENT_IMAGE_URLS.remove(stem)
             except Exception as e:
                 logger.debug(f"Evergreen image download failed: {e}")
+                # Un-mark on failure
+                stem = image_url.split("?")[0].lower().strip()
+                if stem in _RECENT_IMAGE_URLS:
+                    _RECENT_IMAGE_URLS.remove(stem)
 
             return []
 
@@ -1247,6 +1392,14 @@ class ChannelManager:
 
         # Hard limit (safety — _add_unique already enforces this)
         image_list = image_list[:MAX_IMAGES_PER_POST]
+
+        # v11.0: Mark curated image URLs as used so evergreen posts don't
+        # re-use the same image right after a news post used it.
+        # This cross-contaminates news and evergreen image pools to prevent
+        # the same photo appearing in consecutive posts of any type.
+        if image_list:
+            for url in curated_image_urls:
+                _mark_image_url_used(url)
 
         if not image_list:
             logger.info(
@@ -1557,6 +1710,8 @@ class ChannelManager:
 
             # Clean and validate
             post_text = _clean_post_text(post_text)
+            # v11.0: Trim excessive editorial jokes — keep at most 1 joke line per post
+            post_text = _trim_excessive_jokes(post_text)
             if not _validate_post_text(post_text):
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
@@ -2210,6 +2365,8 @@ class ChannelManager:
 
                 # Clean and validate
                 post_text = _clean_post_text(post_text)
+                # v11.0: Trim excessive editorial jokes — keep at most 1 joke line per post
+                post_text = _trim_excessive_jokes(post_text)
                 if not _validate_post_text(post_text):
                     logger.warning(
                         "Evergreen post validation failed (attempt %d/%d) for: %s — trying next item",

@@ -82,8 +82,9 @@ class ContentWriter:
                 logger.warning("Generated text is empty after cleanup")
                 return None
 
-            # Maybe add editorial aside
-            if random.random() < 0.3:
+            # Maybe add editorial aside (v11.0: reduced from 30% to 8% —
+            # jokes were taking up to half of each post. Now posts are informative.)
+            if random.random() < 0.08:
                 aside = self.persona_manager.get_random_aside()
                 if aside:
                     text = f"{text}\n\n💬 {aside}"

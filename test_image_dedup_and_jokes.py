@@ -107,96 +107,79 @@ check(
 )
 print()
 
-# ─── 2. _fetch_evergreen_image picks UNIQUE images ──────────────────────
-print("── 2. _fetch_evergreen_image — unique images for similar topics ──")
+# ─── 2. _fetch_evergreen_image — now text-only (v11.1) ──────────────────
+print("── 2. _fetch_evergreen_image — text-only evergreen posts (v11.1) ──")
 
 
-async def test_evergreen_image_uniqueness():
-    """Simulate _fetch_evergreen_image logic for 8 different topics and verify
-    all picked images are unique (no same-image bug)."""
-    from news import fetch_news_json
-    items = await fetch_news_json(limit=500)
-    if not items:
-        print("  ⚠️  Skipped (news.json unavailable)")
-        return True
+async def test_evergreen_image_text_only():
+    """Verify _fetch_evergreen_image now returns [] (text-only evergreen posts).
 
-    match_keywords = [
-        "e30", "e36", "e46", "e39", "m1 ", "m2", "m3", "m4", "m5", "m6", "m8",
-        "x5m", "x6m", "s14", "s54", "s55", "s58", "s63", "s68",
-        "n54", "n55", "n63", "b48", "b58",
-        "vanos", "valvetronic", "xdrive", "alpina",
-        "neue klasse", "ix3", "i3", "i4", "i5", "i7",
-        "bmw", "бмв", "wagon", "sedan", "coupe", "turbo", "hybrid", "electric",
-    ]
-
-    topics = [
-        "BMW M3 History: From E30 to G80",
-        "BMW M5: The Legend of the Sports Sedan",
-        "BMW E46 M3: The Driver's Car",
-        "BMW B58 Engine: Modern Reliability",
-        "BMW X5 M: SUV Performance",
-        "BMW M2: The Purist Choice",
-        "BMW S58 Engine: M Power Evolution",
-        "BMW i3 Electric: Neue Klasse",
-    ]
-
-    # Clear dedup cache for clean test
-    _RECENT_IMAGE_URLS.clear()
-
-    picked_urls = []
-    for topic in topics:
-        topic_lower = topic.lower()
-        matched = [kw for kw in match_keywords if kw in topic_lower]
-        if not matched:
-            matched = ["bmw"]
-
-        # Score ALL items (new v11.0 logic)
-        candidates = []
-        for it in items:
-            title = (it.get("title", "") + " " + it.get("summary", "")).lower()
-            score = sum(1 for kw in matched if kw in title)
-            if score == 0:
-                continue
-            images = it.get("images") or it.get("image_urls") or []
-            if not images or not isinstance(images, list) or not images[0]:
-                continue
-            candidates.append((score, it, images[0]))
-
-        if not candidates:
-            continue
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        # v11.0: progressive expansion + random pick
-        picked = None
-        for pool_size in (8, 20, 50, len(candidates)):
-            pool = candidates[:pool_size]
-            fresh = [(s, it, url) for (s, it, url) in pool if not _is_image_url_recently_used(url)]
-            if fresh:
-                fresh.sort(key=lambda x: x[0], reverse=True)
-                top_half = fresh[: max(1, len(fresh) // 2)]
-                picked = random.choice(top_half)
-                break
-        if not picked:
-            picked = candidates[0]
-
-        score, it, image_url = picked
-        _mark_image_url_used(image_url)
-        picked_urls.append(image_url)
-
-    return picked_urls
+    v11.1: Evergreen posts are NOT news — they are pre-made BMW content
+    (history, debates, DIY guides). Photos must come from the news itself,
+    not from unrelated news.json items matched by keyword. So evergreen
+    posts are now text-only.
+    """
+    # Instantiate ChannelManager without __init__ (just for the method)
+    import channel as ch_mod
+    cm = object.__new__(ch_mod.ChannelManager)
+    # Call the method — should return [] immediately
+    result = await cm._fetch_evergreen_image("BMW M3 History: From E30 to G80")
+    return result
 
 
-# Run the async test
-picked_urls = asyncio.run(test_evergreen_image_uniqueness())
-if picked_urls:
-    unique_count = len(set(picked_urls))
-    total_count = len(picked_urls)
-    check(
-        f"8 evergreen topics → {unique_count} unique images (was 4 of 5 before fix)",
-        unique_count == total_count,
-        f"(got {unique_count}/{total_count})",
-    )
+result = asyncio.run(test_evergreen_image_text_only())
+check(
+    f"_fetch_evergreen_image returns [] (text-only, got {result})",
+    result == [],
+    f"(got {result})",
+)
+
+# Verify the function no longer fetches news.json for evergreen images
+import inspect
+from channel import ChannelManager
+src = inspect.getsource(ChannelManager._fetch_evergreen_image)
+check(
+    "_fetch_evergreen_image docstring says 'TEXT-ONLY'",
+    "TEXT-ONLY" in src or "text-only" in src.lower(),
+)
+check(
+    "_fetch_evergreen_image no longer calls fetch_news_json",
+    "fetch_news_json" not in src,
+)
+check(
+    "_fetch_evergreen_image no longer does keyword matching",
+    "match_keywords" not in src,
+)
+print()
+
+# ─── 2b. News posts take images FROM the news itself ────────────────────
+print("── 2b. _get_post_images — takes images FROM the news ──")
+
+import inspect
+from channel import ChannelManager
+src_get = inspect.getsource(ChannelManager._get_post_images)
+
+check(
+    "_get_post_images takes curated_image_urls from news_item",
+    'news_item.get("image_urls"' in src_get or "curated_image_urls" in src_get,
+)
+check(
+    "_get_post_images scrapes article page for additional images",
+    "_scrape_article_images" in src_get,
+)
+check(
+    "_get_post_images uses resolved_url (the actual article URL)",
+    "resolved_url" in src_get,
+)
+# Verify it does NOT pick images from OTHER news.json items
+check(
+    "_get_post_images does NOT call fetch_news_json",
+    "fetch_news_json" not in src_get,
+)
+check(
+    "_get_post_images does NOT do keyword matching against other news",
+    "match_keywords" not in src_get,
+)
 print()
 
 # ─── 3. get_editorial_aside frequency ────────────────────────────────────
@@ -442,7 +425,9 @@ print(f"📊 RESULTS: {passed} ✅  |  {failed} ❌")
 print("=" * 70)
 if failed == 0:
     print("🎉 ALL CHECKS PASSED — Masha bot fixes verified!")
-    print("   + Image dedup: same-image bug FIXED (8 topics → 8 unique images)")
+    print("   + Evergreen posts: TEXT-ONLY (no fake images from unrelated news)")
+    print("   + News posts: images taken FROM the news itself (curated + scrape)")
+    print("   + Image dedup cache: prevents same image across consecutive news posts")
     print("   + Editorial asides: ~20% of posts (was 100%)")
     print("   + writer.py aside injection: 8% (was 30%)")
     print("   + _trim_excessive_jokes: max 1 joke line per post")

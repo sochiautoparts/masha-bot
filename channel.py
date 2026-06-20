@@ -1034,149 +1034,32 @@ class ChannelManager:
         return images
 
     async def _fetch_evergreen_image(self, topic: str) -> List[bytes]:
-        """Fetch a relevant BMW image for an evergreen topic.
+        """Fetch an image for an evergreen topic.
 
-        v11.0: FIXED same-image bug. Previously always picked the single
-        highest-scoring news.json item, which was often the SAME item for
-        similar evergreen topics (e.g. "BMW B58 Engine" and "BMW X5 M"
-        both matched the same "X5 M dragrace" article → same image repeated).
+        v11.1: DISABLED — evergreen posts are now TEXT-ONLY.
 
-        New strategy:
-          1. Extract BMW-relevant keywords from the topic (M5, E30, VANOS, B58, etc.)
-          2. Score ALL news.json items by keyword match count
-          3. Take the TOP-N matches (N=8) as candidates
-          4. FILTER OUT items whose image URL was used recently (dedup cache)
-          5. Pick RANDOMLY from remaining candidates (variety!)
-          6. If all top-N were recently used, expand to top-20, then top-50
-          7. Mark the picked image URL as used before returning
+        Evergreen content (from evergreen_pool.json) is pre-made BMW content
+        (history, debates, DIY guides) that is NOT based on a specific news
+        article. Attaching a photo from an UNRELATED news.json item (matched
+        by keyword) was misleading — the photo showed a current news event,
+        not the historical/educational evergreen topic.
 
-        Returns:
-          List with one image bytes payload, or empty list if no match / download failed.
+        Per requirement: "фото должно браться именно из новости" — photos
+        must come from the news article itself. Since evergreen posts have
+        no source news article, they are published as text-only.
+
+        News posts still get photos from the actual news article via
+        _get_post_images() (curated image_urls from news.json + scraped
+        from the article page).
+
+        This function is kept for API compatibility but always returns [].
         """
-        try:
-            # BMW model/engine keywords to match against news.json
-            # Order matters — more specific keywords first
-            match_keywords = [
-                # BMW models (specific chassis codes)
-                "e30", "e36", "e46", "e39", "e60", "e90", "f10", "f30", "f80", "f82", "f87", "f90",
-                "g20", "g80", "g82", "g87", "g90", "g60", "g70",
-                # BMW M models
-                "m1 ", "m2", "m3", "m4", "m5", "m6", "m8",
-                "x5m", "x6m", "x3m", "x4m",
-                # BMW engines
-                "s14", "s54", "s55", "s58", "s63", "s68",
-                "n54", "n55", "n63", "b48", "b58", "b46",
-                # BMW tech
-                "vanos", "valvetronic", "xdrive", "hpfp", "isc",
-                # BMW sub-brands
-                "alpina", "bovensiepen", "mini cooper", "rolls-royce",
-                # BMW electric
-                "neue klasse", "ix3", "ix1", "ix2", "i3", "i4", "i5", "i7", "i8", "im3", "ix ",
-                # BMW racing
-                "dtm", "lemans", "le mans", "m motorsport", "procar",
-                # Common BMW terms
-                "bimmercode", "ista", "realoem", "bimmer",
-                # Tools/services
-                "amg", "mercedes",
-                # v9.1.1: Generic fallback — almost all evergreen topics are about BMW,
-                # so if no specific keyword matched, just look for any BMW-relevant news.json
-                # item with images (used as last-resort, lower priority than specific matches)
-                "bmw", "бмв",
-                # Body styles
-                "wagon", "sedan", "coupe", "suv", "convertible", "touring",
-                # General automotive terms that may help match
-                "turbo", "hybrid", "electric", "diesel", "manual", "automatic",
-            ]
+        logger.debug(
+            f"Evergreen image fetch disabled (v11.1) — evergreen posts are text-only. "
+            f"Topic: {topic[:50]}"
+        )
+        return []
 
-            topic_lower = topic.lower()
-            # Find which keywords appear in the topic
-            matched = [kw for kw in match_keywords if kw in topic_lower]
-            if not matched:
-                logger.debug(f"No image-matchable keywords in evergreen topic: {topic[:50]}")
-                # Even with no keyword match, fall through to BMW fallback below
-                matched = ["bmw"]  # Always fall through with generic BMW
-
-            # Fetch news.json
-            try:
-                from news import fetch_news_json
-                items = await fetch_news_json(limit=500)
-            except Exception as e:
-                logger.debug(f"Could not fetch news.json for evergreen image: {e}")
-                return []
-
-            if not items:
-                return []
-
-            # v11.0: Score ALL items and collect candidates with images
-            # (was: only tracked the single best match → same image for similar topics)
-            candidates: list[tuple[int, dict, str]] = []  # (score, item, image_url)
-            for it in items:
-                title = (it.get("title", "") + " " + it.get("summary", "")).lower()
-                score = sum(1 for kw in matched if kw in title)
-                if score == 0:
-                    continue
-                images = it.get("images") or it.get("image_urls") or []
-                if not images or not isinstance(images, list) or not images[0]:
-                    continue
-                candidates.append((score, it, images[0]))
-
-            if not candidates:
-                logger.debug(f"No news.json match for evergreen topic: {topic[:50]} (keywords: {matched[:3]})")
-                return []
-
-            # Sort by score descending (highest relevance first)
-            candidates.sort(key=lambda x: x[0], reverse=True)
-
-            # v11.0: Take TOP-N candidates and pick randomly among unused ones.
-            # This prevents the same image being picked for similar topics.
-            # Progressive expansion: try top-8, then top-20, then top-50, then all.
-            for pool_size in (8, 20, 50, len(candidates)):
-                pool = candidates[:pool_size]
-                # Filter out recently-used images
-                fresh = [(s, it, url) for (s, it, url) in pool if not _is_image_url_recently_used(url)]
-                if fresh:
-                    # Pick RANDOMLY among the fresh candidates (top-scored ones)
-                    # Weighted: higher score = higher chance, but not guaranteed.
-                    # Take top half of fresh pool, then random pick from those.
-                    fresh.sort(key=lambda x: x[0], reverse=True)
-                    top_half = fresh[: max(1, len(fresh) // 2)]
-                    best_score, best_match, image_url = random.choice(top_half)
-                    break
-            else:
-                # All candidates were recently used — take the highest-scoring one anyway
-                best_score, best_match, image_url = candidates[0]
-
-            logger.info(
-                f"Evergreen image match: '{topic[:40]}' ↔ news '{best_match.get('title', '')[:40]}' "
-                f"(score={best_score}, keywords={matched[:3]}, pool={pool_size})"
-            )
-
-            # v11.0: Mark this image URL as used BEFORE downloading so concurrent
-            # calls don't pick the same image.
-            _mark_image_url_used(image_url)
-
-            # Download the image
-            try:
-                downloaded = await self._download_images([image_url], max_count=1, curated=True)
-                if downloaded:
-                    return downloaded
-                # Download failed — UN-mark so it can be tried again later
-                # (remove from recently-used list)
-                stem = image_url.split("?")[0].lower().strip()
-                if stem in _RECENT_IMAGE_URLS:
-                    _RECENT_IMAGE_URLS.remove(stem)
-            except Exception as e:
-                logger.debug(f"Evergreen image download failed: {e}")
-                # Un-mark on failure
-                stem = image_url.split("?")[0].lower().strip()
-                if stem in _RECENT_IMAGE_URLS:
-                    _RECENT_IMAGE_URLS.remove(stem)
-
-            return []
-
-        except Exception as e:
-            logger.debug(f"Evergreen image fetch error: {e}")
-            return []
 
     async def _resolve_article_url(self, url: str, title: str = "") -> str:
         """Resolve a news URL to a direct article link.

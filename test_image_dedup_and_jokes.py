@@ -419,6 +419,182 @@ check(
 )
 print()
 
+# ─── 13. Text uniquification + detailed posts + short-news handling ──────
+print("── 13. Text uniquification + detailed posts + short-news handling ──")
+
+from ai.router import MASHA_SYSTEM_PROMPT, CHANNEL_PROMPT_SUFFIX
+import inspect
+from ai.router import AIRouter as AIRouter2
+
+# MASHA_SYSTEM_PROMPT
+check(
+    "MASHA_SYSTEM_PROMPT has 'УНИКАЛИЗАЦИЯ ТЕКСТА' block",
+    "УНИКАЛИЗАЦИЯ ТЕКСТА" in MASHA_SYSTEM_PROMPT,
+)
+check(
+    "MASHA_SYSTEM_PROMPT says NEVER copy source phrases",
+    "НИКОГДА не копируй" in MASHA_SYSTEM_PROMPT,
+)
+check(
+    "MASHA_SYSTEM_PROMPT has short-news handling (КОРОТКАЯ)",
+    "короткая" in MASHA_SYSTEM_PROMPT.lower(),
+)
+check(
+    "MASHA_SYSTEM_PROMPT requires editorial commentary for short news",
+    "редакционный комментарий" in MASHA_SYSTEM_PROMPT,
+)
+check(
+    "MASHA_SYSTEM_PROMPT mentions footer format",
+    "Автор @asmasha_bot" in MASHA_SYSTEM_PROMPT,
+)
+
+# CHANNEL_PROMPT_SUFFIX
+check(
+    "CHANNEL_PROMPT_SUFFIX has 'ЛИМИТЫ И ПОДПИСЬ' block",
+    "ЛИМИТЫ И ПОДПИСЬ" in CHANNEL_PROMPT_SUFFIX,
+)
+check(
+    "CHANNEL_PROMPT_SUFFIX says 1024 chars INCLUDING footer",
+    "1024 символа ВКЛЮЧАЯ подпись" in CHANNEL_PROMPT_SUFFIX,
+)
+check(
+    "CHANNEL_PROMPT_SUFFIX has 'ПОДРОБНОСТЬ И УНИКАЛИЗАЦИЯ' block",
+    "ПОДРОБНОСТЬ И УНИКАЛИЗАЦИЯ" in CHANNEL_PROMPT_SUFFIX,
+)
+check(
+    "CHANNEL_PROMPT_SUFFIX requires minimum 4-6 sentences",
+    "Минимум 4-6 предложений" in CHANNEL_PROMPT_SUFFIX,
+)
+check(
+    "CHANNEL_PROMPT_SUFFIX requires editorial commentary for short news",
+    "редакционный комментарий" in CHANNEL_PROMPT_SUFFIX,
+)
+check(
+    "CHANNEL_PROMPT_SUFFIX has explicit footer format",
+    "Автор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club" in CHANNEL_PROMPT_SUFFIX,
+)
+
+# generate_channel_post type_instructions
+src_gcp = inspect.getsource(AIRouter2.generate_channel_post)
+check(
+    "generate_channel_post has 'ПОДРОБНЫЙ новостейный пост' instruction",
+    "ПОДРОБНЫЙ новостейный пост" in src_gcp,
+)
+check(
+    "generate_channel_post has structured format (хук/факт)",
+    "хук/факт" in src_gcp,
+)
+check(
+    "generate_channel_post requires minimum 4-6 sentences",
+    "МИНИМУМ 4-6 предложений" in src_gcp,
+)
+check(
+    "generate_channel_post has short-news handling",
+    "короткая" in src_gcp.lower(),
+)
+check(
+    "generate_channel_post media_note has 850-900 char text limit",
+    "850-900" in src_gcp,
+)
+check(
+    "generate_channel_post has explicit footer format in user_msg",
+    "Автор @asmasha_bot" in src_gcp and "@bmw_mpower_club" in src_gcp,
+)
+check(
+    "generate_channel_post has УНИКАЛИЗАЦИЯ instruction",
+    "УНИКАЛИЗАЦИЯ" in src_gcp,
+)
+check(
+    "generate_channel_post has КОРОТКАЯ НОВОСТЬ instruction",
+    "КОРОТКАЯ НОВОСТЬ" in src_gcp,
+)
+
+# generate_local_post (fallback)
+src_glp = inspect.getsource(AIRouter2.generate_local_post)
+check(
+    "generate_local_post has 'ПОДРОБНЫЙ ПОСТ' instruction",
+    "ПОДРОБНЫЙ ПОСТ" in src_glp,
+)
+check(
+    "generate_local_post has УНИКАЛИЗАЦИЯ instruction",
+    "УНИКАЛИЗАЦИЯ" in src_glp,
+)
+check(
+    "generate_local_post has КОРОТКАЯ НОВОСТЬ handling",
+    "КОРОТКАЯ НОВОСТЬ" in src_glp,
+)
+check(
+    "generate_local_post requires minimum 4-6 sentences",
+    "Минимум 4-6 предложений" in src_glp,
+)
+check(
+    "generate_local_post has explicit footer format",
+    "Автор @asmasha_bot" in src_glp and "@bmw_mpower_club" in src_glp,
+)
+
+# get_translation_uniquification_hint
+from bot.content_engine import get_translation_uniquification_hint
+hint_ru = get_translation_uniquification_hint("ru")
+hint_en = get_translation_uniquification_hint("en")
+hint_de = get_translation_uniquification_hint("de")
+
+check(
+    "get_translation_uniquification_hint(ru) has 'УНИКАЛИЗАЦИЯ ТЕКСТА'",
+    "УНИКАЛИЗАЦИЯ ТЕКСТА" in hint_ru,
+)
+check(
+    "get_translation_uniquification_hint(ru) has short-news handling",
+    "КОРОТКАЯ НОВОСТЬ" in hint_ru,
+)
+check(
+    "get_translation_uniquification_hint(ru) requires editorial commentary",
+    "редакционный комментарий" in hint_ru,
+)
+check(
+    "get_translation_uniquification_hint(ru) has footer requirement",
+    "Подпись в конце ОБЯЗАТЕЛЬНА" in hint_ru,
+)
+check(
+    "get_translation_uniquification_hint(ru) has char limits (1024 INCLUDING footer)",
+    "1024 символа ВКЛЮЧАЯ подпись" in hint_ru,
+)
+check(
+    "get_translation_uniquification_hint(en) mentions English",
+    "английском" in hint_en,
+)
+check(
+    "get_translation_uniquification_hint(en) has uniquification block",
+    "УНИКАЛИЗАЦИЯ ТЕКСТА" in hint_en,
+)
+check(
+    "get_translation_uniquification_hint(de) mentions German",
+    "немецком" in hint_de,
+)
+
+# _generate_post_text short-news handling in channel.py
+src_gpt = inspect.getsource(channel.ChannelManager._generate_post_text)
+check(
+    "_generate_post_text has short-news detection (<400 chars)",
+    "КОРОТКАЯ" in src_gpt and "400" in src_gpt,
+)
+check(
+    "_generate_post_text requires editorial commentary for short news",
+    "редакционный комментарий" in src_gpt,
+)
+check(
+    "_generate_post_text says 'РАСШИРИТЬ тему' for short news",
+    "РАСШИРИТЬ тему" in src_gpt,
+)
+check(
+    "_generate_post_text has medium-news handling (<800 chars)",
+    "800" in src_gpt,
+)
+check(
+    "_generate_post_text requires minimum 4-6 sentences",
+    "Минимум 4-6 предложений" in src_gpt,
+)
+print()
+
 # ─── SUMMARY ────────────────────────────────────────────────────────────
 print("=" * 70)
 print(f"📊 RESULTS: {passed} ✅  |  {failed} ❌")
@@ -434,6 +610,10 @@ if failed == 0:
     print("   + Prompts emphasize INFORMATIVENESS over jokes")
     print("   + News source: 278 unique-image items from sochiautoparts/nws")
     print("   + Telegram limits respected (1024/4096/10)")
+    print("   + Text UNIQUIFICATION: never copy source, restructure, own commentary")
+    print("   + DETAILED posts: minimum 4-6 sentences, structured (hook→facts→opinion→question)")
+    print("   + SHORT-NEWS handling: editorial commentary required when source <400 chars")
+    print("   + FOOTER awareness: explicit format, char budget (850-900 text + ~120 footer)")
 else:
     print("⚠️  Some checks failed — review above.")
 sys.exit(0 if failed == 0 else 1)

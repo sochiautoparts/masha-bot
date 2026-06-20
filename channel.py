@@ -1370,6 +1370,24 @@ class ChannelManager:
             "Если статья на английском — ПЕРЕВЕДИ факты и напиши пост на русском."
         )
 
+        # v12.0: Short-news handling — if the source is short, force editorial commentary
+        source_text_len = len(full_article_text) if full_article_text else len(summary)
+        if source_text_len < 400:
+            context_parts.append(
+                f"ВНИМАНИЕ: Исходная новость КОРОТКАЯ (~{source_text_len} символов). "
+                "Фактов мало — ОБЯЗАТЕЛЬНО добавь ПОДРОБНЫЙ редакционный комментарий: "
+                "экспертное мнение Маши, сравнение с другими BMW, исторический контекст, "
+                "или мнение 'от редакции' (Серёга бы сказал..., Мы в редакции считаем...). "
+                "Короткая новость = Маша должна РАСШИРИТЬ тему своим комментарием. "
+                "Минимум 4-6 предложений в посте."
+            )
+        elif source_text_len < 800:
+            context_parts.append(
+                f"Исходная новость средняя (~{source_text_len} символов). "
+                "Перескажи СВОИМИ словами + добавь экспертный комментарий Маши. "
+                "Минимум 4-6 предложений."
+            )
+
         full_context = "\n\n".join(context_parts)
 
         # Determine content type from news item category

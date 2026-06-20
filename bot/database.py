@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -379,32 +380,109 @@ class Database:
     def _normalize_url(url: str) -> str:
         """Normalize a URL for dedup comparison.
 
-        Strips trailing slash, lowercases host, removes common tracking query params.
+        Canonicalization:
+          - lowercase scheme + host
+          - strip leading "www." from host
+          - force https scheme (so http:// and https:// are treated as equal)
+          - strip trailing slash (except root "/")
+          - drop tracking query params (utm_*, ref, source, ref_src, ref_url,
+            fbclid, gclid, etc.)
+
         This prevents the same article from being posted twice when the URL has
-        trivial differences (e.g. `url` vs `url/` vs `url?utm_source=...`).
+        trivial differences (http vs https, www vs non-www, trailing slash,
+        tracking params).
         """
         if not url:
             return ""
         u = url.strip()
-        # Strip trailing slash (but keep root `/`)
-        if u.endswith("/") and u.count("/") > 3:
-            u = u.rstrip("/")
-        # Drop tracking query params
-        if "?" in u:
-            base, _, query = u.partition("?")
-            # Keep only meaningful params (drop utm_*, ref, source, etc.)
+        try:
+            from urllib.parse import urlsplit, urlunsplit
+            parts = urlsplit(u)
+            scheme = "https"
+            host = (parts.hostname or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            path = parts.path or ""
+            # Strip trailing slash (but keep root "/")
+            if len(path) > 1 and path.endswith("/"):
+                path = path.rstrip("/")
+            # Drop tracking query params
             kept = []
-            for kv in query.split("&"):
-                if "=" in kv:
-                    k, _, _v = kv.partition("=")
-                    k = k.lower()
-                    if k.startswith("utm_") or k in ("ref", "source", "ref_src", "ref_url"):
-                        continue
-                    kept.append(kv)
-                else:
-                    kept.append(kv)
-            u = base + ("?" + "&".join(kept) if kept else "")
+            if parts.query:
+                for kv in parts.query.split("&"):
+                    if "=" in kv:
+                        k, _, _v = kv.partition("=")
+                        k = k.lower()
+                        if k.startswith("utm_") or k in (
+                            "ref", "source", "ref_src", "ref_url",
+                            "fbclid", "gclid", "mc_cid", "mc_eid",
+                        ):
+                            continue
+                        kept.append(kv)
+                    else:
+                        kept.append(kv)
+            query = "&".join(kept)
+            u = urlunsplit((scheme, host, path, query, ""))
+        except Exception:
+            # Fallback to the pre-v10 simple normalization if urlsplit fails
+            if u.endswith("/") and u.count("/") > 3:
+                u = u.rstrip("/")
+            if "?" in u:
+                base, _, query = u.partition("?")
+                kept = []
+                for kv in query.split("&"):
+                    if "=" in kv:
+                        k, _, _v = kv.partition("=")
+                        k = k.lower()
+                        if k.startswith("utm_") or k in ("ref", "source", "ref_src", "ref_url"):
+                            continue
+                        kept.append(kv)
+                    else:
+                        kept.append(kv)
+                u = base + ("?" + "&".join(kept) if kept else "")
         return u
+
+    @staticmethod
+    def _url_dedup_variants(url: str) -> list[str]:
+        """Build a list of URL variants to check against the DB.
+
+        The DB stores RAW source URLs in channel_posts.source and news_items.url.
+        Because historical posts used the old (looser) normalization, we check
+        several plausible forms of the incoming URL so that an article posted
+        as http://www.example.com/a/, https://example.com/a, etc. is recognized
+        as already-posted.
+        """
+        if not url:
+            return []
+        raw = url.strip()
+        normalized = Database._normalize_url(raw)
+        variants = set()
+        variants.add(raw)
+        variants.add(normalized)
+        # with/without trailing slash
+        if normalized.endswith("/"):
+            variants.add(normalized.rstrip("/"))
+        else:
+            variants.add(normalized + "/")
+        # http vs https of the normalized form
+        if normalized.startswith("https://"):
+            variants.add("http://" + normalized[len("https://"):])
+        elif normalized.startswith("http://"):
+            variants.add("https://" + normalized[len("http://"):])
+        # www vs non-www (both schemes)
+        for v in list(variants):
+            if "://www." in v:
+                variants.add(v.replace("://www.", "://", 1))
+            else:
+                m = re.match(r"(https?://)([^/]+)", v)
+                if m:
+                    variants.add(m.group(1) + "www." + m.group(2) + v[len(m.group(0)):])
+        # Order: most-likely first, drop empties
+        ordered = [v for v in [raw, normalized] if v]
+        for v in variants:
+            if v not in ordered:
+                ordered.append(v)
+        return ordered
 
     async def is_source_url_posted(self, source_url: str) -> bool:
         """Check if a source URL has already been posted to the channel.
@@ -413,32 +491,17 @@ class Database:
         already posted, we skip it regardless of what text the AI generates.
         Prevents the same news being posted multiple times with different text.
 
-        v9.0: Normalizes the URL before checking (strips trailing slash,
-        removes tracking params) so trivially-different URLs are treated
-        as duplicates.
+        v10.0: Generates http/https, www/non-www, slash/no-slash variants so
+        trivially-different URLs are treated as duplicates.
         """
         if not source_url:
             return False
         assert self._conn is not None
 
-        normalized = self._normalize_url(source_url)
-        # Candidates: original AND normalized (in case DB stores either form)
-        candidates = [source_url, normalized]
-        # Also try with/without trailing slash
-        if normalized.endswith("/"):
-            candidates.append(normalized.rstrip("/"))
-        else:
-            candidates.append(normalized + "/")
-        # De-dup the list (preserving order)
-        seen = set()
-        unique_candidates = []
-        for c in candidates:
-            if c and c not in seen:
-                seen.add(c)
-                unique_candidates.append(c)
+        candidates = self._url_dedup_variants(source_url)
 
         # Check channel_posts table for any URL variant
-        for url_variant in unique_candidates:
+        for url_variant in candidates:
             async with self._conn.execute(
                 "SELECT id FROM channel_posts WHERE source = ? LIMIT 1",
                 (url_variant,)
@@ -447,7 +510,7 @@ class Database:
                     return True
 
         # Also check news_items table for is_used flag
-        for url_variant in unique_candidates:
+        for url_variant in candidates:
             async with self._conn.execute(
                 "SELECT id FROM news_items WHERE url = ? AND is_used = 1 LIMIT 1",
                 (url_variant,)
@@ -528,7 +591,13 @@ class Database:
             return [r["text"][:200] for r in rows if r["text"]]
 
     async def is_duplicate_post(self, text: str, threshold: float = 0.75) -> bool:
-        """Check if a post is semantically similar to recent posts."""
+        """Check if a post is semantically similar to recent posts.
+
+        NOTE: This checks the `post_fingerprints` table. The active channel.py
+        pipeline populates `channel_posts.fingerprint` (not post_fingerprints),
+        so prefer is_post_text_duplicate() for real text-dedup. Kept for
+        backward compatibility with the legacy publishing module.
+        """
         assert self._conn is not None
         text_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -549,6 +618,25 @@ class Database:
                 return True
 
         return False
+
+    async def is_post_text_duplicate(self, text: str, hours: int = 48) -> bool:
+        """Check if a post with the same text fingerprint was published recently.
+
+        Uses the `fingerprint` column of `channel_posts` (sha256(text)[:16]),
+        which is populated by add_channel_post(). This is the functional
+        text-based dedup layer for the active pipeline — it catches exact text
+        repeats regardless of source URL.
+        """
+        assert self._conn is not None
+        if not text:
+            return False
+        text_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        async with self._conn.execute(
+            "SELECT id FROM channel_posts WHERE fingerprint = ? "
+            "AND posted_at > datetime('now', ?) LIMIT 1",
+            (text_hash, f"-{int(hours)} hours"),
+        ) as cur:
+            return await cur.fetchone() is not None
 
     # ── Post Fingerprints ─────────────────────────────────────────────────
 
@@ -702,24 +790,55 @@ class Database:
     # ── Evergreen Used ────────────────────────────────────────────────────
 
     async def mark_evergreen_used(self, evergreen_id: str, post_id: int | None = None) -> None:
-        """Mark an evergreen content item as used."""
+        """Mark an evergreen content item as used.
+
+        UPSERT semantics: if the evergreen_id was already recorded, UPDATE
+        used_at to NOW (and post_id). This is critical because evergreen items
+        are intentionally re-used over time — without the update, the UNIQUE
+        constraint would silently drop the second use and `used_at` would stay
+        frozen at the first use, breaking time-window dedup.
+        """
         assert self._conn is not None
-        try:
-            await self._conn.execute(
-                "INSERT INTO evergreen_used (evergreen_id, post_id) VALUES (?, ?)",
-                (evergreen_id, post_id),
-            )
-            await self._conn.commit()
-        except aiosqlite.IntegrityError:
-            pass
+        await self._conn.execute(
+            """INSERT INTO evergreen_used (evergreen_id, post_id, used_at)
+               VALUES (?, ?, datetime('now'))
+               ON CONFLICT(evergreen_id) DO UPDATE SET
+                   used_at = datetime('now'),
+                   post_id = excluded.post_id""",
+            (evergreen_id, post_id),
+        )
+        await self._conn.commit()
 
     async def is_evergreen_used(self, evergreen_id: str) -> bool:
-        """Check if an evergreen item has been used."""
+        """Check if an evergreen item has EVER been used."""
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT id FROM evergreen_used WHERE evergreen_id = ?", (evergreen_id,)
         ) as cur:
             return await cur.fetchone() is not None
+
+    async def is_evergreen_used_recently(self, evergreen_id: str, hours: int = 2) -> bool:
+        """Check if an evergreen item was used within the last `hours` hours.
+
+        This is the time-window dedup used by the evergreen fallback to prevent
+        the same evergreen topic being reposted in quick succession.
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT id FROM evergreen_used WHERE evergreen_id = ? AND used_at > datetime('now', ?)",
+            (evergreen_id, f"-{int(hours)} hours"),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def get_recent_evergreen_ids(self, hours: int = 2) -> set[str]:
+        """Return the set of evergreen IDs used within the last `hours` hours."""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT evergreen_id FROM evergreen_used WHERE used_at > datetime('now', ?)",
+            (f"-{int(hours)} hours",),
+        ) as cur:
+            rows = await cur.fetchall()
+            return {r["evergreen_id"] for r in rows}
 
     async def get_unused_evergreen_count(self) -> int:
         """Count evergreen items not yet used."""
@@ -1259,6 +1378,38 @@ async def is_source_url_posted(source_url: str) -> bool:
     """
     db = _get_db()
     return await db.is_source_url_posted(source_url)
+
+
+async def is_post_text_duplicate(text: str, hours: int = 48) -> bool:
+    """Check if a post with the same text fingerprint was published recently.
+
+    Defense-in-depth dedup layer: catches exact/near-exact text repeats even
+    when the source URL differs (e.g. same story syndicated across sites, or
+    AI regenerating identical text). Uses the `fingerprint` column already
+    populated by add_channel_post (sha256(text)[:16]).
+    """
+    if not text:
+        return False
+    db = _get_db()
+    return await db.is_post_text_duplicate(text, hours=hours)
+
+
+async def is_evergreen_used_recently(evergreen_id: str, hours: int = 2) -> bool:
+    """Check if an evergreen item was used within the last `hours` hours."""
+    db = _get_db()
+    return await db.is_evergreen_used_recently(evergreen_id, hours)
+
+
+async def get_recent_evergreen_ids(hours: int = 2) -> set[str]:
+    """Return the set of evergreen IDs used within the last `hours` hours."""
+    db = _get_db()
+    return await db.get_recent_evergreen_ids(hours)
+
+
+async def mark_evergreen_used(evergreen_id: str, post_id: int | None = None) -> None:
+    """Mark an evergreen content item as used (UPSERT — updates used_at)."""
+    db = _get_db()
+    await db.mark_evergreen_used(evergreen_id, post_id)
 
 
 # ── Topic Registry ───────────────────────────────────────────────────────

@@ -42,6 +42,7 @@ from bot.database import (
     mark_news_posted, add_partner_post, get_today_partner_post_count,
     is_duplicate_post, add_post_fingerprint, cleanup_old_fingerprints,
     get_recent_post_titles, is_source_url_posted, DB_PATH,
+    is_post_text_duplicate, mark_evergreen_used, get_recent_evergreen_ids,
 )
 from ai.router import get_ai_router
 from bot.partners import partner_manager
@@ -61,6 +62,13 @@ POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///
 # ── How many images per news post ───────────────────────────────────────────
 # Telegram allows up to 10 media per post.
 MAX_IMAGES_PER_POST = 10
+
+# ── Evergreen / static-fallback dedup ───────────────────────────────────────
+# An evergreen (or static BMW fact) topic may not be reposted within this window.
+# 2 hours comfortably eliminates the observed 3–30 minute repeats while still
+# allowing the 20-item evergreen pool to cycle (up to ~10 unique evergreen
+# posts/hour) when the fresh-news pool is exhausted.
+EVERGREEN_DEDUP_HOURS = 2
 
 # ── Poll topics for channel engagement — BMW-themed ──────────────────────────
 
@@ -1139,45 +1147,105 @@ class ChannelManager:
         return url
 
     async def _get_post_images(self, news_item: Dict, resolved_url: str = "") -> tuple:
-        """Get images for a news post — ONLY from curated news.json images.
+        """Get images for a news post — curated news.json images FIRST, then
+        supplement with article-page scraping to fill a multi-image album.
 
-        v8.0: USE ONLY PHOTOS FROM NEWS.JSON — no more article scraping.
-        Each news item in news.json has a pre-curated `images[]` list
-        with direct, high-quality image URLs. No more scraping, no more junk.
-
-        The curated source already filters out thumbnails, logos, icons, etc.
-        These are REAL article photos selected by the news curator.
+        v10.0: MULTI-IMAGE SUPPORT.
+          - news.json normally supplies a SINGLE curated image per article
+            (the `"image"` field). Telegram allows up to 10 media per post
+            (sendMediaGroup album), so posting only 1 photo leaves engagement
+            on the table.
+          - When the curated list has fewer than MAX_IMAGES_PER_POST images,
+            we now scrape the article page (`_scrape_article_images`, which
+            already does strict og:image / JSON-LD / <article>-body filtering)
+            for ADDITIONAL images and append them — deduped by image bytes —
+            until we reach MAX_IMAGES_PER_POST (10).
+          - The actual album send happens via send_media_group in
+            run_scheduled_post() when len(image_list) > 1.
 
         Returns (image_list: List[bytes], source: str)
         """
-        image_list = []
+        image_list: List[bytes] = []
+        seen_hashes: set = set()
         source = "none"
         title = news_item.get("title", "")
 
-        # Download curated images — skip URL-based junk filters (already pre-filtered)
+        def _add_unique(imgs: List[bytes]) -> int:
+            """Append images, deduping by content hash. Returns count added."""
+            added = 0
+            for img in imgs:
+                if len(image_list) >= MAX_IMAGES_PER_POST:
+                    break
+                # Dedup by first 4KB hash — catches same image served from
+                # different CDN URLs (very common with WordPress srcset).
+                h = hashlib.md5(img[:4096]).hexdigest()
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                image_list.append(img)
+                added += 1
+            return added
+
+        # ── 1. Curated images from news.json (pre-filtered, high quality) ──
         curated_image_urls = news_item.get("image_urls", [])
         if curated_image_urls:
             try:
-                curated_images = await self._download_images(curated_image_urls, max_count=MAX_IMAGES_PER_POST, curated=True)
+                curated_images = await self._download_images(
+                    curated_image_urls, max_count=MAX_IMAGES_PER_POST, curated=True
+                )
                 if curated_images:
-                    image_list.extend(curated_images)
-                    source = "curated"
-                    logger.info(f"Downloaded {len(curated_images)} curated images for: {title[:50]}")
+                    added = _add_unique(curated_images)
+                    if added:
+                        source = "curated"
+                        logger.info(
+                            f"Downloaded {added} curated image(s) for: {title[:50]}"
+                        )
             except Exception as e:
                 logger.debug(f"Curated image download failed: {e}")
 
-        # Fallback: try article scraping if curated images failed or were empty
+        # ── 2. Supplement with article-page scrape to build a multi-image album ──
+        # Only scrape when we have room for more AND a resolvable article URL.
+        # _scrape_article_images already does strict og:image / JSON-LD /
+        # <article>-body filtering — no logos/avatars/sidebar junk.
+        if len(image_list) < MAX_IMAGES_PER_POST and resolved_url:
+            try:
+                need = MAX_IMAGES_PER_POST - len(image_list)
+                # Request a few extra to allow for dedup dropouts
+                scraped_images = await self._scrape_article_images(
+                    resolved_url, max_count=need + 2
+                )
+                if scraped_images:
+                    added = _add_unique(scraped_images)
+                    if added:
+                        # "mixed" = curated + scraped; otherwise scraped is primary.
+                        # NOTE: don't use `source or "scraped"` — "none" is a
+                        # truthy string and would short-circuit to "none".
+                        if source == "curated":
+                            source = "mixed"
+                        else:
+                            source = "scraped"
+                        logger.info(
+                            f"Supplemented with {added} scraped image(s) from article "
+                            f"for: {title[:50]} (total now {len(image_list)})"
+                        )
+            except Exception as e:
+                logger.debug(f"Article scraping supplement failed: {e}")
+
+        # ── 3. Last-resort fallback: scrape if curated yielded nothing ──
         if not image_list and resolved_url:
             try:
                 scraped_images = await self._scrape_article_images(resolved_url, max_count=3)
                 if scraped_images:
-                    image_list.extend(scraped_images)
-                    source = "scraped"
-                    logger.info(f"Fallback: scraped {len(scraped_images)} images from article for: {title[:50]}")
+                    _add_unique(scraped_images)
+                    if image_list:
+                        source = "scraped"
+                        logger.info(
+                            f"Fallback: scraped {len(image_list)} images from article for: {title[:50]}"
+                        )
             except Exception as e:
                 logger.debug(f"Article scraping fallback failed: {e}")
 
-        # Hard limit
+        # Hard limit (safety — _add_unique already enforces this)
         image_list = image_list[:MAX_IMAGES_PER_POST]
 
         if not image_list:
@@ -1440,6 +1508,21 @@ class ChannelManager:
                 )
 
                 if attempt_text:
+                    # v10.0: Defense-in-depth text dedup — skip if the AI
+                    # produced text byte-identical to a recent channel post
+                    # (catches same-story syndication across sources and AI
+                    # regenerating identical text). Uses the `fingerprint`
+                    # column populated by add_channel_post.
+                    try:
+                        if await is_post_text_duplicate(attempt_text, hours=48):
+                            logger.info(
+                                f"Generated text duplicates a recent post (attempt {attempt+1}): {title[:60]}"
+                            )
+                            tried_titles.append(title)
+                            continue
+                    except Exception as _dup_err:
+                        logger.debug(f"Post-text dedup check failed (non-critical): {_dup_err}")
+
                     # Success! Keep this item and its generated text.
                     selected_item = news_item
                     post_text = attempt_text
@@ -2017,12 +2100,39 @@ class ChannelManager:
                 "Evergreen pool loaded: %d items from %s", len(pool), evergreen_path.name
             )
 
+            # ── v10.0: TIME-WINDOW DEDUP — the root-cause fix for repeating posts ──
+            # The same evergreen topic must not be reposted within EVERGREEN_DEDUP_HOURS.
+            # This is what was missing: the fallback used to pick purely at random,
+            # so the same Nürburgring / VANOS / San Remo Green topics reappeared
+            # every 3-30 minutes when the fresh-news pool was exhausted.
+            try:
+                recently_used_ids = await get_recent_evergreen_ids(hours=EVERGREEN_DEDUP_HOURS)
+            except Exception as du_err:
+                logger.debug(f"Could not load recently-used evergreen ids: {du_err}")
+                recently_used_ids = set()
+
+            fresh_pool = [it for it in pool if it.get("id", "") not in recently_used_ids]
+            if not fresh_pool:
+                # Every evergreen item was posted within the dedup window.
+                # Better to skip this cycle (and let the 3-empty-cycle owner alert
+                # fire) than to spam the channel with repeated topics.
+                logger.info(
+                    "All %d evergreen items posted within last %dh — skipping evergreen "
+                    "this cycle to avoid topic repetition (news pool may be exhausted).",
+                    len(pool), EVERGREEN_DEDUP_HOURS,
+                )
+                return False
+            logger.info(
+                "Evergreen dedup: %d/%d items available (not used in last %dh)",
+                len(fresh_pool), len(pool), EVERGREEN_DEDUP_HOURS,
+            )
+
             # Try up to 5 different random items — if one fails validation, try the next.
             # Avoids the "single bad item blocks the whole fallback" failure mode.
             tried_ids: set = set()
-            max_attempts = min(5, len(pool))
+            max_attempts = min(5, len(fresh_pool))
             for attempt in range(max_attempts):
-                available = [it for it in pool if id(it) not in tried_ids]
+                available = [it for it in fresh_pool if id(it) not in tried_ids]
                 if not available:
                     break
                 item = _rand.choice(available)
@@ -2036,6 +2146,19 @@ class ChannelManager:
                 if not topic:
                     logger.info("Evergreen item has no topic, trying next (attempt %d/%d)", attempt + 1, max_attempts)
                     continue
+
+                # v10.0: Semantic dedup on the topic too — in case the evergreen_id
+                # wasn't recorded but a near-identical topic was just posted (e.g.
+                # two evergreen items about Nürburgring with different ids).
+                try:
+                    if _is_semantically_duplicate(topic):
+                        logger.info(
+                            "Evergreen topic semantically duplicates a recent post (attempt %d/%d): %s",
+                            attempt + 1, max_attempts, topic[:50],
+                        )
+                        continue
+                except Exception:
+                    pass
 
                 # Build a simple evergreen news_item-like dict for post generation
                 evergreen_item = {
@@ -2179,6 +2302,20 @@ class ChannelManager:
                         has_image=has_media,
                         image_url="",
                     )
+                    # v10.0: Record the evergreen item as used so the time-window
+                    # dedup blocks it from reposting within EVERGREEN_DEDUP_HOURS.
+                    # Also feed the topic into the in-memory semantic dedup so
+                    # near-identical evergreen topics are caught too.
+                    evergreen_id = item.get("id", "")
+                    if evergreen_id:
+                        try:
+                            await mark_evergreen_used(evergreen_id, sent.message_id)
+                        except Exception as mark_err:
+                            logger.debug(f"Could not mark evergreen used: {mark_err}")
+                    try:
+                        _record_post_title(topic)
+                    except Exception:
+                        pass
                     # Add reaction
                     try:
                         await self._add_reaction(config.CHANNEL_ID, sent.message_id)
@@ -2207,42 +2344,66 @@ class ChannelManager:
           - The evergreen_pool.json file is missing
           - All evergreen items fail validation
           - AI generation completely fails and no other fallback works
+
+        v10.0: Now applies the same EVERGREEN_DEDUP_HOURS time-window dedup as
+        the evergreen fallback (via the evergreen_used table with stable
+        `static-NNN` ids) so the same hard-coded fact is not reposted within
+        the window. If ALL facts are recently used, returns False rather than
+        spamming a repeat.
         """
-        # A curated list of BMW facts — pick one at random
+        # A curated list of BMW facts — each with a stable id for dedup
         import random as _rand
         facts = [
             (
+                "static-001",
                 "🏆 E30 M3 — первый M-автомобиль BMW",
                 "E30 M3 (1986-1991) — создан для омологации DTM/Group A. "
                 "S14B23 2.3L I4, 192-238 л.с. Купе, кабриолет, седан и универсал. "
                 "Один из самых коллекционных BMW в истории."
             ),
             (
+                "static-002",
                 "🔥 S63 — король M-division",
                 "S63B44T4 — 4.4L V8 twin-turbo, ставился на M5 F90 (600-635 л.с.), "
                 "M8 F91/92/93 (600-625 л.с.), X5M/X6M G05/F96 (600-625 л.с.). "
                 "Базовый мотор для M-division с 2018 года."
             ),
             (
+                "static-003",
                 "⚡ Neue Klasse — будущее BMW",
                 "Neue Klasse — новая платформа BMW для электромобилей с 2025 года. "
                 "800V архитектура, round displays, новый дизайн интерьера. "
                 "Первый модельный ряд — i3 (седан) и iX3 (SUV)."
             ),
             (
+                "static-004",
                 "🔧 B58 — самый успешный мотор BMW",
                 "B58 (2015+) — 3.0L I6 single-turbo, преемник N55. Ставится на "
                 "M340i, M440i, M550i, M760i, Supra A90. 322-382 л.с. "
                 "Ward's 10 Best Engines 6 раз подряд."
             ),
             (
+                "static-005",
                 "🏁 M5 F90 Competition — самая быстрая Маша",
                 "M5 F90 Competition (2018-2023): S63B44T4 625 л.с., 750 Нм, "
                 "0-100 за 3.3с, xDrive M Mode, ZF 8HP M Steptronic. "
                 "M Dynamic Mode + карбон-керамика опционально."
             ),
         ]
-        topic, context = _rand.choice(facts)
+
+        # v10.0: filter out facts posted within the dedup window
+        try:
+            recently_used_static = await get_recent_evergreen_ids(hours=EVERGREEN_DEDUP_HOURS)
+        except Exception:
+            recently_used_static = set()
+        candidate_facts = [f for f in facts if f[0] not in recently_used_static]
+        if not candidate_facts:
+            logger.info(
+                "All %d static BMW facts posted within last %dh — skipping static fallback "
+                "to avoid repetition.", len(facts), EVERGREEN_DEDUP_HOURS,
+            )
+            return False
+        fact_id, topic, context = _rand.choice(candidate_facts)
         post_text = (
             f"🏎️ {topic}\n\n"
             f"{context}\n\n"
@@ -2324,6 +2485,15 @@ class ChannelManager:
                     has_image=has_media,
                     image_url="",
                 )
+                # v10.0: record the static fact as used for time-window dedup
+                try:
+                    await mark_evergreen_used(fact_id, sent.message_id)
+                except Exception:
+                    pass
+                try:
+                    _record_post_title(topic)
+                except Exception:
+                    pass
                 try:
                     await self._add_reaction(config.CHANNEL_ID, sent.message_id)
                 except Exception:

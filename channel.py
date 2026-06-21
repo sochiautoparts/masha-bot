@@ -1536,19 +1536,19 @@ class ChannelManager:
         No photo = text-only post. Better no photo than wrong photo.
         """
         try:
-            # v16.1: Rolling-window cap check (3h window matching the posting cycle).
+            # v16.1: Rolling-window cap check (1h window matching the posting cycle).
             # OLD code used get_today_post_count() (since midnight UTC) — if the
             # old bot spammed 58 evergreen posts at 04:00-07:00, the daily counter
             # stayed at 58 all day, blocking ALL news posts until midnight. With
             # a 3h rolling window, posts older than 3h naturally fall off, so
             # the bot can resume posting news with photos within 3h of the fix
             # being deployed.
-            # Limit: NEWS_POSTS_PER_CYCLE (2) + 1 partner = 3 per 3h window.
-            recent_count = await get_recent_post_count(hours=3)
-            _WINDOW_LIMIT = 3  # 2 news + 1 partner per 3h cycle
+            # Limit: NEWS_POSTS_PER_CYCLE (2) + 1 partner = 3 per 1h window.
+            recent_count = await get_recent_post_count(hours=1)
+            _WINDOW_LIMIT = 3  # 2 news + 1 partner per 1h cycle
             if recent_count >= _WINDOW_LIMIT:
                 logger.info(
-                    f"Rolling 3h post limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping"
+                    f"Rolling 1h post limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping"
                 )
                 return False
 
@@ -2117,12 +2117,12 @@ class ChannelManager:
         if not partner_manager.should_post_partner():
             return False
 
-        # ── v16.1 CAP GUARD — rolling 3h window (matches run_scheduled_post) ──
-        recent_count = await get_recent_post_count(hours=3)
+        # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
+        recent_count = await get_recent_post_count(hours=1)
         _WINDOW_LIMIT = 3
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
-                f"Rolling 3h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping partner post"
+                f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping partner post"
             )
             return False
         hourly_count = await get_hourly_post_count()
@@ -2228,12 +2228,12 @@ class ChannelManager:
           Now it respects CHANNEL_MAX_POSTS_PER_DAY and CHANNEL_MAX_POSTS_PER_HOUR
           so evergreen only fills REMAINING slots, not creates new ones.
         """
-        # ── v16.1 CAP GUARD — rolling 3h window (matches run_scheduled_post) ──
-        recent_count = await get_recent_post_count(hours=3)
-        _WINDOW_LIMIT = 3  # 2 news + 1 partner per 3h cycle
+        # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
+        recent_count = await get_recent_post_count(hours=1)
+        _WINDOW_LIMIT = 3  # 2 news + 1 partner per 1h cycle
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
-                f"Rolling 3h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping evergreen"
+                f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping evergreen"
             )
             return False
         hourly_count = await get_hourly_post_count()
@@ -2535,12 +2535,12 @@ class ChannelManager:
         v16.0 CAP GUARD: Same as _post_evergreen_fallback — never bypass
         daily/hourly post caps.
         """
-        # ── v16.1 CAP GUARD — rolling 3h window (matches run_scheduled_post) ──
-        recent_count = await get_recent_post_count(hours=3)
+        # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
+        recent_count = await get_recent_post_count(hours=1)
         _WINDOW_LIMIT = 3
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
-                f"Rolling 3h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping static fact"
+                f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping static fact"
             )
             return False
         hourly_count = await get_hourly_post_count()

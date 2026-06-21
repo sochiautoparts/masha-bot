@@ -245,15 +245,10 @@ class BackgroundTasks:
         """
         await asyncio.sleep(30)
         
-        # v16: REDUCED from 5 → 2 news posts per cycle.
-        # The news source (sochiautoparts/nws bmw-news.json) supplies ~11 fresh
-        # articles per 24h, but the old setting published 5 posts × 24 cycles =
-        # 120/day — 11× faster than the source replenishes. This exhausted the
-        # 281-item pool within days and the bot fell back to evergreen content
-        # (which is published text-only by design), so the channel filled with
-        # posts without photos. At 2 posts/cycle × 8 cycles/day = 16/day, the
-        # bot stays close to the source's replenish rate.
-        logger.info("Channel poster started — 2 news + 1 partner per 3h cycle")
+        # 2 news posts per hour + 1 partner per cycle (original schedule).
+        # The 48h TTL dedup (posted_urls table) recycles old articles after 48h,
+        # so 2 news/hour = 48/day is sustainable without exhausting the source.
+        logger.info("Channel poster started — 2 news + 1 partner per hourly cycle")
 
         consecutive_empty_cycles = 0
         NEWS_POSTS_PER_CYCLE = 2

@@ -731,27 +731,30 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
             exclude_set.add(t.lower().strip()[:80])
 
     # Pre-filter: check which source URLs were already posted
-    # This is the PRIMARY dedup mechanism
+    # v16.1: Changed from is_source_url_posted (PERMANENT block) to
+    # is_url_recently_posted (48h TTL). The old permanent check blocked
+    # 281/281 news items forever because they were all in channel_posts.source,
+    # forcing the bot into evergreen text-only fallback. With 48h TTL,
+    # articles posted >48h ago become re-postable when the news pool runs low.
     posted_urls = set()
     try:
-        from bot.database import is_source_url_posted
+        from bot.database import is_url_recently_posted
         for item in items:
             url = item.get("url", "")
             if url:
-                is_posted = await is_source_url_posted(url)
+                is_posted = await is_url_recently_posted(url, hours=48)
                 if is_posted:
                     posted_urls.add(url)
         if posted_urls:
             unposted_count = len(items) - len(posted_urls)
             logger.info(
-                f"Source URL dedup: {len(posted_urls)}/{len(items)} already-posted URLs filtered out "
+                f"Source URL dedup (48h TTL): {len(posted_urls)}/{len(items)} recently-posted URLs filtered out "
                 f"({unposted_count} remaining)"
             )
-            # v9.0: If ALL items are filtered out, log a few candidate URLs for debugging
             if unposted_count == 0 and len(items) > 0:
                 sample = items[:3]
                 logger.info(
-                    "All %d news items already posted — first 3 examples: %s",
+                    "All %d news items posted within 48h — first 3 examples: %s",
                     len(items),
                     [it.get("url", "")[:80] for it in sample],
                 )

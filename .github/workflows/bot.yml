@@ -265,12 +265,16 @@ jobs:
           DB_PATH: masha_bot.db
           ADMITAD_ADS_FILE: data/partners.json
           LOG_LEVEL: INFO
-          # Schedule settings — aligned with asya-bot intervals
+          # Schedule settings — v16: SLOWED to match BMW news source replenish
+          # rate (~11 fresh articles/day). The old 20-min interval caused the
+          # bot to publish 120+ posts/day, exhausting the 281-item pool within
+          # days and flooding the channel with text-only evergreen posts.
+          # At 180 min (3h) × 2 posts/cycle = 16 posts/day, close to supply.
           NEWS_FETCH_INTERVAL: 900      # 15 min
-          CHANNEL_POST_INTERVAL: 1200   # 20 min
+          CHANNEL_POST_INTERVAL: 10800  # 180 min (3h)
           NEWS_INTERVAL_MINUTES: "15"
-          CHANNEL_POST_INTERVAL_MINUTES: "20"
-          CHANNEL_NEWS_PER_HOUR: "6"
+          CHANNEL_POST_INTERVAL_MINUTES: "180"
+          CHANNEL_NEWS_PER_HOUR: "2"
           CHANNEL_PARTNER_PER_HOUR: "1"
           PARTNER_POST_INTERVAL_HOURS: "4"
         run: |
@@ -281,7 +285,7 @@ jobs:
           echo "FAILOVER: Local -> Pollinations(key) -> Pollinations(free) -> Cloudflare -> Local-Only/Static"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
           echo "NEWS: BMW news from sochiautoparts/nws (bmw-news.json) -> RSS fallback -> Web search"
-          echo "SCHEDULE: News every 15min, Posts every 20min"
+          echo "SCHEDULE: News every 15min, Posts every 180min (v16: slowed to match source)"
           echo "=== Launching bot with UNLIMITED auto-restart ==="
 
           # UNLIMITED retries — bot MUST always be running! (aligned with asya-bot)

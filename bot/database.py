@@ -186,6 +186,21 @@ class Database:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             );
 
+            -- v16: posted_urls — TTL-based URL dedup (aligned with asya-bot).
+            -- Unlike channel_posts.source (which is checked with NO time bound
+            -- and permanently blocks re-posting), this table uses a 48h TTL
+            -- so articles can be re-posted after 48h when the news pool runs low.
+            -- Cleanup prunes entries older than 30 days (see cleanup_posted_urls).
+            CREATE TABLE IF NOT EXISTS posted_urls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                url_fingerprint TEXT NOT NULL,
+                title TEXT DEFAULT '',
+                posted_at REAL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_posted_urls_fingerprint ON posted_urls(url_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_posted_urls_time ON posted_urls(posted_at);
+
             CREATE INDEX IF NOT EXISTS idx_news_fingerprint ON news_items(fingerprint);
             CREATE INDEX IF NOT EXISTS idx_news_is_used ON news_items(is_used);
             CREATE INDEX IF NOT EXISTS idx_channel_posts_posted_at ON channel_posts(posted_at);
@@ -519,6 +534,103 @@ class Database:
                     return True
 
         return False
+
+    # ── v16: posted_urls — TTL-based URL dedup (aligned with asya-bot) ────
+    # Unlike is_source_url_posted() which checks channel_posts.source with NO
+    # time bound (permanent block), these methods use a 48h TTL so articles
+    # can be re-posted after 48h when the news pool runs low.
+
+    @staticmethod
+    def _url_fingerprint(url: str) -> str:
+        """Stable fingerprint for a URL — same as _normalize_url but hashed.
+
+        Uses the same normalization as _url_dedup_variants (strip www, force
+        https, drop trailing slash, strip tracking params) so that trivially-
+        different URLs map to the same fingerprint.
+        """
+        normalized = Database._normalize_url(url or "")
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    async def is_url_recently_posted(self, url: str, hours: int = 48) -> bool:
+        """Check if a URL was posted within the last `hours` (default 48h).
+
+        This is the v16 TTL-based dedup. Articles posted MORE than 48h ago
+        are considered re-postable (the news pool may be low and the audience
+        has likely rotated). Returns True only if the URL was posted recently.
+        """
+        if not url:
+            return False
+        assert self._conn is not None
+        fp = self._url_fingerprint(url)
+        cutoff = time.time() - (hours * 3600)
+        async with self._conn.execute(
+            "SELECT id FROM posted_urls WHERE url_fingerprint = ? AND posted_at >= ? LIMIT 1",
+            (fp, cutoff),
+        ) as cur:
+            return bool(await cur.fetchone())
+
+    async def save_posted_url(self, url: str, title: str = "") -> None:
+        """Record that a URL was just posted (UPSERT — updates posted_at if exists)."""
+        if not url:
+            return
+        assert self._conn is not None
+        fp = self._url_fingerprint(url)
+        now = time.time()
+        await self._conn.execute(
+            """INSERT INTO posted_urls (url, url_fingerprint, title, posted_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(url_fingerprint) DO UPDATE SET
+                   posted_at = excluded.posted_at,
+                   title = excluded.title""",
+            (url, fp, title[:200], now),
+        )
+        await self._conn.commit()
+
+    async def cleanup_posted_urls(self, max_age_days: int = 30) -> int:
+        """Delete posted_urls entries older than max_age_days. Returns count deleted."""
+        assert self._conn is not None
+        cutoff = time.time() - (max_age_days * 86400)
+        cur = await self._conn.execute(
+            "DELETE FROM posted_urls WHERE posted_at < ?", (cutoff,)
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def migrate_channel_posts_to_posted_urls(self) -> int:
+        """One-time migration: copy existing channel_posts.source URLs into
+        posted_urls so they're subject to the TTL (and eventually pruned).
+
+        Uses posted_at = posted_at timestamp of the channel_post (so articles
+        posted >48h ago become immediately re-postable).
+        """
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT source, text, posted_at FROM channel_posts WHERE source LIKE 'http%'"
+        ) as cur:
+            rows = await cur.fetchall()
+        migrated = 0
+        for row in rows:
+            url = row["source"]
+            title = (row["text"] or "")[:200]
+            # Parse posted_at (text like "2026-06-21 04:03:28") to epoch
+            try:
+                from datetime import datetime
+                dt = datetime.strptime(row["posted_at"], "%Y-%m-%d %H:%M:%S")
+                posted_at = dt.timestamp()
+            except Exception:
+                posted_at = time.time()
+            fp = self._url_fingerprint(url)
+            try:
+                await self._conn.execute(
+                    """INSERT OR IGNORE INTO posted_urls (url, url_fingerprint, title, posted_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (url, fp, title, posted_at),
+                )
+                migrated += 1
+            except Exception:
+                pass
+        await self._conn.commit()
+        return migrated
 
     # ── Channel Posts ─────────────────────────────────────────────────────
 
@@ -1138,9 +1250,24 @@ def _get_db() -> Database:
 # ── Initialization ────────────────────────────────────────────────────────
 
 async def init_db() -> None:
-    """Initialize the database singleton and create tables."""
+    """Initialize the database singleton and create tables.
+
+    v16: Also runs one-time migration to populate posted_urls from existing
+    channel_posts, so the 48h TTL dedup has historical data from day one.
+    """
     db = _get_db()
     await db.init()
+    # v16: One-time migration — populate posted_urls from channel_posts
+    try:
+        migrated = await db.migrate_channel_posts_to_posted_urls()
+        if migrated > 0:
+            logger.info(f"v16 migration: {migrated} URLs copied to posted_urls (48h TTL dedup)")
+            # Prune entries older than 30 days immediately
+            pruned = await db.cleanup_posted_urls(max_age_days=30)
+            if pruned > 0:
+                logger.info(f"v16 cleanup: pruned {pruned} posted_urls entries older than 30 days")
+    except Exception as e:
+        logger.warning(f"v16 posted_urls migration failed (non-critical): {e}")
 
 
 # ── Chat History ──────────────────────────────────────────────────────────
@@ -1378,6 +1505,35 @@ async def is_source_url_posted(source_url: str) -> bool:
     """
     db = _get_db()
     return await db.is_source_url_posted(source_url)
+
+
+# ── v16: TTL-based URL dedup wrappers (aligned with asya-bot) ────────────────
+# These complement is_source_url_posted() (which is permanent) with a TTL
+# version that allows re-posting after 48h. channel.py uses is_url_recently_posted
+# as the PRIMARY check so the news pool isn't permanently blocked.
+
+async def is_url_recently_posted(url: str, hours: int = 48) -> bool:
+    """Check if a URL was posted within the last `hours` (default 48h)."""
+    db = _get_db()
+    return await db.is_url_recently_posted(url, hours=hours)
+
+
+async def save_posted_url(url: str, title: str = "") -> None:
+    """Record that a URL was just posted (UPSERT)."""
+    db = _get_db()
+    await db.save_posted_url(url, title=title)
+
+
+async def cleanup_posted_urls(max_age_days: int = 30) -> int:
+    """Delete posted_urls entries older than max_age_days."""
+    db = _get_db()
+    return await db.cleanup_posted_urls(max_age_days=max_age_days)
+
+
+async def migrate_channel_posts_to_posted_urls() -> int:
+    """One-time migration: copy channel_posts.source into posted_urls."""
+    db = _get_db()
+    return await db.migrate_channel_posts_to_posted_urls()
 
 
 async def is_post_text_duplicate(text: str, hours: int = 48) -> bool:

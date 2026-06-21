@@ -208,6 +208,14 @@ class BackgroundTasks:
                     removed = await cleanup_old_fingerprints(max_age_days=7)
                     if removed > 0:
                         logger.info(f"Cleaned up {removed} old post fingerprints")
+                    # v16: Also prune posted_urls entries older than 30 days
+                    try:
+                        from bot.database import cleanup_posted_urls
+                        pruned = await cleanup_posted_urls(max_age_days=30)
+                        if pruned > 0:
+                            logger.info(f"Cleaned up {pruned} old posted_urls entries (>30 days)")
+                    except Exception as e:
+                        logger.debug(f"posted_urls cleanup skipped: {e}")
 
                 # Auto-refresh partner data every 6 hours
                 if cycle_count % 12 == 0:

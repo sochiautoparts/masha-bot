@@ -775,12 +775,22 @@ async def get_best_news_item(items: List[Dict] = None, exclude_titles: List[str]
         interest = _score_interest(title, item.get("summary", ""))
         freshness = _score_freshness(item.get("published_time", 0))
         total = interest + freshness
-        
-        # v5.0: Bonus for items with image_urls — posts with photos get 3x more views
+
+        # v16: Photo-priority scoring (aligned with asya-bot content_engine).
+        # Stronger bonus for photo-rich items — ensures the bot prefers articles
+        # WITH images, reducing text-only posts. Items WITHOUT images get a
+        # penalty so they're only picked when no photo-rich alternative exists.
         image_urls = item.get("image_urls", [])
-        if image_urls and len(image_urls) > 0:
-            total += 0.3  # Significant bonus for having photos
-        
+        image_count = len(image_urls) if image_urls else 0
+        if image_count >= 5:
+            total += 2.0
+        elif image_count >= 3:
+            total += 1.5
+        elif image_count >= 1:
+            total += 1.0
+        else:
+            total -= 0.5  # Penalize items without photos
+
         # v8.2: Deprioritize Reddit/community posts vs real news articles
         # Reddit posts are personal stories, not news — they should rank lower
         source = item.get("source", "")

@@ -43,6 +43,10 @@ from bot.database import (
     is_duplicate_post, add_post_fingerprint, cleanup_old_fingerprints,
     get_recent_post_titles, is_source_url_posted, DB_PATH,
     is_post_text_duplicate, mark_evergreen_used, get_recent_evergreen_ids,
+    # v16: TTL-based URL dedup (48h) — replaces permanent is_source_url_posted
+    # as the PRIMARY check so the news pool isn't permanently blocked.
+    is_url_recently_posted, save_posted_url, cleanup_posted_urls,
+    migrate_channel_posts_to_posted_urls,
 )
 from ai.router import get_ai_router
 from bot.partners import partner_manager
@@ -767,7 +771,7 @@ class ChannelManager:
         }
 
         async with httpx.AsyncClient(
-            timeout=15.0,
+            timeout=30.0,
             follow_redirects=True,
             headers=_IMG_DOWNLOAD_HEADERS,
         ) as client:
@@ -1572,12 +1576,16 @@ class ChannelManager:
                 title = news_item.get("title", "")
                 source_url = news_item.get("url", "")
 
-                # ── PRIMARY DEDUP: Source URL ──
-                # If the same article URL was already posted, skip it
-                # regardless of what text the AI generates. This prevents
-                # the same news being posted multiple times with different text.
-                if source_url and await is_source_url_posted(source_url):
-                    logger.info(f"Source URL already posted (attempt {attempt+1}): {source_url[:60]}")
+                # ── PRIMARY DEDUP: Source URL (v16: TTL-based, 48h) ──
+                # v16: Replaced permanent is_source_url_posted() with
+                # is_url_recently_posted(hours=48). The old permanent check
+                # blocked 279/281 news items forever, forcing the bot into
+                # text-only evergreen flood. With 48h TTL, articles posted
+                # >48h ago become re-postable when the news pool runs low.
+                # The text-fingerprint dedup below still prevents byte-identical
+                # reposts within 48h.
+                if source_url and await is_url_recently_posted(source_url, hours=48):
+                    logger.info(f"Source URL posted within 48h (attempt {attempt+1}): {source_url[:60]}")
                     tried_titles.append(title)
                     continue
 
@@ -1851,6 +1859,9 @@ class ChannelManager:
                     # Mark news as posted
                     if news_item.get("url"):
                         await mark_news_posted(news_item["url"])
+                        # v16: Also record in posted_urls (48h TTL table) so the
+                        # TTL-based dedup in run_scheduled_post can find it.
+                        await save_posted_url(news_item["url"], title=news_item.get("title", ""))
 
                     # Register topic for dedup
                     _register_topic(entity_key, news_item["title"])
@@ -1861,9 +1872,12 @@ class ChannelManager:
 
             except Exception as e:
                 logger.error(f"Error posting to channel: {e}")
-                # If photo failed, try posting as text-only (better than losing the post)
-                if has_media and "PHOTO" in str(e).upper():
-                    logger.info("Photo failed — retrying as text-only post")
+                # v16: Retry as text-only on ANY send error (was: only "PHOTO"
+                # errors). Network timeouts, Telegram 429/500, entity parse
+                # errors — all previously lost the post entirely. Better to
+                # publish text-only than lose the post.
+                if has_media:
+                    logger.info(f"Send failed ({type(e).__name__}) — retrying as text-only post")
                     try:
                         sent_message = await self._bot.send_message(
                             chat_id=config.CHANNEL_ID,
@@ -1882,6 +1896,7 @@ class ChannelManager:
                             )
                             if news_item.get("url"):
                                 await mark_news_posted(news_item["url"])
+                                await save_posted_url(news_item["url"], title=news_item.get("title", ""))
                             _register_topic(entity_key, news_item["title"])
                             _record_post_title(news_item["title"])
                             logger.info(f"✅ Text-only fallback post published: {news_item['title'][:60]}")
@@ -2081,9 +2096,30 @@ class ChannelManager:
         v8.2: Uses raw images from partners.json — SVG→PNG conversion only.
         No branded cards — just the partner image as-is.
         Always tries to post WITH an image for maximum engagement.
+
+        v16.0 CAP GUARD: Partner posts must NOT bypass daily/hourly caps.
+          Previously only the 4h partner interval was checked, so partner
+          posts could push the total above CHANNEL_MAX_POSTS_PER_DAY.
         """
         if not partner_manager.should_post_partner():
             return False
+
+        # ── v16 CAP GUARD — never bypass daily/hourly limits ──
+        try:
+            today_count = await get_today_post_count()
+            if today_count >= config.CHANNEL_MAX_POSTS_PER_DAY:
+                logger.info(
+                    f"Daily post limit reached ({today_count}/{config.CHANNEL_MAX_POSTS_PER_DAY}) — skipping partner post"
+                )
+                return False
+            hourly_count = await get_hourly_post_count()
+            if hourly_count >= config.CHANNEL_MAX_POSTS_PER_HOUR:
+                logger.info(
+                    f"Hourly post limit reached ({hourly_count}/{config.CHANNEL_MAX_POSTS_PER_HOUR}) — skipping partner post"
+                )
+                return False
+        except Exception as e:
+            logger.debug(f"Cap check failed (non-critical): {e}")
 
         # ── Topical selection: match partner to recent channel topics ─────
         program = None
@@ -2176,7 +2212,30 @@ class ChannelManager:
           - Tries multiple random items (up to 5) so a single bad item doesn't kill it
           - Falls back to a hard-coded static BMW fact if the JSON file is missing
           - Still posts a static fact even if AI generation completely fails
+
+        v16.0 CAP GUARD: Evergreen must NOT bypass daily/hourly post caps.
+          Previously when the news pool was exhausted, this function flooded the
+          channel with unlimited text-only evergreen posts (58/day observed).
+          Now it respects CHANNEL_MAX_POSTS_PER_DAY and CHANNEL_MAX_POSTS_PER_HOUR
+          so evergreen only fills REMAINING slots, not creates new ones.
         """
+        # ── v16 CAP GUARD — never bypass daily/hourly limits ──
+        try:
+            today_count = await get_today_post_count()
+            if today_count >= config.CHANNEL_MAX_POSTS_PER_DAY:
+                logger.info(
+                    f"Daily post limit reached ({today_count}/{config.CHANNEL_MAX_POSTS_PER_DAY}) — skipping evergreen"
+                )
+                return False
+            hourly_count = await get_hourly_post_count()
+            if hourly_count >= config.CHANNEL_MAX_POSTS_PER_HOUR:
+                logger.info(
+                    f"Hourly post limit reached ({hourly_count}/{config.CHANNEL_MAX_POSTS_PER_HOUR}) — skipping evergreen"
+                )
+                return False
+        except Exception as e:
+            logger.debug(f"Cap check failed (non-critical): {e}")
+
         import json
         import random as _rand
         from pathlib import Path
@@ -2467,7 +2526,27 @@ class ChannelManager:
         `static-NNN` ids) so the same hard-coded fact is not reposted within
         the window. If ALL facts are recently used, returns False rather than
         spamming a repeat.
+
+        v16.0 CAP GUARD: Same as _post_evergreen_fallback — never bypass
+        daily/hourly post caps.
         """
+        # ── v16 CAP GUARD — never bypass daily/hourly limits ──
+        try:
+            today_count = await get_today_post_count()
+            if today_count >= config.CHANNEL_MAX_POSTS_PER_DAY:
+                logger.info(
+                    f"Daily post limit reached ({today_count}/{config.CHANNEL_MAX_POSTS_PER_DAY}) — skipping static fact"
+                )
+                return False
+            hourly_count = await get_hourly_post_count()
+            if hourly_count >= config.CHANNEL_MAX_POSTS_PER_HOUR:
+                logger.info(
+                    f"Hourly post limit reached ({hourly_count}/{config.CHANNEL_MAX_POSTS_PER_HOUR}) — skipping static fact"
+                )
+                return False
+        except Exception as e:
+            logger.debug(f"Cap check failed (non-critical): {e}")
+
         # A curated list of BMW facts — each with a stable id for dedup
         import random as _rand
         facts = [

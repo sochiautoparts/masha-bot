@@ -23,14 +23,19 @@ import httpx
 logger = logging.getLogger("masha.image_fetcher")
 
 # ── Minimal junk filter — only catches obvious non-content ──────────────────
+# v16: Removed 'badge','banner','social','logo','icon','avatar','button' —
+# these caused false positives on legitimate article photos:
+#   - 'badge' matched Rolls-Royce "Black-Badge" article photos
+#   - 'social' matched social-roundup article URLs
+#   - 'logo'/'icon'/'avatar'/'button' appeared in legitimate WP uploads paths
+# These were the SAME false positives removed from channel.py._JUNK_IMAGE_PATHS
+# in commit e9140a5. Now aligned with the curated-image junk set in news.py.
 
 JUNK_KEYWORDS = frozenset([
     'favicon', '1x1', 'pixel', 'spacer', 'blank.gif',
     'gravatar', 'analytics', 'tracker', 'beacon',
     'doubleclick', 'adservice', 'googlesyndication',
     # v5.0: Added more junk patterns that appear in RSS feeds
-    'logo', 'icon', 'avatar', 'badge', 'button',
-    'banner', 'social', 'share', 'follow', 'subscribe',
     '/assets/images/', '/assets/img/', '/themes/',
     '/widgets/', '/plugins/',
 ])

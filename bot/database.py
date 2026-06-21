@@ -680,6 +680,25 @@ class Database:
             row = await cur.fetchone()
             return row["cnt"] if row else 0
 
+    async def get_posts_recent_count(self, hours: int = 3) -> int:
+        """Get number of posts in the last N hours (rolling window).
+
+        v16: Used for cap checks instead of get_posts_today_count() (which
+        counts since midnight UTC). The rolling window ensures old evergreen
+        spam from earlier today doesn't permanently block news posts for the
+        rest of the day. With a 3h window matching the posting cycle, old
+        posts naturally fall off and the bot can resume posting.
+        """
+        assert self._conn is not None
+        cutoff = (datetime.now(timezone.utc).timestamp()) - (hours * 3600)
+        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM channel_posts WHERE posted_at >= ?",
+            (cutoff_dt,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row["cnt"] if row else 0
+
     async def get_recent_posts(self, limit: int = 20) -> list[dict[str, Any]]:
         """Get recent channel posts."""
         assert self._conn is not None
@@ -1444,6 +1463,15 @@ async def get_hourly_post_count() -> int:
     """Get number of posts in the current hour."""
     db = _get_db()
     return await db.get_posts_hourly_count()
+
+
+async def get_recent_post_count(hours: int = 3) -> int:
+    """Get number of posts in the last N hours (rolling window).
+
+    v16: Used for cap checks so old evergreen spam doesn't block news posts.
+    """
+    db = _get_db()
+    return await db.get_posts_recent_count(hours=hours)
 
 
 # ── Partner Posts ─────────────────────────────────────────────────────────

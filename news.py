@@ -287,20 +287,51 @@ async def fetch_news_json(limit: int = 500) -> list[dict[str, Any]]:
     return items[:limit]
 
 
+# ── Minimal junk set for CURATED images ──────────────────────────────────────
+# Curated images come pre-filtered from sochiautoparts/nws, so we only need to
+# catch UNAMBIGUOUS junk here. The broad JUNK_KEYWORDS list in image_fetcher
+# (which includes 'badge', 'banner', 'social', 'logo', 'icon', 'avatar', ...)
+# causes false positives on real article photos — e.g. a Rolls-Royce
+# "Black-Badge" article photo gets blocked because the filename contains
+# "badge", or a "social-media" roundup article photo gets dropped because the
+# URL contains "social". Using the full list here silently strips the photo
+# from ~1-2% of news items and the post is then published text-only.
+_CURATED_JUNK_KEYWORDS: tuple[str, ...] = (
+    # Tracking pixels / analytics beacons — never real photos
+    'favicon', '1x1', 'pixel', 'spacer', 'blank.gif',
+    'gravatar', 'analytics', 'tracker', 'beacon',
+    'doubleclick', 'adservice', 'googlesyndication',
+    # UI chrome that occasionally sneaks through
+    'avatar', 'button',
+)
+
+
+def _is_curated_junk_url(url: str) -> bool:
+    """Strict junk check for curated news.json images.
+
+    Only blocks unambiguous tracking/UI junk. Deliberately does NOT use the
+    broad 'badge' / 'banner' / 'social' / 'logo' / 'icon' keywords because
+    those match legitimate article photos (Black-Badge trim, social-roundup
+    articles, etc.) and cause text-only posts.
+    """
+    url_lower = url.lower()
+    return any(kw in url_lower for kw in _CURATED_JUNK_KEYWORDS)
+
+
 def _filter_curated_images(images: list[str]) -> list[str]:
     """Filter pre-curated image URLs from news.json.
 
     Even though images are curated, some entries may still contain
     thumbnail-sized variants or sidebar images. We filter based on:
     1. URL dimension patterns (e.g., 120x120 = thumbnail)
-    2. Known junk keywords (favicon, logo, icon, etc.)
+    2. Known junk keywords (favicon, tracker, analytics — MINIMAL set)
     3. SVG format (always icons/logos)
     4. Reddit preview thumbnails with small width/height params
 
     We prefer LARGER images — if both 830x467 and full-size versions
     exist for the same base image, keep the larger one.
     """
-    from bot.sources.image_fetcher import _is_junk_url, _is_thumbnail_url
+    from bot.sources.image_fetcher import _is_thumbnail_url
 
     filtered = []
     seen_base = set()  # Track base filenames to dedup resized versions
@@ -364,8 +395,12 @@ def _filter_curated_images(images: list[str]) -> list[str]:
                 logger.debug(f"Skipping motorsport.com wrong-car image: {filename[:60]}")
                 continue
 
-        # Check for junk patterns
-        if _is_junk_url(url):
+        # Check for junk patterns — MINIMAL set only (see _is_curated_junk_url).
+        # The broad _is_junk_url() from image_fetcher is intentionally NOT used
+        # here because its 'badge'/'banner'/'social'/'logo'/'icon' keywords
+        # cause false positives on curated article photos (e.g. Rolls-Royce
+        # "Black-Badge"), which results in text-only posts.
+        if _is_curated_junk_url(url):
             continue
 
         # Check for thumbnail patterns

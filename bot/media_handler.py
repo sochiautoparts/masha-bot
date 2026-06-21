@@ -49,12 +49,17 @@ class MediaHandler:
         self.MAX_SIZE_KB = 5000  # 5MB max for fast loading
         
         # Bad keywords in URL (reject these images)
+        # NOTE: the bare token 'ad' was removed — it matched common substrings
+        # inside legitimate image URLs such as "uploads", "download", "header",
+        # "shadow", "loader", which caused every wp-content/uploads/* photo to
+        # be rejected and the post to fall back to text-only. We keep the more
+        # specific 'advertisement', 'ads/', 'ad-' instead.
         self.BAD_KEYWORDS = [
-            'banner', 'ad', 'advertisement', 'logo', 'icon', 'spacer',
+            'banner', 'advertisement', 'ads/', 'ad-', 'logo', 'icon', 'spacer',
             '1x1', 'pixel', 'tracking', 'analytics', 'button',
             'social', 'share', 'widget', 'sidebar', 'footer',
             'newsletter', 'subscribe', 'popup', 'avatar', 'favicon',
-            'badge', 'tracking-pixel', 'beacon', 'webstat'
+            'tracking-pixel', 'beacon', 'webstat'
         ]
         
         # Good keywords in URL (prefer these images)

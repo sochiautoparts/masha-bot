@@ -698,10 +698,15 @@ class ChannelManager:
     ])
 
     # URL path patterns that NEVER contain real article photos
+    # NOTE: 'badge' was removed — it matched legitimate Rolls-Royce "Black-Badge"
+    #   article photos and made those posts text-only.
+    # NOTE: 'ad.' was removed — it matched common substrings like "upload.",
+    #   "download.", "header." in real image URLs. 'ads/' is kept (safer — only
+    #   matches the /ads/ path segment).
     _JUNK_IMAGE_PATHS = frozenset([
         'favicon', '1x1', 'pixel', 'spacer', 'blank.gif', 'gravatar',
         'analytics', 'tracker', 'beacon', 'logo', 'icon', 'avatar',
-        'badge', 'button', 'banner', 'ad.', 'ads/', 'sponsor',
+        'button', 'banner', 'ads/', 'sponsor',
         'social', 'share', 'follow', 'subscribe', 'newsletter',
         'doubleclick', 'adservice', 'googlesyndication',
         # Navigation thumbs common in BMW Blog sidebar
@@ -737,14 +742,34 @@ class ChannelManager:
         if not image_urls:
             return images
 
-        MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+        # Telegram Bot API allows photos up to 10MB. We previously capped at 5MB,
+        # which rejected legitimate high-resolution article photos (e.g. The Verge
+        # serves ~6MB JPEGs). The PIL resize step in run_scheduled_post() will
+        # shrink anything that exceeds Telegram's dimension limits, so a higher
+        # byte cap here is safe and avoids text-only posts.
+        MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB — Telegram photo limit
         MIN_IMAGE_SIZE = 10_000 if curated else 15_000  # Lower threshold for curated images
 
-        # Use a single client for all downloads
+        # Full browser headers. The previous truncated User-Agent
+        # ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" — no
+        # KHTML/Chrome/Safari tokens) was flagged as a bot by several CDNs/WAFs
+        # (e.g. bimmerfile S3 → 403). The Accept header makes modern CDNs serve
+        # WebP instead of huge JPEGs — e.g. The Verge drops from 6.1MB JPEG to
+        # 2.7MB WebP, which then fits under the size cap.
+        # NOTE: image/avif is deliberately NOT requested — Telegram sendPhoto
+        # does not accept AVIF, and PIL can only decode AVIF with an extra
+        # plugin. Requesting it made some CDNs (topspeed) return AVIF, which
+        # then failed the magic-byte check and the post went out text-only.
+        _IMG_DOWNLOAD_HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
         async with httpx.AsyncClient(
             timeout=15.0,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            headers=_IMG_DOWNLOAD_HEADERS,
         ) as client:
             for url in image_urls:
                 if len(images) >= max_count:
@@ -797,7 +822,26 @@ class ChannelManager:
                         continue
 
                 try:
-                    response = await client.get(url)
+                    # Derive a Referer from the image's own origin. Many CDNs
+                    # (Cloudflare, S3, WordPress hotlink protection) reject
+                    # image requests with no/foreign Referer — returning 403
+                    # or 415. Sending the image's own origin as Referer bypasses
+                    # most hotlink protection without spoofing.
+                    from urllib.parse import urlparse
+                    parsed = urlparse(url)
+                    origin = f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else None
+                    req_headers = {"Referer": origin} if origin else None
+
+                    response = await client.get(url, headers=req_headers)
+                    # Retry once on 403/415/429 with an explicit google Referer,
+                    # which some hotlink-protected sites whitelist.
+                    if response.status_code in (403, 415, 429) and origin:
+                        logger.debug(
+                            f"Image HTTP {response.status_code}, retrying with google Referer: {url[:70]}"
+                        )
+                        response = await client.get(
+                            url, headers={"Referer": "https://www.google.com/"}
+                        )
                     if response.status_code != 200:
                         continue
 
@@ -805,6 +849,10 @@ class ChannelManager:
 
                     # Size check
                     if len(content) < MIN_IMAGE_SIZE or len(content) > MAX_IMAGE_SIZE:
+                        logger.debug(
+                            f"Skipping image size {len(content)}B (min {MIN_IMAGE_SIZE}, "
+                            f"max {MAX_IMAGE_SIZE}): {url[:70]}"
+                        )
                         continue
 
                     # Must be an actual image: check magic bytes (JPEG, PNG, WebP)
@@ -820,6 +868,13 @@ class ChannelManager:
                     try:
                         from PIL import Image
                         import io
+                        # Some news sources serve very high-resolution photos
+                        # (e.g. The Verge 11648x8736 ≈ 101MP). PIL's default
+                        # DecompressionBomb threshold (~89MP) would warn/error
+                        # on these and silently drop the photo. These are legit
+                        # press images, not attacks — raise the ceiling. The
+                        # publish step downscales anything with w+h > 10000.
+                        Image.MAX_IMAGE_PIXELS = 250_000_000  # 250MP ceiling
                         img = Image.open(io.BytesIO(content))
                         w, h = img.size
                         # v8.2: Lower minimums for curated images (300x200)
@@ -1147,7 +1202,9 @@ class ChannelManager:
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
                 resp = await client.get(url, headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
                 })
                 html = resp.text
                 # Google redirect pages often contain the target URL in data attributes or JS
@@ -1685,6 +1742,8 @@ class ChannelManager:
                         try:
                             from PIL import Image
                             import io
+                            # Allow very high-res press photos (see _download_images)
+                            Image.MAX_IMAGE_PIXELS = 250_000_000
                             img = Image.open(io.BytesIO(img_data))
                             w, h = img.size
                             needs_resize = False

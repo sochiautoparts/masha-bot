@@ -1543,9 +1543,9 @@ class ChannelManager:
             # a 3h rolling window, posts older than 3h naturally fall off, so
             # the bot can resume posting news with photos within 3h of the fix
             # being deployed.
-            # Limit: NEWS_POSTS_PER_CYCLE (2) + 1 partner = 3 per 1h window.
+            # Limit: NEWS_POSTS_PER_CYCLE (4) + 1 partner per 1h window.
             recent_count = await get_recent_post_count(hours=1)
-            _WINDOW_LIMIT = 3  # 2 news + 1 partner per 1h cycle
+            _WINDOW_LIMIT = 6  # 4 news + 1 partner per 1h cycle
             if recent_count >= _WINDOW_LIMIT:
                 logger.info(
                     f"Rolling 1h post limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping"
@@ -2119,7 +2119,7 @@ class ChannelManager:
 
         # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
         recent_count = await get_recent_post_count(hours=1)
-        _WINDOW_LIMIT = 3
+        _WINDOW_LIMIT = 6
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
                 f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping partner post"
@@ -2230,7 +2230,7 @@ class ChannelManager:
         """
         # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
         recent_count = await get_recent_post_count(hours=1)
-        _WINDOW_LIMIT = 3  # 2 news + 1 partner per 1h cycle
+        _WINDOW_LIMIT = 6  # 4 news + 1 partner per 1h cycle
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
                 f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping evergreen"
@@ -2537,7 +2537,7 @@ class ChannelManager:
         """
         # ── v16.1 CAP GUARD — rolling 1h window (matches run_scheduled_post) ──
         recent_count = await get_recent_post_count(hours=1)
-        _WINDOW_LIMIT = 3
+        _WINDOW_LIMIT = 6
         if recent_count >= _WINDOW_LIMIT:
             logger.info(
                 f"Rolling 1h limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping static fact"

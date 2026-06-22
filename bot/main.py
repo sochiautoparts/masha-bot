@@ -234,31 +234,33 @@ class BackgroundTasks:
                 await asyncio.sleep(1)
 
     async def _channel_poster(self) -> None:
-        """Post to channel — 5 news + 1 partner per hourly cycle.
+        """Post to channel — 4 news + 1 partner per hourly cycle.
         
-        Each 60-min cycle publishes 6 posts:
-          Posts 1-5: DIFFERENT news items (each with dedup checks)
-          Post 6: partner content (if interval allows)
+        Each 60-min cycle publishes 5 posts:
+          Posts 1-4: DIFFERENT news items (each with dedup checks)
+          Post 5: partner content (if interval allows)
           
         Between posts: 2-4 min gap to avoid Telegram rate limits.
         Tracks tried titles per cycle to avoid re-selecting the same article.
         """
         await asyncio.sleep(30)
         
-        # 2 news posts per hour + 1 partner per cycle (original schedule).
+        # 4 news posts per hour + 1 partner per cycle.
         # The 48h TTL dedup (posted_urls table) recycles old articles after 48h,
-        # so 2 news/hour = 48/day is sustainable without exhausting the source.
-        logger.info("Channel poster started — 2 news + 1 partner per hourly cycle")
+        # so 4 news/hour = 96/day is sustainable — the bmw-news.json source is
+        # refreshed hourly and the multi-source fallback (RSS + web search)
+        # guarantees a non-empty pool.
+        logger.info("Channel poster started — 4 news + 1 partner per hourly cycle")
 
         consecutive_empty_cycles = 0
-        NEWS_POSTS_PER_CYCLE = 2
+        NEWS_POSTS_PER_CYCLE = 4
 
         while self._running:
             posts_this_cycle = 0
             tried_titles_this_cycle = []  # Track titles tried this cycle
             logger.info(f"Channel poster: starting new hourly cycle (consecutive_empty={consecutive_empty_cycles})")
             
-            # ── Phase 1: 5 news posts ──
+            # ── Phase 1: 4 news posts ──
             for post_num in range(NEWS_POSTS_PER_CYCLE):
                 try:
                     posted = await channel_manager.run_scheduled_post(
@@ -406,15 +408,22 @@ async def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
-    # Include all handler routers
+    # Include all handler routers.
+    # IMPORTANT: admin_router MUST be registered BEFORE chat_router.
+    # chat_router has a catch-all `@chat_router.message(F.text)` handler that
+    # matches every text message — including slash commands. If chat_router is
+    # registered first, ALL admin commands (/admin, /status, /post, /switch, ...)
+    # are swallowed by the catch-all and routed to the AI as ordinary text,
+    # silently breaking the entire admin panel. Registering admin_router first
+    # lets its Command(...) handlers take precedence.
     try:
-        from bot.handlers.chat import chat_router
         from bot.handlers.admin import admin_router
+        from bot.handlers.chat import chat_router
         from bot.handlers.inline import inline_router
-        dp.include_router(chat_router)
         dp.include_router(admin_router)
+        dp.include_router(chat_router)
         dp.include_router(inline_router)
-        logger.info("Handler routers included successfully")
+        logger.info("Handler routers included successfully (admin -> chat -> inline)")
     except Exception as e:
         logger.critical(f"Failed to include handler routers: {e}")
         raise

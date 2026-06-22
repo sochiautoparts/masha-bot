@@ -386,9 +386,10 @@ async def cmd_switch_model(message: Message):
         await message.answer(f"Модель '{model_name}' не найдена. Используйте /models для списка.")
         return
 
-    from ai.providers.pollinations_provider import DEFAULT_MODEL
     import ai.providers.pollinations_provider as pp
-    pp.DEFAULT_MODEL = model_name
+    # preferred_chat_model is consulted by the chat completion path, so the
+    # admin's choice takes effect on the very next message (no restart needed).
+    pp.preferred_chat_model = model_name
 
     await message.answer(f"✅ Модель переключена на: {model_name}")
 

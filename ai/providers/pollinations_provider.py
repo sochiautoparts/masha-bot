@@ -67,6 +67,11 @@ REASONING_MODELS = [
     "mistral-reasoning",
 ]
 
+# Preferred chat model — switchable at runtime via the /switch admin command.
+# When set (and present in CHAT_MODELS), it takes precedence over random
+# selection so the admin's choice actually sticks across requests.
+preferred_chat_model: Optional[str] = None
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
 GEN_BASE_URL = "https://gen.pollinations.ai"        # New API (requires key)
@@ -350,7 +355,9 @@ class PollinationsProvider(BaseAIProvider):
 
         Priority: gen.pollinations.ai (with key) → legacy text.pollinations.ai (free)
         """
-        chosen_model = self._pick_model(model, CHAT_MODELS)
+        # Honour the runtime-preferred chat model (set via /switch) when the
+        # caller did not request a specific model.
+        chosen_model = self._pick_model(model or preferred_chat_model, CHAT_MODELS)
         circuit = self._get_circuit(chosen_model)
 
         if circuit.is_open and self._circuit.is_open:

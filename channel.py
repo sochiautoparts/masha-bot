@@ -1039,6 +1039,73 @@ def _enforce_partner_char_limit(
     return result
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# REUSABLE PARTNER-POST PREPARATION PIPELINE
+# ════════════════════════════════════════════════════════════════════════════
+# Used by BOTH the automatic channel poster (ChannelManager.post_partner_content)
+# AND the admin /send_partner_post command, so the same cleaning, leakage guard,
+# validation, and link-preservation enforcement apply in every mode.
+
+def prepare_partner_post_for_publish(
+    post_content: str,
+    program,
+    has_media: bool = False,
+) -> Optional[str]:
+    """Clean, validate, and enforce char limits on a partner post.
+
+    Returns the publication-ready text (with goto_link + footer guaranteed),
+    or None if validation fails (e.g. prompt-leakage too heavy).
+
+    Pipeline:
+      1. _clean_partner_post_text  — strip markdown, preserve goto_link
+      2. _strip_prompt_leakage     — remove AI task-echo lines
+      3. _validate_post_text_partner — block SSE/errors/leakage (safety net)
+      4. Re-append goto_link if missing
+      5. _enforce_partner_char_limit — reserve room for link + footer, trim body
+      6. Final guarantee: link must be present
+    """
+    if not post_content:
+        return None
+
+    goto_link = getattr(program, "goto_link", "") or ""
+
+    # 1. Clean markdown (preserve goto_link) + 2. strip prompt leakage
+    post_content = _clean_partner_post_text(post_content, goto_link=goto_link)
+    post_content = _strip_prompt_leakage(post_content)
+
+    # 3. Validate — block SSE artifacts, provider ads, and heavy leakage
+    if not _validate_post_text_partner(post_content):
+        logger.warning(
+            f"Partner post validation failed in prepare pipeline: {program.name}"
+        )
+        return None
+
+    # 4. Guarantee the goto_link is present before enforcing limits
+    if goto_link and goto_link not in post_content:
+        logger.info(f"goto_link missing after cleaning — re-appending for {program.name}")
+        post_content = post_content.rstrip() + f"\n\n👉 {goto_link}"
+
+    # 5. Enforce char limit PRESERVING the goto_link + footer
+    post_content = _enforce_partner_char_limit(
+        post_content,
+        goto_link=goto_link,
+        has_media=has_media,
+        program_name=getattr(program, "name", ""),
+    )
+
+    # 6. FINAL GUARANTEE: the published text MUST contain the goto_link
+    if goto_link and goto_link not in post_content:
+        logger.warning(f"goto_link lost after enforce — emergency re-append for {program.name}")
+        post_content = _enforce_partner_char_limit(
+            post_content + f"\n\n👉 {goto_link}",
+            goto_link=goto_link,
+            has_media=has_media,
+            program_name=getattr(program, "name", ""),
+        )
+
+    return post_content
+
+
 class ChannelManager:
     """Manages posting to the @bmw_mpower_club channel."""
 
@@ -2587,47 +2654,26 @@ class ChannelManager:
         if not post_content:
             return False
 
-        # ── v17.0: Clean markdown (preserve goto_link) + strip prompt leakage ──
-        post_content = _clean_partner_post_text(post_content, goto_link=goto_link)
-        post_content = _strip_prompt_leakage(post_content)
+        # Get partner image FIRST — determines has_media for char-limit enforcement
+        # (1024 with media, 4096 without). Image fetch is async on the ChannelManager.
+        image_data = await self._get_partner_image(program)
+        has_media = bool(image_data)
 
-        if not _validate_post_text_partner(post_content):
-            logger.warning(f"Partner post validation failed: {program.name}")
+        # ── v17.0: Run the shared prepare pipeline ──
+        # Cleaning, leakage guard, validation, link re-append, char-limit
+        # enforcement — all in one reusable function so the admin /send_partner_post
+        # command uses the exact same safety as the automatic poster.
+        post_content = prepare_partner_post_for_publish(
+            post_content, program, has_media=has_media
+        )
+        if not post_content:
+            logger.warning(f"Partner post rejected by prepare pipeline: {program.name}")
             return False
 
-        # ── v17.0: Guarantee the goto_link is present before publishing ──
-        # generate_partner_post_content already re-appends the link if missing,
-        # but cleaning/stripping could in theory remove a malformed line. Re-add
-        # the canonical link if it's absent.
+        # Triple-check: the goto_link MUST be in the final text.
         if goto_link and goto_link not in post_content:
-            logger.info(f"goto_link missing after cleaning — re-appending for {program.name}")
-            post_content = post_content.rstrip() + f"\n\n👉 {goto_link}"
-
-        # Get partner image — from partners.json (SVG→PNG conversion built-in)
-        image_data = await self._get_partner_image(program)
-
-        # ── v17.0: Enforce char limit PRESERVING the goto_link + footer ──
-        # The old code called _enforce_char_limit which chopped the link line
-        # when truncating at a paragraph break. _enforce_partner_char_limit
-        # moves the goto_link into a protected tail so truncation only ever
-        # trims the body — the published post ALWAYS carries the link.
-        has_media = bool(image_data)
-        post_content = _enforce_partner_char_limit(
-            post_content, goto_link=goto_link, has_media=has_media,
-            program_name=program.name,
-        )
-
-        # FINAL GUARANTEE: the published text MUST contain the goto_link.
-        # If the enforcer somehow dropped it (shouldn't happen), re-append and
-        # re-trim the body to make room.
-        if goto_link and goto_link not in post_content:
-            logger.warning(f"goto_link lost after enforce — emergency re-append for {program.name}")
-            post_content = _enforce_partner_char_limit(
-                post_content + f"\n\n👉 {goto_link}",
-                goto_link=goto_link,
-                has_media=has_media,
-                program_name=program.name,
-            )
+            logger.error(f"goto_link STILL missing after prepare pipeline — aborting: {program.name}")
+            return False
 
         try:
             if image_data:

@@ -198,7 +198,16 @@ async def cmd_partner_post(message: Message):
 
 @admin_router.message(Command("send_partner_post"))
 async def cmd_send_partner_post(message: Message):
-    """Send the pending partner post to the channel."""
+    """Send the pending partner post to the channel.
+
+    v17.0: Runs the post through the SAME prepare pipeline as the automatic
+    channel poster (prepare_partner_post_for_publish from channel.py) so the
+    admin-initiated post gets identical cleaning, prompt-leakage guard,
+    validation, and goto_link-preservation enforcement. Previously this command
+    sent the raw AI text directly to the channel — no markdown cleaning, no
+    leakage check, no char-limit enforcement, and the goto_link could be
+    missing or chopped off.
+    """
     if not await _is_admin(message):
         return
 
@@ -209,10 +218,47 @@ async def cmd_send_partner_post(message: Message):
         await message.answer("Нет партнёрского поста для отправки.")
         return
 
+    # ── v17.0: Run the shared prepare pipeline ──
+    # Admin posts are text-only (no image attachment in this command), so
+    # has_media=False → 4096-char limit. The pipeline cleans markdown, strips
+    # prompt leakage, validates, re-appends the goto_link if missing, and
+    # enforces the char limit preserving the link + footer.
+    try:
+        from channel import prepare_partner_post_for_publish
+        prepared = prepare_partner_post_for_publish(
+            post_text, program, has_media=False
+        )
+    except ImportError:
+        # Fallback: channel.py is at repo root; if import fails, use the text as-is
+        # (legacy behavior) but still log a warning so the admin knows.
+        logger.warning("Could not import prepare_partner_post_for_publish — sending uncleaned post")
+        prepared = post_text
+    except Exception as e:
+        logger.error(f"prepare_partner_post_for_publish error: {e}")
+        prepared = None
+
+    if not prepared:
+        await message.answer(
+            "❌ Пост не прошёл проверку (prompt-leakage или пустой текст). "
+            "Попробуйте /partner_post ещё раз."
+        )
+        message.bot._pending_partner_post = None
+        message.bot._pending_partner_program = None
+        return
+
+    # Final guarantee: the goto_link must be present
+    goto_link = getattr(program, "goto_link", "") or ""
+    if goto_link and goto_link not in prepared:
+        logger.error(f"Admin partner post missing goto_link — aborting: {program.name}")
+        await message.answer("❌ Партнёрская ссылка потеряна при очистке. Попробуйте ещё раз.")
+        message.bot._pending_partner_post = None
+        message.bot._pending_partner_program = None
+        return
+
     try:
         sent = await message.bot.send_message(
             chat_id=config.CHANNEL_ID,
-            text=post_text,
+            text=prepared,
         )
 
         from bot.database import add_partner_post
@@ -221,12 +267,15 @@ async def cmd_send_partner_post(message: Message):
             program_name=program.name,
             category=program.category if program.category else "general",
             affiliate_url=program.goto_link,
-            post_content=post_text,
+            post_content=prepared,
             message_id=sent.message_id,
         )
 
         partner_manager.mark_posted(program)
-        await message.answer(f"✅ Партнёрский пост опубликован: {program.name}")
+        await message.answer(
+            f"✅ Партнёрский пост опубликован: {program.name}\n"
+            f"   Длина: {len(prepared)} симв. | Ссылка: {'✅' if goto_link in prepared else '❌'}"
+        )
 
         message.bot._pending_partner_post = None
         message.bot._pending_partner_program = None

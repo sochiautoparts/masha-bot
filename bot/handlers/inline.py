@@ -130,13 +130,36 @@ async def handle_inline_query(inline_query: InlineQuery):
 
         # Append partner links section so the published inline message carries
         # the correct goto_links from partners.json (used EXACTLY as-is).
+        # v17.0: Build the section FIRST, then reserve room for it when
+        # truncating the body. Previously the body was truncated to 4000 chars
+        # AFTER the section was appended, so `reply_text[:3997]` chopped the
+        # section off the end whenever the AI response was long.
+        partner_section = ""
         if partner_links:
-            section = _format_inline_partner_links(partner_links)
-            if section:
-                reply_text = reply_text.rstrip() + "\n\n" + section
+            partner_section = _format_inline_partner_links(partner_links)
 
-        if len(reply_text) > 4000:
-            reply_text = reply_text[:3997] + "..."
+        # Inline messages have a 4096-char hard limit. Reserve room for the
+        # partner section + a margin, then truncate the BODY at a sentence
+        # boundary. The section is always appended intact.
+        _INLINE_LIMIT = 4096
+        _MARGIN = 10  # separator + safety
+        section_cost = len(partner_section) + (_MARGIN if partner_section else 0)
+        body_budget = _INLINE_LIMIT - section_cost
+
+        if len(reply_text) > body_budget:
+            # Truncate at sentence boundary, then sentence, then hard cut
+            cut = reply_text[:body_budget]
+            pos = cut.rfind('\n\n')
+            if pos < body_budget // 2:
+                pos = cut.rfind('. ')
+            if pos < body_budget // 2:
+                pos = cut.rfind('\n')
+            if pos < body_budget // 2:
+                pos = body_budget
+            reply_text = cut[:pos].rstrip() + "…"
+
+        if partner_section:
+            reply_text = reply_text.rstrip() + "\n\n" + partner_section
 
         results = _build_inline_results(query, reply_text, query_type)
 

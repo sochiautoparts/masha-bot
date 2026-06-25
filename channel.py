@@ -471,11 +471,32 @@ def _validate_post_text(text: str) -> bool:
         logger.warning(f"Post BLOCKED (no BMW-relevant keywords)")
         return False
 
+    # ── Prompt-leakage safety net ──
+    # Block posts that are mostly echoed task instructions. Confirmed leakages
+    # in DB: channel_posts #713, #464 ("Мы должны написать пост для канала...").
+    # The news flow runs `_strip_prompt_leakage` before validating, but this
+    # guard catches anything the cleaner missed.
+    if _looks_like_prompt_leakage(text):
+        logger.warning("Post BLOCKED (prompt-leakage detected)")
+        return False
+    for marker in ("мы должны написать", "партнёрская ссылка дана",
+                   "тип контента: partner", "используй goto_link",
+                   "напиши подробный новостной пост"):
+        if marker in text_lower:
+            logger.warning(f"Post BLOCKED (leakage marker '{marker}')")
+            return False
+
     return True
 
 
 def _validate_post_text_partner(text: str) -> bool:
-    """Validate partner post text — RELAXED version."""
+    """Validate partner post text — RELAXED version.
+
+    Note: the caller (`post_partner_content`) runs `_clean_partner_post_text`
+    and `_strip_prompt_leakage` BEFORE this validator, so leakage should be
+    gone by now. We still block heavy leakage here as a safety net so we never
+    publish a post that is mostly leaked task instructions.
+    """
     if not text or not text.strip():
         return False
 
@@ -499,6 +520,23 @@ def _validate_post_text_partner(text: str) -> bool:
 
     if text.strip().startswith(('{', '[', '```', 'data:')):
         return False
+
+    # ── Prompt-leakage safety net ──
+    # Block posts that are mostly echoed task instructions even after cleaning
+    # (e.g. the local 4B model regurgitating "Мы должны написать партнёрский
+    # пост..."). Confirmed leakages in DB: partner_posts #99, #51.
+    if _looks_like_prompt_leakage(text):
+        logger.warning("Partner post BLOCKED (prompt-leakage detected)")
+        return False
+
+    # Block any surviving single prompt-echo line that the cleaner missed
+    # (defense in depth — the cleaner already strips these, but if a line
+    # survives, the post is not safe to publish).
+    for marker in ("мы должны написать", "партнёрская ссылка дана",
+                   "тип контента: partner", "используй goto_link"):
+        if marker in text_lower:
+            logger.warning(f"Partner post BLOCKED (leakage marker '{marker}')")
+            return False
 
     return True
 
@@ -632,6 +670,371 @@ def _enforce_char_limit(text: str, has_media: bool) -> str:
             result = content_only.rstrip() + footer
         else:
             result = footer.lstrip('\n')
+
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PROMPT-LEAKAGE GUARD — strips AI task-echo from published posts
+# ════════════════════════════════════════════════════════════════════════════
+# Problem: the local 4B fallback model (RuDaptQwen3-4B) sometimes echoes the
+# task instructions back instead of writing the post — e.g.:
+#   "Мы должны написать партнёрский пост для канала @bmw_mpower_club. Тема: ..."
+#   "Мы должны написать пост для Telegram-канала от лица Маши..."
+#   "Напиши подробный новостной пост с реакцией Маши..."
+#   "Задача: Прочитай факты из статьи..."
+# These leaked instructions were published to the channel (confirmed in DB:
+# partner_posts #99, #51 and channel_posts #713, #464). This guard detects
+# and strips such leakage before validation/publishing.
+
+# Lines that are CLEARLY prompt-echo, not post content. Matched case-insensitively
+# as full-line prefixes (a line is dropped if it starts with one of these).
+_PROMPT_LEAK_LINE_PREFIXES = (
+    "мы должны написать",          # "Мы должны написать пост для канала..."
+    "напиши подробный",            # "Напиши подробный новостейный пост..."
+    "напиши пост",                  # "Напиши пост для канала..."
+    "задача:",                      # "Задача: Прочитай факты..."
+    "задача :", 
+    "тип контента:",               # "Тип контента: partner"
+    "контекст:",                    # "Контекст: ..." (when on its own line)
+    "тема:",                        # "Тема: Avtocod RU — проверка авто"
+    "новость:",                     # "Новость: <title>" (local-model prompt header)
+    "исходная новость:",
+    "полный текст статьи:",
+    "источник:",
+    "редакционная шутка",
+    "уникализация:",
+    "короткая новость:",
+    "ограничения и подпись",
+    "критически важно",
+    "подпись в конце обязательна",
+    "партнёрская ссылка (вставь",
+    "партнёрские ссылки (вставь",
+    "партнёрские ссылки для запчастей",
+    "используй goto_link",
+    "вставь в исходном виде",
+    "вставь естественно в ответ",
+    "это партнёрский пост, не новость",
+    "партнёрский пост — рекомендации",
+    "добавь подпись",
+    "добавь экспертный комментарий",
+    "напиши свой текст",
+    "перескажи своими словами",
+    "обязательно включить партнёр",
+    "партнёрская ссылка дана",
+    "redirect url",
+    "goto_link",
+    "campaigns",
+)
+
+# Substring markers (anywhere in text) that indicate a leaked prompt block.
+# If found, the WHOLE line containing the marker is dropped.
+_PROMPT_LEAK_LINE_MARKERS = (
+    "используй goto_link",
+    "вставь в исходном виде, ничего не меняй",
+    "партнёрская ссылка (вставь",
+    "партнёрские ссылки (вставь",
+    "давай всегда в этом порядке",
+    "партнёрский пост, не новость",
+)
+
+
+def _strip_prompt_leakage(text: str) -> str:
+    """Remove prompt-echo lines from AI-generated post text.
+
+    Drops any line that starts with a known task-instruction prefix or contains
+    a prompt-only marker. Collapses the resulting blank lines. Never strips the
+    footer (Автор @asmasha_bot / @bmw_mpower_club / #bmw_mpower_club) or lines
+    that contain an http(s) link.
+    """
+    if not text:
+        return text
+
+    link_re = re.compile(r'https?://\S+')
+    lines = text.split('\n')
+    kept: list[str] = []
+
+    for line in lines:
+        stripped = line.lstrip().rstrip()
+        if not stripped:
+            kept.append(line)
+            continue
+
+        # NEVER drop a line that carries a real URL (the goto_link must survive)
+        if link_re.search(stripped):
+            kept.append(line)
+            continue
+
+        # NEVER drop the footer lines
+        s_low = stripped.lower()
+        if s_low.startswith("автор @asmasha_bot") or s_low.startswith("@bmw_mpower_club") or s_low.startswith("#bmw_mpower_club"):
+            kept.append(line)
+            continue
+
+        drop = False
+        for pref in _PROMPT_LEAK_LINE_PREFIXES:
+            if s_low.startswith(pref):
+                drop = True
+                break
+        if not drop:
+            for marker in _PROMPT_LEAK_LINE_MARKERS:
+                if marker in s_low:
+                    drop = True
+                    break
+        if drop:
+            logger.warning(f"Stripped prompt-leakage line: {stripped[:80]!r}")
+            continue
+        kept.append(line)
+
+    cleaned = '\n'.join(kept)
+    # Collapse 3+ newlines left by removed lines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
+def _looks_like_prompt_leakage(text: str) -> bool:
+    """Return True if the post looks like leaked task instructions overall.
+
+    Used by the validators to BLOCK a post entirely (rather than just strip
+    lines) when the leakage is so heavy that stripping would leave garbage.
+    Heuristic: if the post STARTS with a prompt-echo prefix, or 2+ of the first
+    4 lines are prompt-echo lines, treat it as leaked.
+    """
+    if not text:
+        return False
+    body = text.strip()
+    if not body:
+        return False
+    first_low = body.split('\n', 1)[0].lstrip().lower()
+    for pref in _PROMPT_LEAK_LINE_PREFIXES:
+        if first_low.startswith(pref):
+            return True
+
+    # Count prompt-echo lines among the first 4 non-empty lines
+    link_re = re.compile(r'https?://\S+')
+    head_lines = [ln.lstrip() for ln in body.split('\n')[:6] if ln.strip()]
+    leak_count = 0
+    for ln in head_lines[:4]:
+        if link_re.search(ln):
+            continue
+        ln_low = ln.lower()
+        for pref in _PROMPT_LEAK_LINE_PREFIXES:
+            if ln_low.startswith(pref):
+                leak_count += 1
+                break
+        else:
+            for marker in _PROMPT_LEAK_LINE_MARKERS:
+                if marker in ln_low:
+                    leak_count += 1
+                    break
+    return leak_count >= 2
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PARTNER-POST MARKDOWN CLEANER — cleans markdown WITHOUT dropping goto_link
+# ════════════════════════════════════════════════════════════════════════════
+# The generic `_clean_post_text` converts `[label](url)` → `label`, which would
+# DELETE the partner goto_link if the AI wraps it in markdown. This partner-
+# specific cleaner preserves any URL that points to a partner redirect domain
+# (the `/g/` admitad pattern, ali.click, etc.) by converting `[label](url)`
+# into the bare `url` (so the link survives), and only collapses other markdown
+# links to their label.
+
+# Domains/patterns that identify a partner affiliate (goto) link.
+_PARTNER_LINK_PATTERNS = (
+    "/g/",            # admitad redirect path
+    "ali.click",      # aliexpress affiliate
+    "goto_link",
+)
+
+
+def _is_partner_goto_link(url: str) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return any(p in low for p in _PARTNER_LINK_PATTERNS)
+
+
+def _clean_partner_post_text(text: str, goto_link: str = "") -> str:
+    """Clean a partner post: strip markdown, AI meta-comments, <think> tags,
+    and SSE artifacts — while PRESERVING the goto_link.
+
+    Differences from `_clean_post_text`:
+      - `[label](url)` where url is a partner goto link → replaced by the bare
+        `url` (link preserved). Other markdown links → `label` (url dropped).
+      - Never strips a line that contains the goto_link or any partner link.
+      - Strips `**bold**`/`*italic*` markdown, `<think>` tags, "As an AI"
+        disclaimers, and the banned editorial headings (same as news cleaner).
+    """
+    if not text:
+        return text
+
+    # 1. Convert markdown links, preserving partner goto links.
+    def _md_link_repl(m: re.Match) -> str:
+        label = m.group(1)
+        url = m.group(2)
+        if _is_partner_goto_link(url) or (goto_link and url == goto_link):
+            return url  # keep the link, drop the label wrapper
+        return label     # ordinary markdown link → keep label only
+
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', _md_link_repl, text)
+
+    # 2. Strip bold/italic markdown
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)', r'\1', text)
+
+    # 3. SSE / done artifacts
+    text = re.sub(r'data:\s*\{[^}]*\}', '', text)
+    text = re.sub(r'\[DONE\]', '', text)
+
+    # 4. AI disclaimers / provider ad artifacts
+    for phrase in ["As an AI", "Как AI", "Как искусственный интеллект",
+                   "powered by pollinations", "pollinations.ai"]:
+        text = re.sub(rf'.*{re.escape(phrase)}.*', '', text, flags=re.IGNORECASE)
+
+    # 5. <think> blocks (reasoning models)
+    text = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'</?think[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # 6. Strip trailing punctuation/markdown garbage glued to the goto_link
+    #    (e.g. "https://.../?erid=...).," → "https://.../?erid=...")
+    #    Includes ':' for the common AI habit of "link:" — a trailing colon is
+    #    never part of a valid URL (the scheme ':' is internal, not trailing).
+    _TRAILING_JUNK = r'[\)\]\*,\.;:]+'
+    if goto_link:
+        # Remove any run of trailing junk that immediately follows the link
+        text = re.sub(
+            re.escape(goto_link) + _TRAILING_JUNK,
+            goto_link,
+            text,
+        )
+        # Same for partner links the AI wrapped/edited (any /g/ URL)
+        text = re.sub(
+            r'(https?://\S*?/g/\S+?)' + _TRAILING_JUNK,
+            lambda m: m.group(1),
+            text,
+        )
+        # Same for ali.click partner URLs
+        text = re.sub(
+            r'(https?://\S*?ali\.click\S+?)' + _TRAILING_JUNK,
+            lambda m: m.group(1),
+            text,
+        )
+
+    # 7. Banned editorial openings (same list as news cleaner)
+    _banned_openings = [
+        "🔥 Мнение Маши", "Мнение Маши",
+        "🔥 Мнение редакции", "Мнение редакции",
+        "🔥 Мнение", "Мнение Маши (с сарказмом и BMW-экспертизой)",
+    ]
+    for banned in _banned_openings:
+        pattern = rf'^[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        pattern = rf'\n[\s]*[-–—]?\s*(?:\S+\s+)?{re.escape(banned)}[^\n]*\n*'
+        text = re.sub(pattern, '\n', text, flags=re.IGNORECASE)
+
+    # 8. Strip "Маша:" / "Assistant:" prefixes
+    for prefix in ["Маша:", "Masha:", "Assistant:"]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+
+    # 9. Collapse whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PARTNER-POST CHAR-LIMIT ENFORCER — preserves the goto_link + footer
+# ════════════════════════════════════════════════════════════════════════════
+# The generic `_enforce_char_limit` treats the `👉 <goto_link>` line as
+# ordinary content and chops it off when truncating at a paragraph break.
+# This partner-specific enforcer reserves room for the link + footer and only
+# truncates the body, so the published post ALWAYS carries the goto_link.
+
+_PARTNER_FOOTER = "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club #bmwparts"
+
+
+def _enforce_partner_char_limit(
+    text: str, goto_link: str, has_media: bool, program_name: str = ""
+) -> str:
+    """Enforce Telegram char limit on a partner post, preserving goto_link.
+
+    The goto_link is ALWAYS moved to a protected tail line so truncation can
+    only ever trim the body — never the link. Structure after enforcement:
+
+        <body>
+        👉 <goto_link>
+        Автор @asmasha_bot
+        @bmw_mpower_club
+        #bmw_mpower_club #bmwparts
+
+    If the goto_link was embedded mid-prose (rare — e.g. "заходите на <link> и
+    подбирайте"), the embedded occurrence is replaced with `program_name` (or
+    removed) to avoid duplication and keep the prose readable.
+    """
+    char_limit = config.TELEGRAM_CAPTION_LIMIT if has_media else config.TELEGRAM_TEXT_LIMIT
+
+    # Extract the body: everything before the footer block.
+    body = text
+    body = re.sub(r'\n*Автор\s+@asmasha_bot.*$', '', body, flags=re.DOTALL)
+
+    # Remove ALL occurrences of the goto_link from the body — the canonical
+    # link lives in the protected tail. For embedded occurrences, substitute
+    # the program name so the prose still reads naturally.
+    if goto_link:
+        replacement = program_name or ""
+        body = body.replace(goto_link, replacement)
+        # Also strip a now-orphaned trailing "👉" marker line (the common case
+        # where the link was on its own line at the end).
+        body = re.sub(r'\n*👉\s*$', '', body)
+        body = re.sub(r'\n*👉\s*\n', '\n', body)
+        # Tidy up orphaned punctuation left by embedded-link removal:
+        # " — — ", "—  —", ": ,", "  ," etc.
+        body = re.sub(r'\s*[—–-]\s*[—–-]\s*', ' — ', body)
+        body = re.sub(r'[\s]*[:,;][\s]*[:,;]+', ',', body)
+        body = re.sub(r'[ \t]{2,}', ' ', body)
+    body = body.rstrip()
+
+    # Build the mandatory protected tail.
+    link_line = f"👉 {goto_link}" if goto_link else ""
+    tail_parts = []
+    if link_line:
+        tail_parts.append(link_line)
+    tail_parts.append(_PARTNER_FOOTER.lstrip('\n'))
+    tail = "\n".join(tail_parts)
+    tail_with_sep = ("\n\n" + tail) if tail else ""
+
+    max_body = char_limit - len(tail_with_sep)
+    if max_body < 80:
+        # Extremely tight budget — keep the link + footer only
+        return tail.lstrip('\n')
+
+    if len(body) <= max_body:
+        return body + tail_with_sep
+
+    # Smart truncation: prefer paragraph break, then sentence, then hard cut.
+    trimmed = body[:max_body]
+    last_para = trimmed.rfind('\n\n')
+    if last_para > max_body * 0.4:
+        trimmed = trimmed[:last_para]
+    else:
+        last_sent = max(trimmed.rfind('. '), trimmed.rfind('! '), trimmed.rfind('? '))
+        if last_sent > max_body * 0.4:
+            trimmed = trimmed[:last_sent + 1]
+        else:
+            trimmed = trimmed.rstrip() + "…"
+
+    result = trimmed.rstrip() + tail_with_sep
+
+    # Final safety: if still over (e.g. unicode width edge cases), trim body
+    if len(result) > char_limit:
+        overhead = len(result) - char_limit
+        body_only = trimmed.rstrip()
+        if len(body_only) > overhead:
+            body_only = body_only[:len(body_only) - overhead].rstrip()
+            result = body_only + tail_with_sep
+        else:
+            result = tail.lstrip('\n')
 
     return result
 
@@ -1691,6 +2094,9 @@ class ChannelManager:
             post_text = _clean_post_text(post_text)
             # v11.0: Trim excessive editorial jokes — keep at most 1 joke line per post
             post_text = _trim_excessive_jokes(post_text)
+            # v17.0: Strip AI task-echo / prompt-leakage lines (local 4B model
+            # sometimes regurgitates the prompt — see channel_posts #713, #464).
+            post_text = _strip_prompt_leakage(post_text)
             if not _validate_post_text(post_text):
                 logger.warning(f"Post validation failed: {post_text[:80]}")
                 return False
@@ -2113,6 +2519,21 @@ class ChannelManager:
         v16.0 CAP GUARD: Partner posts must NOT bypass daily/hourly caps.
           Previously only the 4h partner interval was checked, so partner
           posts could push the total above CHANNEL_MAX_POSTS_PER_DAY.
+
+        v17.0 LINK-PRESERVATION + LEAKAGE GUARD:
+          - Proactively refreshes partner data from sochiautoparts.ru/partners.json
+            (maybe_refresh is throttled to 6h internally) so the post always
+            uses the freshest goto_link.
+          - Cleans markdown + strips prompt-leakage BEFORE validation (the
+            generic _clean_post_text would drop the goto_link — we use
+            _clean_partner_post_text instead).
+          - Uses _enforce_partner_char_limit which reserves room for the
+            `👉 <goto_link>` line + footer, so truncation never chops the
+            link off. ROOT CAUSE of "Маша forgets links": the old code used
+            _enforce_char_limit which treated the link as body content and
+            cut it at the last paragraph break (30% of recent partner posts
+            had no link — see partner_posts #103, #102, #100, #99, #92...).
+          - Final safety net: re-append the goto_link if it somehow vanished.
         """
         if not partner_manager.should_post_partner():
             return False
@@ -2130,6 +2551,16 @@ class ChannelManager:
             logger.info(f"Hourly limit reached ({hourly_count}) — skipping partner post")
             return False
 
+        # ── v17.0: Proactively refresh partner data from the remote source ──
+        # maybe_refresh() is throttled to PARTNERS_REFRESH_INTERVAL (6h) inside
+        # PartnerManager, so this is cheap on steady state but guarantees we
+        # never post with a stale/broken goto_link when the file has been
+        # updated on sochiautoparts.ru.
+        try:
+            await partner_manager.maybe_refresh()
+        except Exception as e:
+            logger.debug(f"Partner maybe_refresh skipped: {e}")
+
         # ── Topical selection: match partner to recent channel topics ─────
         program = None
         try:
@@ -2146,19 +2577,61 @@ class ChannelManager:
         if not program:
             return False
 
+        # No goto_link → nothing to post (partner data incomplete). Skip.
+        goto_link = program.goto_link or ""
+        if not goto_link:
+            logger.warning(f"Partner '{program.name}' has no goto_link — skipping partner post")
+            return False
+
         post_content = await partner_manager.generate_partner_post_content(program)
+        if not post_content:
+            return False
+
+        # ── v17.0: Clean markdown (preserve goto_link) + strip prompt leakage ──
+        post_content = _clean_partner_post_text(post_content, goto_link=goto_link)
+        post_content = _strip_prompt_leakage(post_content)
 
         if not _validate_post_text_partner(post_content):
+            logger.warning(f"Partner post validation failed: {program.name}")
             return False
+
+        # ── v17.0: Guarantee the goto_link is present before publishing ──
+        # generate_partner_post_content already re-appends the link if missing,
+        # but cleaning/stripping could in theory remove a malformed line. Re-add
+        # the canonical link if it's absent.
+        if goto_link and goto_link not in post_content:
+            logger.info(f"goto_link missing after cleaning — re-appending for {program.name}")
+            post_content = post_content.rstrip() + f"\n\n👉 {goto_link}"
 
         # Get partner image — from partners.json (SVG→PNG conversion built-in)
         image_data = await self._get_partner_image(program)
 
+        # ── v17.0: Enforce char limit PRESERVING the goto_link + footer ──
+        # The old code called _enforce_char_limit which chopped the link line
+        # when truncating at a paragraph break. _enforce_partner_char_limit
+        # moves the goto_link into a protected tail so truncation only ever
+        # trims the body — the published post ALWAYS carries the link.
+        has_media = bool(image_data)
+        post_content = _enforce_partner_char_limit(
+            post_content, goto_link=goto_link, has_media=has_media,
+            program_name=program.name,
+        )
+
+        # FINAL GUARANTEE: the published text MUST contain the goto_link.
+        # If the enforcer somehow dropped it (shouldn't happen), re-append and
+        # re-trim the body to make room.
+        if goto_link and goto_link not in post_content:
+            logger.warning(f"goto_link lost after enforce — emergency re-append for {program.name}")
+            post_content = _enforce_partner_char_limit(
+                post_content + f"\n\n👉 {goto_link}",
+                goto_link=goto_link,
+                has_media=has_media,
+                program_name=program.name,
+            )
+
         try:
             if image_data:
-                # Post with image — enforce caption limit
-                if len(post_content) > 1024:
-                    post_content = _enforce_char_limit(post_content, has_media=True)
+                # Post with image (caption limit already enforced)
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp.write(image_data)
                     tmp_path = tmp.name
@@ -2176,9 +2649,7 @@ class ChannelManager:
                     except OSError:
                         pass
             else:
-                # No image available — post text-only
-                if len(post_content) > 4096:
-                    post_content = _enforce_char_limit(post_content, has_media=False)
+                # No image available — post text-only (limit already enforced)
                 logger.warning(f"Partner post without image: {program.name}")
                 sent = await self._bot.send_message(
                     chat_id=config.CHANNEL_ID,
@@ -2195,7 +2666,11 @@ class ChannelManager:
                     message_id=sent.message_id,
                 )
                 partner_manager.mark_posted(program)
-                logger.info(f"Partner post published: {program.name} (with_image={image_data is not None})")
+                logger.info(
+                    f"Partner post published: {program.name} "
+                    f"(with_image={image_data is not None}, len={len(post_content)}, "
+                    f"link_present={goto_link in post_content})"
+                )
                 return True
         except Exception as e:
             logger.error(f"Partner post error: {e}")
@@ -2391,6 +2866,8 @@ class ChannelManager:
                 post_text = _clean_post_text(post_text)
                 # v11.0: Trim excessive editorial jokes — keep at most 1 joke line per post
                 post_text = _trim_excessive_jokes(post_text)
+                # v17.0: Strip prompt-leakage lines (defense in depth for evergreen path)
+                post_text = _strip_prompt_leakage(post_text)
                 if not _validate_post_text(post_text):
                     logger.warning(
                         "Evergreen post validation failed (attempt %d/%d) for: %s — trying next item",

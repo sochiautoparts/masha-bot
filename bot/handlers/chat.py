@@ -2,11 +2,21 @@
 Chat Handler — Main user interaction with AI, web search, partner links,
 BMW car diagnostics, spare part search, VIN decoding, photo analysis,
 and personalized communication with Masha's BMW-expert persona.
+
+v18: GROUP CONVERSATION SUPPORT — Маша replies to other participants in
+group chats and channel comment threads when:
+  - she is @mentioned (@asmasha_bot)
+  - someone replies to one of her messages
+  - the message is a comment on a channel post (discussion group) AND it's
+    BMW-relevant (so she participates naturally in the conversation)
+She applies her full BMW knowledge + the conversation context (last N
+messages with author names from chat_history) to every reply.
 """
 
 import re
 import logging
 import base64
+import time
 from typing import List, Optional
 
 from aiogram import Router, F, types
@@ -21,7 +31,7 @@ from bot.database import (
     get_or_create_user, is_user_blocked, add_chat_message,
     clear_chat_history, get_chat_mode, set_chat_mode,
     add_user_car, get_user_cars, delete_user_car, update_car_mileage,
-    check_rate_limit,
+    check_rate_limit, get_chat_history,
 )
 from bot.masha_data import (
     is_part_number, extract_part_numbers, identify_car_brand,
@@ -203,6 +213,181 @@ def _extract_original_post_text(reply: Message) -> str:
     except Exception:
         pass
     return ""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# v18: GROUP CONVERSATION SUPPORT
+# ════════════════════════════════════════════════════════════════════════════
+# Маша участвует в беседах групп и комментариев к постам канала. Триггеры:
+#   1. @asmasha_bot упоминание (или @asmasha_bot в entities)
+#   2. Reply на сообщение Маши (reply_to_message.from_user.is_bot и это Маша)
+#   3. В дискуссионной группе канала: BMW-релевантный комментарий к посту
+#      (мягкий триггер — чтобы Маша естественно участвовала в обсуждении постов)
+# Перед ответом Маша загружает последние N сообщений беседы из chat_history
+# (с именами авторов) и применяет ВСЕ свои знания (BMW knowledge, partners,
+# web search) к контексту. Rate-limit: 1 ответ/30сек на группу (анти-спам).
+
+# Per-group rate limiting: {chat_id: last_reply_timestamp}
+_group_reply_cooldown: dict[int, float] = {}
+_GROUP_COOLDOWN_SECONDS = 20  # Маша отвечает не чаще чем раз в 20 сек на группу
+_GROUP_HISTORY_LIMIT = 12     # сколько последних сообщений брать в контекст
+
+# BMW-relevance keywords for the soft group trigger (channel comments)
+_BMW_TRIGGER_KEYWORDS = [
+    "bmw", "бмв", "бимер", "баварец", "///m", "m power", "mpower",
+    "m3", "m4", "m5", "m2", "m8", "x5", "x6", "x7", "x3", "x4",
+    "s63", "s58", "s55", "b58", "n55", "b48", "n54", "s68",
+    "vanos", "valvetronic", "xdrive", "alpina",
+    "m5 f90", "e30", "e46", "e39", "f80", "f82", "g80", "g82", "g87",
+    "ista", "bimmercode", "realoem", "inpa",
+    "запчаст", "vin", "вин", "колодк", "фильтр", "масло",
+    "ванос", "стучит", "троит", "чек", "diagnostic",
+    "независ", "m performance", "individual",
+]
+
+
+def _is_group_chat(message: Message) -> bool:
+    """True if the message is from a group or supergroup (not private, not channel)."""
+    try:
+        return getattr(message.chat, "type", "private") in ("group", "supergroup")
+    except Exception:
+        return False
+
+
+def _is_mentioned(message: Message) -> bool:
+    """True if Маша is @mentioned in the message text or entities."""
+    text = message.text or message.caption or ""
+    # 1. Plain-text mention
+    if re.search(r'@asmasha_bot', text, re.IGNORECASE):
+        return True
+    # 2. Telegram entity mention (resolves username → bot id)
+    try:
+        for ent in message.entities or []:
+            if ent.type == "mention":
+                mention_text = text[ent.offset:ent.offset + ent.length]
+                if mention_text.lower() == "@asmasha_bot":
+                    return True
+            if ent.type == "text_mention" and ent.user and ent.user.is_bot:
+                # text_mention resolves to a user object; if it's a bot, likely us
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_reply_to_masha(message: Message) -> bool:
+    """True if the message is a reply to one of Маша's messages (not a channel post).
+
+    Note: a reply to a channel-post COPY (sender_chat set) is NOT a reply to
+    Маша — that's a channel-comment discussion and is handled by trigger 3
+    (channel_comment_bmw). We only return True when the reply target was sent
+    by a bot (Маша is the only active bot in our groups).
+    """
+    try:
+        reply = getattr(message, "reply_to_message", None)
+        if reply is None:
+            return False
+        # Reply target is from a bot — in our groups the only active bot is Маша
+        if reply.from_user and getattr(reply.from_user, "is_bot", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_bmw_relevant(text: str) -> bool:
+    """Soft BMW-relevance check for the channel-comment trigger."""
+    if not text:
+        return False
+    t = text.lower()
+    return any(kw in t for kw in _BMW_TRIGGER_KEYWORDS)
+
+
+def _group_should_reply(message: Message) -> tuple[bool, str]:
+    """Decide whether Маша should reply in a group, and why.
+
+    Returns (should_reply, reason). Reason is logged + used for analytics.
+    """
+    text = message.text or message.caption or ""
+
+    # Trigger 1: explicit @mention — highest priority, always reply
+    if _is_mentioned(message):
+        return True, "mention"
+
+    # Trigger 2: reply to one of Маша's messages
+    if _is_reply_to_masha(message):
+        return True, "reply_to_masha"
+
+    # Trigger 3: channel-comment discussion — BMW-relevant comment under a post.
+    # Only triggers when the reply target is a channel-post copy (sender_chat
+    # set), NOT a regular group message from another user. This keeps Маша
+    # from replying to every BMW-mention in group chatter.
+    try:
+        reply = getattr(message, "reply_to_message", None)
+        if reply is not None:
+            is_channel_post = bool(getattr(reply, "sender_chat", None))
+            if is_channel_post:
+                orig_text = _extract_original_post_text(reply)
+                if orig_text and _is_bmw_relevant(text):
+                    return True, "channel_comment_bmw"
+    except Exception:
+        pass
+
+    return False, "no_trigger"
+
+
+def _group_rate_limited(chat_id: int) -> bool:
+    """True if Маша replied to this group too recently (anti-spam)."""
+    now = time.time()
+    last = _group_reply_cooldown.get(chat_id, 0)
+    if now - last < _GROUP_COOLDOWN_SECONDS:
+        return True
+    _group_reply_cooldown[chat_id] = now
+    return False
+
+
+def _display_name(user) -> str:
+    """Best-effort display name for a Telegram user (for the conversation transcript)."""
+    try:
+        first = getattr(user, "first_name", "") or ""
+        last = getattr(user, "last_name", "") or ""
+        username = getattr(user, "username", "") or ""
+        if first and last:
+            return f"{first} {last}"
+        if first:
+            return first
+        if username:
+            return f"@{username}"
+        return "Участник"
+    except Exception:
+        return "Участник"
+
+
+def _format_conversation_transcript(history: list[dict], current_author: str, current_text: str) -> str:
+    """Format chat_history into a readable transcript for the AI.
+
+    Each line: «Имя: текст». Маша's own previous replies are marked as «Маша:».
+    The current message is appended as the last line so the AI sees it in
+    context. Skips the thinking-status messages Маша posts («Слушаю...» etc.).
+    """
+    lines: list[str] = []
+    _THINKING_PHRASES = (
+        "секунд", "слушаю", "думаю", "ищу", "проверяю", "смотрю", "греди",
+    )
+    for row in history:
+        role = row.get("role", "user")
+        content = (row.get("content") or "").strip()
+        if not content:
+            continue
+        # Skip Маша's short "thinking" status messages
+        if role == "assistant" and len(content) < 40 and any(p in content.lower() for p in _THINKING_PHRASES):
+            continue
+        author = row.get("author_name") or ("Маша" if role == "assistant" else "Участник")
+        lines.append(f"{author}: {content}")
+    # Append the current message (not yet in DB when this is called)
+    if current_text:
+        lines.append(f"{current_author}: {current_text}")
+    return "\n".join(lines)
 
 
 # ── Gender detection from Russian first name ────────────────────────────────
@@ -574,13 +759,29 @@ async def cmd_mileage(message: Message):
 
 @chat_router.message(F.photo)
 async def handle_photo(message: Message):
-    """Handle photo messages — analyze with vision AI."""
+    """Handle photo messages — analyze with vision AI.
+
+    v18: In groups, photos are only handled when triggered (mention / reply to
+    Маша / BMW-relevant caption under a channel post) — same gate as text
+    messages. Prevents Маша from commenting on every photo in the group.
+    """
     if not await _check_user(message):
         return
 
     is_group = message.chat.type in ("group", "supergroup")
 
     if is_group:
+        # v18: Apply the same trigger gate as text messages
+        should_reply, reason = _group_should_reply(message)
+        # For photos, also allow the BMW-relevant caption to trigger (the
+        # _is_bmw_relevant check in _group_should_reply already covers this
+        # via the channel-comment path, but a plain @mention always works).
+        if not should_reply:
+            return  # Silent — don't comment on every group photo
+
+        if _group_rate_limited(message.chat.id):
+            return
+
         caption = message.caption or ""
         simple_prompt = (
             f"Кто-то прислал фото в группе. "
@@ -733,9 +934,19 @@ async def handle_photo(message: Message):
 
 @chat_router.message(F.voice)
 async def handle_voice(message: Message):
-    """Handle voice messages — transcribe and process."""
+    """Handle voice messages — transcribe and process.
+
+    v18: In groups, voice messages are only handled when triggered (mention /
+    reply to Маша) — same gate as text messages.
+    """
     if not await _check_user(message):
         return
+
+    # v18: Group trigger gate — don't transcribe every voice in the group
+    if _is_group_chat(message):
+        should_reply, _ = _group_should_reply(message)
+        if not should_reply:
+            return
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     await message.answer("Слушаю... 🎧")
@@ -744,7 +955,12 @@ async def handle_voice(message: Message):
     text = await process_voice_message(message.bot, voice.file_id)
 
     if text and not text.startswith("Не удалось"):
-        await _process_text_message(message, text)
+        # In groups, route through the group message processor (conversation
+        # context + BMW knowledge); in private, use the standard text flow.
+        if _is_group_chat(message):
+            await _process_group_message(message, text, "voice_trigger")
+        else:
+            await _process_text_message(message, text)
     else:
         await message.answer(text)
 
@@ -753,7 +969,13 @@ async def handle_voice(message: Message):
 
 @chat_router.message(F.text)
 async def handle_text(message: Message):
-    """Handle text messages — main interaction point."""
+    """Handle text messages — main interaction point.
+
+    v18: In GROUP chats, Маша replies ONLY when triggered (mention / reply to
+    her / BMW-relevant channel-comment). In PRIVATE chat she replies to every
+    message (existing behavior). Group replies load the conversation transcript
+    from chat_history so Маша answers with full context of the discussion.
+    """
     if not await _check_user(message):
         return
 
@@ -761,7 +983,246 @@ async def handle_text(message: Message):
     if not text:
         return
 
+    # ── v18: GROUP trigger gate ──
+    if _is_group_chat(message):
+        should_reply, reason = _group_should_reply(message)
+        if not should_reply:
+            return  # Silent: don't reply to every group message (anti-spam)
+
+        # Per-group rate limit (anti-spam): skip if we just replied here
+        if _group_rate_limited(message.chat.id):
+            logger.debug(
+                f"Group rate-limited (chat_id={message.chat.id}, reason={reason})"
+            )
+            return
+
+        logger.info(
+            f"Group reply triggered: chat_id={message.chat.id} "
+            f"user={message.from_user.id} reason={reason}"
+        )
+        await _process_group_message(message, text, reason)
+        return
+
+    # ── PRIVATE chat: existing behavior (reply to every message) ──
     await _process_text_message(message, text)
+
+
+async def _process_group_message(message: Message, text: str, reason: str):
+    """Process a group message that triggered a reply.
+
+    v18: Loads the conversation transcript (last N messages with author names),
+    injects BMW knowledge + partner links relevant to the topic, and calls the
+    AI with a group-optimized system prompt. The reply is sent via _safe_reply
+    (preserves forum thread + reply chain). Saves the user's message AND Маша's
+    reply to chat_history keyed by chat_id so the next trigger sees the context.
+    """
+    import random
+    chat_id = message.chat.id
+    user = message.from_user
+    author_name = _display_name(user)
+
+    # Strip the @asmasha_bot mention from the text we send to the AI
+    clean_text = re.sub(r'@asmasha_bot\s*', '', text, flags=re.IGNORECASE).strip()
+    if not clean_text:
+        clean_text = text  # keep original if stripping left it empty
+
+    await message.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    # ── Load conversation transcript ──
+    transcript = ""
+    try:
+        history = await get_chat_history(chat_id, limit=_GROUP_HISTORY_LIMIT)
+        transcript = _format_conversation_transcript(history, author_name, clean_text)
+    except Exception as e:
+        logger.debug(f"Group history load error: {e}")
+        transcript = f"{author_name}: {clean_text}"
+
+    # ── Build context: chat-type awareness + original post (if comment) ──
+    extra_context_parts: list[str] = []
+
+    # Chat context (group/comment/forum) — short style guidance
+    chat_ctx = _detect_chat_context(message)
+    if chat_ctx:
+        extra_context_parts.append("\n".join(chat_ctx))
+
+    # User persona (name, gender) for personalized tone
+    user_ctx = _get_user_persona_context(message)
+    if user_ctx:
+        extra_context_parts.append(user_ctx)
+
+    # The trigger reason — so the AI knows WHY it's replying
+    _reason_desc = {
+        "mention": "Тебя @упомянули в группе. Ответь адресованно тому, кто упомянул.",
+        "reply_to_masha": "Кто-то ответил на твоё сообщение. Продолжи диалог по существу.",
+        "channel_comment_bmw": "Это BMW-релевантный комментарий под постом канала. Ответь как эксперт, дополни или поправь, если нужно.",
+    }
+    extra_context_parts.append(
+        f"Почему ты отвечаешь: {_reason_desc.get(reason, 'Триггер группы')}"
+    )
+
+    # ── Apply BMW knowledge ──
+    try:
+        from bot.bmw_knowledge import build_bmw_context
+        bmw_ctx = build_bmw_context(clean_text)
+        if bmw_ctx:
+            extra_context_parts.append(bmw_ctx)
+    except Exception:
+        pass
+
+    # ── Partner links (for VIN/parts queries in the group) ──
+    collected_partner_links: list[tuple[str, str]] = []
+    try:
+        await partner_manager.maybe_refresh()
+        # If the message mentions parts/VIN, inject partner context
+        text_lower = clean_text.lower()
+        if any(kw in text_lower for kw in [
+            "запчаст", "деталь", "артикул", "vin", "вин", "купить", "подобрать",
+            "масло", "фильтр", "колодк", "ремень", "тормоз",
+        ]):
+            primary = partner_manager.format_primary_parts_links()
+            if primary:
+                extra_context_parts.append(primary)
+            pctx = partner_manager.generate_partner_context(clean_text, max_programs=3)
+            if pctx:
+                extra_context_parts.append(pctx)
+            for pl in partner_manager.get_all_relevant_links(clean_text, max_programs=4):
+                collected_partner_links.append((pl["name"], pl["url"]))
+    except Exception as e:
+        logger.debug(f"Group partner context error: {e}")
+
+    # ── Web search for diagnostic / parts questions (best-effort) ──
+    try:
+        if any(kw in clean_text.lower() for kw in [
+            "стучит", "не работает", "горит", "ошибка", "чек", "троит",
+            "запчаст", "артикул", "купить", "сколько стоит",
+        ]):
+            results = await web_search(clean_text, max_results=3)
+            if results:
+                extra_context_parts.append(
+                    "Результаты поиска (используй если релевантно):\n"
+                    + format_search_results(results, max_items=3)
+                )
+    except Exception as e:
+        logger.debug(f"Group web search error: {e}")
+
+    # ── Build the AI prompt ──
+    # Group-optimized system prompt: short, conversational, uses transcript
+    group_system = (
+        MASHA_SYSTEM_PROMPT
+        + "\n\nСЕЙЧАС ТЫ В ГРУППЕ/КОММЕНТАРИЯХ. Правила:\n"
+        "- Отвечай КОРОТКО (до 500 символов), живо, как участник беседы.\n"
+        "- Используй контекст беседы (переписка выше) — отвечай по существу, "
+        "ссылайся на то, что говорили другие, если уместно.\n"
+        "- Применяй ВСЮ свою BMW-экспертизу: модели, двигатели, технологии, "
+        "сленг. Если вопрос про запчасти/VIN/диагностику — давай конкретику.\n"
+        "- НЕ пиши подпись канала, НЕ используй формат поста. Это живой чат.\n"
+        "- Можно эмодзи, можно сарказм, можно не согласиться с собеседником.\n"
+        "- Если спрашивают про запчасти — упомяни партнёров (Росско, Autopiter, "
+        "AvtoALL) и дай ссылку из контекста. Не спамь ссылками без повода.\n"
+        "- Если ответ на вопрос есть в контексте беседы выше — не повторяйся, "
+        "добавь новое.\n"
+        "- Не извиняйся, не «как AI» — ты Маша, главред, владелица M5 F90."
+    )
+
+    extra_context = "\n\n".join(p for p in extra_context_parts if p)
+    user_msg = (
+        f"Переписка в группе (последние сообщения, oldest→newest):\n"
+        f"{transcript}\n\n"
+    )
+    if extra_context:
+        user_msg += f"Контекст для ответа:\n{extra_context}\n\n"
+    user_msg += (
+        f"Ответь на последнее сообщение от {author_name}. "
+        f"Коротко, по делу, как BMW-эксперт в живой беседе."
+    )
+
+    chat_messages = [
+        {"role": "system", "content": group_system},
+        {"role": "user", "content": user_msg},
+    ]
+
+    # ── Save the user's message to chat_history BEFORE replying ──
+    try:
+        await add_chat_message(
+            user_id=user.id,
+            role="user",
+            content=clean_text,
+            chat_id=chat_id,
+            author_name=author_name,
+        )
+    except Exception as e:
+        logger.debug(f"Group: failed to save user message to history: {e}")
+
+    # ── Call AI (ROUTE_COMMENT = local-first for fast group replies) ──
+    try:
+        response = await get_ai_router().chat(
+            messages=chat_messages,
+            use_cache=False,
+            max_tokens=600,
+            route_type=ROUTE_COMMENT,
+        )
+    except Exception as e:
+        logger.error(f"Group AI error: {e}")
+        try:
+            await message.reply("Ой, зависла 😅 Попробуй ещё раз!")
+        except Exception:
+            pass
+        return
+
+    if not response or response.error or not response.text:
+        logger.debug(f"Group AI empty response: {getattr(response, 'error_message', '?')}")
+        return  # Silent — don't spam the group with error messages
+
+    reply_text = _clean_markdown(response.text)
+    reply_text = _replace_plain_urls_with_affiliate(reply_text)
+
+    # Strip the @asmasha_bot mention from the reply (we know who's addressed)
+    # and trim to group limit
+    reply_text = reply_text.strip()
+    if len(reply_text) > GROUP_MAX_CHARS:
+        reply_text = reply_text[:GROUP_MAX_CHARS - 1].rstrip() + "…"
+
+    # ── Append partner links section (short, for group) ──
+    # Dedup and keep max 2 (group = compact)
+    if collected_partner_links:
+        seen = set()
+        unique_links = []
+        for name, url in collected_partner_links:
+            if name not in seen and url:
+                seen.add(name)
+                unique_links.append((name, url))
+        if unique_links:
+            section_lines = ["🔗 Где искать:"]
+            for name, url in unique_links[:2]:
+                section_lines.append(f"• {name}: {url}")
+            reply_text = reply_text.rstrip() + "\n\n" + "\n".join(section_lines)
+
+    # ── Send the reply (preserves reply chain + forum thread) ──
+    try:
+        sent = await message.reply(reply_text)
+    except Exception:
+        try:
+            sent = await message.answer(reply_text)
+        except Exception as e:
+            logger.error(f"Group reply send error: {e}")
+            return
+
+    # ── Save Маша's reply to chat_history ──
+    try:
+        await add_chat_message(
+            user_id=0,  # bot's own messages — user_id 0 (Маша herself)
+            role="assistant",
+            content=reply_text,
+            chat_id=chat_id,
+            author_name="Маша",
+        )
+    except Exception as e:
+        logger.debug(f"Group: failed to save Маша's reply to history: {e}")
+
+    logger.info(
+        f"Group reply sent: chat_id={chat_id} reason={reason} "
+        f"len={len(reply_text)} partners={len(collected_partner_links)}"
+    )
 
 
 async def _process_text_message(message: Message, text: str):

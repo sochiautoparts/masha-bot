@@ -245,6 +245,20 @@ class Database:
             except Exception:
                 pass
 
+        # v18: add author_name column to chat_history so group conversations
+        # can record WHO said each message — Маша uses this to follow the thread.
+        try:
+            await self._conn.execute("SELECT author_name FROM chat_history LIMIT 1")
+        except Exception:
+            try:
+                await self._conn.execute(
+                    "ALTER TABLE chat_history ADD COLUMN author_name TEXT DEFAULT ''"
+                )
+                await self._conn.commit()
+                logger.info("Migration: added author_name column to chat_history")
+            except Exception:
+                pass
+
     # ── Users ─────────────────────────────────────────────────────────────
 
     async def add_user(
@@ -283,12 +297,19 @@ class Database:
         chat_id: int,
         role: str,
         content: str,
+        author_name: str = "",
     ) -> None:
-        """Add a chat message to history."""
+        """Add a chat message to history.
+
+        v18: `author_name` records WHO said the message (display name of the
+        group participant, or "Маша" for the bot). Used to build a readable
+        conversation transcript for the AI when Маша replies in groups.
+        """
         assert self._conn is not None
         await self._conn.execute(
-            "INSERT INTO chat_history (user_id, chat_id, role, content) VALUES (?, ?, ?, ?)",
-            (user_id, chat_id, role, content),
+            "INSERT INTO chat_history (user_id, chat_id, role, content, author_name) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, chat_id, role, content, author_name),
         )
         await self._conn.commit()
 
@@ -297,7 +318,7 @@ class Database:
         chat_id: int,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Get recent chat history for a chat."""
+        """Get recent chat history for a chat (oldest-first)."""
         assert self._conn is not None
         async with self._conn.execute(
             "SELECT * FROM chat_history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
@@ -1291,10 +1312,37 @@ async def init_db() -> None:
 
 # ── Chat History ──────────────────────────────────────────────────────────
 
-async def add_chat_message(user_id: int, role: str, content: str) -> None:
-    """Add a chat message (simplified API — chat_id defaults to user_id)."""
+async def add_chat_message(
+    user_id: int,
+    role: str,
+    content: str,
+    chat_id: int | None = None,
+    author_name: str = "",
+) -> None:
+    """Add a chat message.
+
+    Backwards-compatible simplified API. Defaults chat_id to user_id (private
+    chat). v18: pass chat_id + author_name explicitly for GROUP conversations
+    so Маша can load the conversation thread when she replies.
+    """
     db = _get_db()
-    await db.add_chat_message(user_id=user_id, chat_id=user_id, role=role, content=content)
+    cid = chat_id if chat_id is not None else user_id
+    await db.add_chat_message(
+        user_id=user_id, chat_id=cid, role=role,
+        content=content, author_name=author_name,
+    )
+
+
+async def get_chat_history(chat_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    """Get recent chat history for a chat (oldest-first).
+
+    Module-level API for handlers. Each row dict has keys:
+    id, user_id, chat_id, role, content, created_at, author_name.
+    Used by the group-chat handler to build a conversation transcript
+    so Маша replies with full context of the ongoing discussion.
+    """
+    db = _get_db()
+    return await db.get_chat_history(chat_id=chat_id, limit=limit)
 
 
 async def clear_chat_history(user_id: int) -> None:

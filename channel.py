@@ -64,7 +64,9 @@ logger = logging.getLogger("masha.channel")
 
 # ── Reactions to add to posts ───────────────────────────────────────────────
 
-POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "///M"]
+POST_REACTIONS = ["👍", "🔥", "🏎️", "😍", "👏", "💯", "⚡", "🚗", "💪", "😎"]
+# v18.1: removed "///M" — it's text, NOT a valid emoji, caused silent API failures
+# (1/8 reactions failed silently when "///M" was randomly chosen).
 
 # ── How many images per news post ───────────────────────────────────────────
 # Telegram allows up to 10 media per post.
@@ -1143,17 +1145,42 @@ class ChannelManager:
             logger.warning(f"Could not load recent post titles: {e}")
 
     async def _add_reaction(self, chat_id, message_id: int) -> None:
-        """Add a reaction to a post."""
-        try:
-            emoji = random.choice(POST_REACTIONS)
-            await self._bot.set_message_reaction(
-                chat_id=chat_id,
-                message_id=message_id,
-                reaction=[ReactionTypeEmoji(emoji=emoji)],
-            )
-            logger.info(f"Added reaction {emoji} to message {message_id}")
-        except Exception as e:
-            logger.debug(f"Could not add reaction: {e}")
+        """Add a reaction to a post.
+
+        v18.1: Made more robust — logs failures at WARNING level (was DEBUG,
+        so missing reactions were invisible), retries once with a different
+        emoji if the first attempt fails (some emojis aren't valid reactions
+        on all Telegram clients). Also adds a short delay after posting so
+        Telegram has time to register the message before we react to it.
+        """
+        import asyncio
+        # Small delay — Telegram sometimes returns 400 "message not found"
+        # if we react immediately after sending (race condition).
+        await asyncio.sleep(0.5)
+
+        # Try up to 3 different emojis (first may be invalid on some clients)
+        emojis_to_try = random.sample(POST_REACTIONS, min(3, len(POST_REACTIONS)))
+        for attempt, emoji in enumerate(emojis_to_try):
+            try:
+                await self._bot.set_message_reaction(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reaction=[ReactionTypeEmoji(emoji=emoji)],
+                )
+                logger.info(f"Added reaction {emoji} to message {message_id}")
+                return
+            except Exception as e:
+                err_str = str(e)
+                # 400 = bad request (invalid emoji or message not found)
+                # 429 = rate limit — wait and retry
+                if "429" in err_str:
+                    logger.warning(f"Reaction rate-limited (msg {message_id}), waiting 2s")
+                    await asyncio.sleep(2)
+                    continue
+                if attempt < len(emojis_to_try) - 1:
+                    logger.debug(f"Reaction '{emoji}' failed ({e}), trying next emoji")
+                    continue
+                logger.warning(f"Could not add reaction to message {message_id}: {e}")
 
     # ── IMAGE PIPELINE v5.0 — STRICT QUALITY CONTROL ──────────────────────────
     #
@@ -2703,6 +2730,13 @@ class ChannelManager:
                 )
 
             if sent:
+                # v18.1: Add reaction to partner post (was MISSING — every
+                # other post type gets a reaction, but partner posts didn't).
+                try:
+                    await self._add_reaction(config.CHANNEL_ID, sent.message_id)
+                except Exception as react_err:
+                    logger.warning(f"Partner post reaction failed: {react_err}")
+
                 await add_partner_post(
                     program_id=program.id,
                     program_name=program.name,

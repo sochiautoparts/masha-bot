@@ -229,8 +229,14 @@ def _extract_original_post_text(reply: Message) -> str:
 
 # Per-group rate limiting: {chat_id: last_reply_timestamp}
 _group_reply_cooldown: dict[int, float] = {}
-_GROUP_COOLDOWN_SECONDS = 20  # Маша отвечает не чаще чем раз в 20 сек на группу
+_GROUP_COOLDOWN_SECONDS = 12  # Маша отвечает не чаще чем раз в 12 сек на группу
 _GROUP_HISTORY_LIMIT = 12     # сколько последних сообщений брать в контекст
+
+# v18.1: Probabilities for casual participation (when not explicitly triggered).
+# Маша участвует в беседе живо — не только по @mention, но и присоединяется к
+# разговорам, реагирует на BMW-тематику, иногда вступает в обычную болтовню.
+_PARTICIPATE_PROB_BMW = 0.55   # 55% — BMW-релевантное сообщение без reply → вступает
+_PARTICIPATE_PROB_CASUAL = 0.18  # 18% — обычная болтовня без reply → иногда вступает
 
 # BMW-relevance keywords for the soft group trigger (channel comments)
 _BMW_TRIGGER_KEYWORDS = [
@@ -243,6 +249,10 @@ _BMW_TRIGGER_KEYWORDS = [
     "запчаст", "vin", "вин", "колодк", "фильтр", "масло",
     "ванос", "стучит", "троит", "чек", "diagnostic",
     "независ", "m performance", "individual",
+    # v18.1: broader car/automotive terms so Маша вступает в авто-беседы
+    "машина", "авто", "двигатель", "мотор", "коробка", "кузов",
+    "тормоз", "подвеска", "руль", "турбина", "седан", "кроссовер",
+    "пробег", "сервис", "ремонт", "сто", "оил", "дрифт", "трек",
 ]
 
 
@@ -303,35 +313,70 @@ def _is_bmw_relevant(text: str) -> bool:
     return any(kw in t for kw in _BMW_TRIGGER_KEYWORDS)
 
 
+def _is_reply_in_conversation(message: Message) -> bool:
+    """True if the message is a reply to ANY message in the group.
+
+    v18.1: Маша присоединяется к ЛЮБОЙ ветке разговора — не только когда
+    отвечают ей, но и когда кто-то отвечает другому участнику. Это делает
+    её полноправным участником беседы, а не пассивным наблюдателем.
+    """
+    try:
+        reply = getattr(message, "reply_to_message", None)
+        if reply is None:
+            return False
+        # Any reply target (user, bot, or channel-post copy) counts as a
+        # conversation thread Маша can join.
+        return True
+    except Exception:
+        return False
+
+
 def _group_should_reply(message: Message) -> tuple[bool, str]:
     """Decide whether Маша should reply in a group, and why.
 
+    v18.1: Маша теперь активно участвует в беседах, а не только отвечает на
+    прямые обращения. Триггеры (по приоритету):
+
+      1. @asmasha_bot упоминание → ВСЕГДА отвечает (адресовано ей)
+      2. Reply на ЛЮБОЕ сообщение в группе → ВСЕГДА отвечает (присоединяется
+         к ветке разговора — даже если отвечают другому участнику)
+      3. BMW/авто-релевантное сообщение (без reply) → 55% вероятность
+         (вступает в BMW-обсуждение)
+      4. Обычная болтовня (без reply, не BMW) → 18% вероятность
+         (иногда вступает в casual-беседу — живой участник, не спамер)
+
+    Rate-limit (12 сек на группу) защищает от спама: даже если триггер
+    сработал, Маша не ответит дважды за 12 секунд.
+
     Returns (should_reply, reason). Reason is logged + used for analytics.
     """
+    import random
+
     text = message.text or message.caption or ""
 
     # Trigger 1: explicit @mention — highest priority, always reply
     if _is_mentioned(message):
         return True, "mention"
 
-    # Trigger 2: reply to one of Маша's messages
-    if _is_reply_to_masha(message):
-        return True, "reply_to_masha"
+    # Trigger 2: reply to ANY message in a conversation thread — always join.
+    # v18.1: расширили с "reply to Маша" до "reply to anyone" — Маша теперь
+    # участвует в беседах, а не только отвечает на обращения к ней.
+    if _is_reply_in_conversation(message):
+        # Sub-case: reply to Маша specifically (continue her own dialogue)
+        if _is_reply_to_masha(message):
+            return True, "reply_to_masha"
+        # Reply to another participant → join the conversation
+        return True, "conversation_join"
 
-    # Trigger 3: channel-comment discussion — BMW-relevant comment under a post.
-    # Only triggers when the reply target is a channel-post copy (sender_chat
-    # set), NOT a regular group message from another user. This keeps Маша
-    # from replying to every BMW-mention in group chatter.
-    try:
-        reply = getattr(message, "reply_to_message", None)
-        if reply is not None:
-            is_channel_post = bool(getattr(reply, "sender_chat", None))
-            if is_channel_post:
-                orig_text = _extract_original_post_text(reply)
-                if orig_text and _is_bmw_relevant(text):
-                    return True, "channel_comment_bmw"
-    except Exception:
-        pass
+    # Trigger 3: BMW/auto-relevant standalone message → probabilistic
+    if _is_bmw_relevant(text):
+        if random.random() < _PARTICIPATE_PROB_BMW:
+            return True, "bmw_chatter"
+        return False, "bmw_skipped_prob"
+
+    # Trigger 4: casual chatter → low probability (живое участие, не спам)
+    if random.random() < _PARTICIPATE_PROB_CASUAL:
+        return True, "casual_participation"
 
     return False, "no_trigger"
 
@@ -1054,7 +1099,11 @@ async def _process_group_message(message: Message, text: str, reason: str):
     _reason_desc = {
         "mention": "Тебя @упомянули в группе. Ответь адресованно тому, кто упомянул.",
         "reply_to_masha": "Кто-то ответил на твоё сообщение. Продолжи диалог по существу.",
+        "conversation_join": "Кто-то ответил другому участнику в беседе, и ты присоединяешься к разговору. Вступай естественно — как живой участник, добавляй своё экспертное мнение, шутку или вопрос по теме.",
         "channel_comment_bmw": "Это BMW-релевантный комментарий под постом канала. Ответь как эксперт, дополни или поправь, если нужно.",
+        "bmw_chatter": "В группе обсуждают BMW/авто-тема — ты вступаешь в обсуждение как эксперт. Добавь ценность: факт, мнение, сравнение.",
+        "casual_participation": "Обычная болтовня в группе — ты иногда вступаешь как живой участник. Коротко, с характером, без занудства. Можно просто пошутить или перекинуться парой слов.",
+        "voice_trigger": "Голосовое сообщение в группе — ты расшифровала и отвечаешь на него.",
     }
     extra_context_parts.append(
         f"Почему ты отвечаешь: {_reason_desc.get(reason, 'Триггер группы')}"

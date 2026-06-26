@@ -230,7 +230,8 @@ def _extract_original_post_text(reply: Message) -> str:
 # Per-group rate limiting: {chat_id: last_reply_timestamp}
 _group_reply_cooldown: dict[int, float] = {}
 _GROUP_COOLDOWN_SECONDS = 12  # Маша отвечает не чаще чем раз в 12 сек на группу
-_GROUP_HISTORY_LIMIT = 12     # сколько последних сообщений брать в контекст
+_GROUP_HISTORY_LIMIT = 12     # сколько последних сообщений брать в контекст группы
+_PRIVATE_HISTORY_LIMIT = 10   # v18.2: сколько последних сообщений брать в личке
 
 # v18.1: Probabilities for casual participation (when not explicitly triggered).
 # Маша участвует в беседе живо — не только по @mention, но и присоединяется к
@@ -1590,42 +1591,111 @@ async def _process_text_message(message: Message, text: str):
     # Route to AI
     extra_context = "\n\n".join(extra_context_parts) if extra_context_parts else ""
 
+    # v18.2: Load conversation history so Маша REMEMBERS the discussion.
+    # In PRIVATE chat, history is keyed by user_id (1-on-1 with Маша).
+    # In GROUP, history is keyed by chat_id (handled by _process_group_message).
+    # Both paths now load recent turns and inject them into the AI prompt.
+    conversation_history: list[dict] = []
+    try:
+        history_chat_id = message.chat.id  # works for both private (id=user_id) and group
+        history_rows = await get_chat_history(history_chat_id, limit=_PRIVATE_HISTORY_LIMIT)
+        # Filter out thinking-status messages Маша posted ("Слушаю..." etc.)
+        _THINKING_PHRASES = ("секунд", "слушаю", "думаю", "ищу", "проверяю", "смотрю", "греди")
+        for row in history_rows:
+            role = row.get("role", "user")
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "assistant" and len(content) < 40 and any(p in content.lower() for p in _THINKING_PHRASES):
+                continue
+            conversation_history.append({"role": role, "content": content})
+    except Exception as e:
+        logger.debug(f"Could not load conversation history: {e}")
+
+    # v18.2: Save the user's message to chat_history BEFORE calling the AI,
+    # so if the AI is slow, the message is still recorded.
+    is_group_msg = message.chat.type in ("group", "supergroup")
+    try:
+        await add_chat_message(
+            user_id=user_id,
+            role="user",
+            content=text,
+            chat_id=message.chat.id,
+            author_name=_display_name(message.from_user) if is_group_msg else "",
+        )
+    except Exception as e:
+        logger.debug(f"Could not save user message to history: {e}")
+
     try:
         if is_diagnostic:
+            # Inject conversation history into extra_context for diagnostic route
+            diag_context = extra_context
+            if conversation_history:
+                hist_text = "\n".join(
+                    f"{'Маша' if m['role']=='assistant' else 'Пользователь'}: {m['content'][:200]}"
+                    for m in conversation_history[-6:]
+                )
+                diag_context = f"Предыдущая переписка:\n{hist_text}\n\n{extra_context}"
             response = await get_ai_router().diagnose_car(
                 user_id=user_id,
                 symptoms=text,
-                extra_context=extra_context,
+                extra_context=diag_context,
             )
         elif is_spare_part_query:
+            parts_context = extra_context
+            if conversation_history:
+                hist_text = "\n".join(
+                    f"{'Маша' if m['role']=='assistant' else 'Пользователь'}: {m['content'][:200]}"
+                    for m in conversation_history[-6:]
+                )
+                parts_context = f"Предыдущая переписка:\n{hist_text}\n\n{extra_context}"
             response = await get_ai_router().find_spare_part(
                 user_id=user_id,
                 article=text.strip(),
-                extra_context=extra_context,
+                extra_context=parts_context,
             )
         else:
-            # Build messages list for chat
+            # Build messages list for chat — INCLUDE conversation history
+            # so Маша remembers what was discussed before.
             chat_messages = [
                 {"role": "system", "content": MASHA_SYSTEM_PROMPT},
             ]
+            # Inject conversation history as alternating user/assistant turns
+            for hist_msg in conversation_history:
+                chat_messages.append(hist_msg)
             if extra_context:
                 chat_messages.append({"role": "user", "content": f"Контекст:\n{extra_context}"})
             chat_messages.append({"role": "user", "content": text})
 
             # Use ROUTE_COMMENT for group/supergroup messages (Local-first for faster responses)
             # Use ROUTE_CHAT for private messages (full cloud pipeline)
-            is_group = message.chat.type in ("group", "supergroup")
-            route = ROUTE_COMMENT if is_group else ROUTE_CHAT
+            route = ROUTE_COMMENT if is_group_msg else ROUTE_CHAT
 
             response = await get_ai_router().chat(
                 messages=chat_messages,
-                use_cache=True,
+                use_cache=False,  # v18.2: disable cache — history makes each request unique
                 route_type=route,
             )
     except Exception as e:
         logger.error(f"AI router error: {e}")
         await message.reply("Ой, что-то я зависла 😅 Попробуй ещё раз!")
         return
+
+    # v18.2: Save Маша's reply to chat_history so the NEXT message sees it.
+    if response and response.text:
+        try:
+            # Strip partner links section from the saved copy (it's appended
+            # later by _send_response; we want to store the core reply)
+            saved_reply = response.text
+            await add_chat_message(
+                user_id=0,  # Маша's own messages
+                role="assistant",
+                content=saved_reply[:2000],  # cap stored length
+                chat_id=message.chat.id,
+                author_name="Маша",
+            )
+        except Exception as e:
+            logger.debug(f"Could not save Маша's reply to history: {e}")
 
     await _send_response(message, response, status_msg, collected_partner_links)
 

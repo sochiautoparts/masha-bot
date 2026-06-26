@@ -336,6 +336,56 @@ class Database:
         )
         await self._conn.commit()
 
+    async def cleanup_old_chat_history(self, max_age_days: int = 30, keep_per_chat: int = 50) -> int:
+        """v18.2: Prune old chat_history to prevent unbounded growth.
+
+        Two-step prune:
+          1. Delete rows older than `max_age_days` days.
+          2. For each chat_id, keep only the most recent `keep_per_chat` rows
+             (so even an active 1-on-1 chat doesn't accumulate 10k+ rows).
+
+        Returns the number of deleted rows.
+        """
+        assert self._conn is not None
+        deleted = 0
+        # Step 1: age-based prune
+        cur = await self._conn.execute(
+            "DELETE FROM chat_history WHERE created_at < datetime('now', ?)",
+            (f"-{max_age_days} days",),
+        )
+        deleted += cur.rowcount
+
+        # Step 2: per-chat cap (keep newest N)
+        # SQLite doesn't support window functions in DELETE directly, so we
+        # find the cutoff id per chat and delete below it.
+        async with self._conn.execute(
+            "SELECT chat_id, id FROM chat_history ORDER BY chat_id, id DESC"
+        ) as read_cur:
+            rows = await read_cur.fetchall()
+
+        # Group by chat_id, find the id of the Nth row (the one to keep up to)
+        chat_cutoff: dict[int, int] = {}
+        chat_counts: dict[int, int] = {}
+        for row in rows:
+            cid = row[0]
+            rid = row[1]
+            chat_counts[cid] = chat_counts.get(cid, 0) + 1
+            if chat_counts[cid] == keep_per_chat:
+                chat_cutoff[cid] = rid  # this is the Nth-newest id; keep >= it
+
+        # Delete rows with id < cutoff for each chat that exceeded the cap
+        for cid, cutoff_id in chat_cutoff.items():
+            cur = await self._conn.execute(
+                "DELETE FROM chat_history WHERE chat_id = ? AND id < ?",
+                (cid, cutoff_id),
+            )
+            deleted += cur.rowcount
+
+        if deleted > 0:
+            await self._conn.commit()
+            logger.info(f"chat_history cleanup: removed {deleted} old rows (> {max_age_days}d or > {keep_per_chat}/chat)")
+        return deleted
+
     # ── News Items ────────────────────────────────────────────────────────
 
     async def add_news_item(
@@ -1349,6 +1399,17 @@ async def clear_chat_history(user_id: int) -> None:
     """Clear all chat history for a user."""
     db = _get_db()
     await db.clear_chat_history_for_user(user_id)
+
+
+async def cleanup_old_chat_history(max_age_days: int = 30, keep_per_chat: int = 50) -> int:
+    """v18.2: Prune old chat_history to prevent unbounded DB growth.
+
+    Called periodically by the background news-fetcher task. Deletes rows
+    older than max_age_days AND caps each chat to keep_per_chat most-recent
+    rows. Returns the number of deleted rows.
+    """
+    db = _get_db()
+    return await db.cleanup_old_chat_history(max_age_days=max_age_days, keep_per_chat=keep_per_chat)
 
 
 # ── Users ─────────────────────────────────────────────────────────────────

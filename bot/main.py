@@ -216,6 +216,15 @@ class BackgroundTasks:
                             logger.info(f"Cleaned up {pruned} old posted_urls entries (>30 days)")
                     except Exception as e:
                         logger.debug(f"posted_urls cleanup skipped: {e}")
+                    # v18.2: Prune old chat_history (>30 days OR >50 per chat)
+                    # Prevents unbounded DB growth from group/private conversations.
+                    try:
+                        from bot.database import cleanup_old_chat_history
+                        removed_ch = await cleanup_old_chat_history(max_age_days=30, keep_per_chat=50)
+                        if removed_ch > 0:
+                            logger.info(f"Cleaned up {removed_ch} old chat_history rows")
+                    except Exception as e:
+                        logger.debug(f"chat_history cleanup skipped: {e}")
 
                 # Auto-refresh partner data every 6 hours
                 if cycle_count % 12 == 0:

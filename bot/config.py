@@ -47,12 +47,15 @@ class BotConfig:
     NEWS_MAX_ITEMS_PER_CYCLE: int = 5
     NEWS_CACHE_HOURS: int = 24
 
-    # Channel posting — 4 news per hour + 1 partner per cycle
+    # Channel posting — continuous small-batch model (aligned with asya-bot)
+    # Schedule: 1-2 news per 20-min cycle + 1 partner per hour.
     # The 48h TTL dedup (posted_urls table) makes the pool recyclable,
-    # so 4 news/hour = 96/day is sustainable without exhausting the source.
-    CHANNEL_POST_INTERVAL_MINUTES: int = int(os.getenv("CHANNEL_POST_INTERVAL_MINUTES", "60"))
-    CHANNEL_MAX_POSTS_PER_HOUR: int = 6   # 4 news + 1 partner + 1 buffer per hour
-    CHANNEL_MAX_POSTS_PER_DAY: int = 120  # 4 news × 24h + 24 partner
+    # so 6 news/hour = 144/day is sustainable without exhausting the source.
+    CHANNEL_POST_INTERVAL_MINUTES: int = int(os.getenv("CHANNEL_POST_INTERVAL_MINUTES", "20"))
+    CHANNEL_NEWS_PER_HOUR: int = int(os.getenv("CHANNEL_NEWS_PER_HOUR", "6"))
+    CHANNEL_PARTNER_PER_HOUR: int = 1
+    CHANNEL_MAX_POSTS_PER_HOUR: int = 7   # 6 news + 1 partner per hour
+    CHANNEL_MAX_POSTS_PER_DAY: int = 168  # 7 posts/hour × 24 hours
 
     # Telegram character limits
     TELEGRAM_TEXT_LIMIT: int = 4096       # Max chars for text-only message

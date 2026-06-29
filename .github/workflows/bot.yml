@@ -94,10 +94,13 @@ jobs:
           sleep 60
           echo "=== Ready to start ==="
 
+      # NOTE: No `token:` here — uses the default GITHUB_TOKEN (auto-provided,
+      # never expires). PAT is NOT used for checkout, so a dead/expired PAT
+      # can't break the checkout step. This matches asya-bot's architecture.
+      # The persisted GITHUB_TOKEN credentials also power the `git push` in the
+      # "Save database to git" step below (permissions: contents: write).
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT_TOKEN }}
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5

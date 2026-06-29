@@ -2040,9 +2040,9 @@ class ChannelManager:
             # a 3h rolling window, posts older than 3h naturally fall off, so
             # the bot can resume posting news with photos within 3h of the fix
             # being deployed.
-            # Limit: NEWS_POSTS_PER_CYCLE (4) + 1 partner per 1h window.
+            # Limit: 6 news + 1 partner per 1h window (aligned with asya-bot, v2).
             recent_count = await get_recent_post_count(hours=1)
-            _WINDOW_LIMIT = 6  # 4 news + 1 partner per 1h cycle
+            _WINDOW_LIMIT = 7  # 6 news + 1 partner per 1h window
             if recent_count >= _WINDOW_LIMIT:
                 logger.info(
                     f"Rolling 1h post limit reached ({recent_count}/{_WINDOW_LIMIT}) — skipping"

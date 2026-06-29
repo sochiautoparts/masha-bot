@@ -268,15 +268,16 @@ jobs:
           DB_PATH: masha_bot.db
           ADMITAD_ADS_FILE: data/partners.json
           LOG_LEVEL: INFO
-          # Schedule settings — 4 news per hour + 1 partner per cycle.
+          # Schedule settings — continuous small-batch model (aligned with asya-bot).
+          # 1-2 news per 20-min cycle + 1 partner per hour = ~6 news + 1 partner/hour.
           # The 48h TTL dedup (posted_urls table) makes the pool recyclable:
-          # after 48h, articles become re-postable, sustaining 96 news/day +
-          # 24 partner/day = 120 posts/day without exhausting the source.
+          # after 48h, articles become re-postable, sustaining 144 news/day +
+          # 24 partner/day = 168 posts/day without exhausting the source.
           NEWS_FETCH_INTERVAL: 900      # 15 min
-          CHANNEL_POST_INTERVAL: 3600   # 60 min (1h)
+          CHANNEL_POST_INTERVAL: 1200   # 20 min (continuous small-batch, aligned with asya-bot)
           NEWS_INTERVAL_MINUTES: "15"
-          CHANNEL_POST_INTERVAL_MINUTES: "60"
-          CHANNEL_NEWS_PER_HOUR: "4"
+          CHANNEL_POST_INTERVAL_MINUTES: "20"
+          CHANNEL_NEWS_PER_HOUR: "6"
           CHANNEL_PARTNER_PER_HOUR: "1"
           PARTNER_POST_INTERVAL_HOURS: "1"
         run: |
@@ -287,7 +288,7 @@ jobs:
           echo "FAILOVER: Local -> Pollinations(key) -> Pollinations(free) -> Cloudflare -> Local-Only/Static"
           echo "EDITORIAL TEAM: Маша + Серёга + Костя + Лена + Доктор Ван Дамм(кот) + Кинг-Конг(попугай)"
           echo "NEWS: BMW news from sochiautoparts/nws (bmw-news.json) -> RSS fallback -> Web search"
-          echo "SCHEDULE: News every 15min, Posts every 60min (4 news + 1 partner per hour)"
+          echo "SCHEDULE: News every 15min, Posts every 20min (6 news + 1 partner per hour = 168/day)"
           echo "=== Launching bot with UNLIMITED auto-restart ==="
 
           # UNLIMITED retries — bot MUST always be running! (aligned with asya-bot)

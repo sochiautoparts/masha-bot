@@ -243,86 +243,117 @@ class BackgroundTasks:
                 await asyncio.sleep(1)
 
     async def _channel_poster(self) -> None:
-        """Post to channel — 4 news + 1 partner per hourly cycle.
-        
-        Each 60-min cycle publishes 5 posts:
-          Posts 1-4: DIFFERENT news items (each with dedup checks)
-          Post 5: partner content (if interval allows)
-          
-        Between posts: 2-4 min gap to avoid Telegram rate limits.
-        Tracks tried titles per cycle to avoid re-selecting the same article.
+        """Post to channel — continuous small-batch model (aligned with asya-bot).
+
+        Schedule (aligned with asya-bot):
+        - Every CHANNEL_POST_INTERVAL_MINUTES (default 20 min)
+        - 1-2 news posts per cycle + 1 partner post every 3rd cycle
+        - 3-5 second gap between posts to avoid Telegram rate limits
+        - All posts go through full dedup pipeline
+
+        Why this beats the old "4 posts × 60min" model:
+        - Old: one failed cycle (dedup/AI) wasted a full hour.
+        - New: one failed cycle wastes only 20 min — 3× faster recovery.
+        - Old: 4 posts × 2-4min gap = 8-16 min cycle length, risk of timeout.
+        - New: 2 posts × 3-5s gap = ~10s cycle, no timeout risk.
+        - Old: 4 posts/cycle required 4 fresh articles; pool exhaustion failed 2-3 of 4.
+        - New: 2 posts/cycle = much higher success rate per cycle.
+
+        Throughput: ~6 news + 1 partner per hour = 168/day max (was 120/day).
         """
         await asyncio.sleep(30)
-        
-        # 4 news posts per hour + 1 partner per cycle.
-        # The 48h TTL dedup (posted_urls table) recycles old articles after 48h,
-        # so 4 news/hour = 96/day is sustainable — the bmw-news.json source is
-        # refreshed hourly and the multi-source fallback (RSS + web search)
-        # guarantees a non-empty pool.
-        logger.info("Channel poster started — 4 news + 1 partner per hourly cycle")
+
+        interval_seconds = config.CHANNEL_POST_INTERVAL_MINUTES * 60
+        logger.info(
+            f"Channel poster started — interval {config.CHANNEL_POST_INTERVAL_MINUTES}min, "
+            f"continuous small-batch model (aligned with asya-bot)"
+        )
 
         consecutive_empty_cycles = 0
-        NEWS_POSTS_PER_CYCLE = 4
+        # 1-2 news posts per cycle (like asya-bot). Capped by CHANNEL_NEWS_PER_HOUR.
+        MAX_NEWS_PER_CYCLE = min(2, getattr(config, "CHANNEL_NEWS_PER_HOUR", 6))
 
         while self._running:
             posts_this_cycle = 0
             tried_titles_this_cycle = []  # Track titles tried this cycle
-            logger.info(f"Channel poster: starting new hourly cycle (consecutive_empty={consecutive_empty_cycles})")
-            
-            # ── Phase 1: 4 news posts ──
-            for post_num in range(NEWS_POSTS_PER_CYCLE):
+            logger.info(
+                f"Channel poster: starting new cycle (consecutive_empty={consecutive_empty_cycles})"
+            )
+
+            # ── Phase 1: 1-2 news posts ──
+            for post_num in range(MAX_NEWS_PER_CYCLE):
+                if not self._running:
+                    break
                 try:
                     posted = await channel_manager.run_scheduled_post(
                         exclude_titles=tried_titles_this_cycle
                     )
                     if posted:
                         posts_this_cycle += 1
-                        # Record the posted title so we don't try it again this cycle
                         if isinstance(posted, dict) and posted.get("title"):
                             tried_titles_this_cycle.append(posted["title"])
-                        logger.info(f"Channel poster: news post {post_num + 1}/{NEWS_POSTS_PER_CYCLE} published")
+                        logger.info(
+                            f"Channel poster: news post {post_num + 1}/{MAX_NEWS_PER_CYCLE} published"
+                        )
+                        # Gap between posts: 3-5 seconds (aligned with asya-bot)
+                        gap = random.randint(3, 5)
+                        for _ in range(gap):
+                            if not self._running:
+                                break
+                            await asyncio.sleep(1)
                     else:
-                        logger.info(f"Channel poster: news post {post_num + 1}/{NEWS_POSTS_PER_CYCLE} returned False")
+                        logger.info(
+                            f"Channel poster: news post {post_num + 1}/{MAX_NEWS_PER_CYCLE} "
+                            f"returned False (dedup, AI failure, or no fresh content)"
+                        )
                 except Exception as e:
-                    logger.error(f"Channel poster error (news post {post_num + 1}): {e}", exc_info=True)
-                
-                # Gap between news posts: 2-4 minutes
-                if post_num < NEWS_POSTS_PER_CYCLE - 1:
-                    gap = random.randint(120, 240)
-                    logger.info(f"Waiting {gap}s before next news post")
-                    for _ in range(gap):
-                        if not self._running:
-                            break
-                        await asyncio.sleep(1)
-            
-            # ── Phase 2: 1 partner post ──
-            try:
-                partner_posted = await channel_manager.post_partner_content()
-                if partner_posted:
-                    posts_this_cycle += 1
-                    logger.info("Channel poster: partner post published")
-                else:
-                    logger.info("Channel poster: partner post skipped (interval or no content)")
-            except Exception as e:
-                logger.error(f"Channel poster error (partner post): {e}", exc_info=True)
-            
+                    logger.error(
+                        f"Channel poster error (news post {post_num + 1}): {e}", exc_info=True
+                    )
+                    break  # Don't keep retrying in a broken state
+
+            # ── Phase 2: partner post — every 3rd cycle (1 partner/hour) ──
+            if consecutive_empty_cycles % 3 == 0:
+                try:
+                    partner_posted = await channel_manager.post_partner_content()
+                    if partner_posted:
+                        posts_this_cycle += 1
+                        logger.info("Channel poster: partner post published")
+                        # Brief gap after partner
+                        for _ in range(5):
+                            if not self._running:
+                                break
+                            await asyncio.sleep(1)
+                    else:
+                        logger.info(
+                            "Channel poster: partner post skipped (interval or no content)"
+                        )
+                except Exception as e:
+                    logger.error(f"Channel poster error (partner post): {e}", exc_info=True)
+
             if posts_this_cycle > 0:
-                logger.info(f"Channel poster hourly cycle complete: {posts_this_cycle} posts published")
+                logger.info(
+                    f"Channel poster cycle complete: {posts_this_cycle} posts published"
+                )
                 consecutive_empty_cycles = 0
             else:
                 consecutive_empty_cycles += 1
-                if consecutive_empty_cycles == 3 and self.bot:
+                logger.warning(
+                    f"Channel poster: no posts this cycle ({consecutive_empty_cycles} consecutive)"
+                )
+                # Health check: alert owner after 6 consecutive empty cycles (~2h with 20min interval)
+                if consecutive_empty_cycles >= 6 and self.bot:
                     try:
                         await self.bot.send_message(
                             chat_id=config.OWNER_ID,
-                            text=f"⚠️ Маша: 3 часа подряд без постов в канал. Возможна проблема с контентом или дедупликацией. Проверь логи."
+                            text=f"⚠️ Маша: {consecutive_empty_cycles} циклов подряд без постов в канал. "
+                                 f"Возможна проблема с контентом или дедупликацией. Проверь логи."
                         )
                     except Exception:
                         pass
 
-            # Wait for next hourly cycle
-            interval = config.CHANNEL_POST_INTERVAL_MINUTES * 60
-            for _ in range(interval):
+            # Wait for next cycle
+            for _ in range(interval_seconds):
                 if not self._running:
                     break
                 await asyncio.sleep(1)

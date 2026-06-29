@@ -1,0 +1,125 @@
+# ═══════════════════════════════════════════════════════════════════
+# PAT Health Check — мониторинг валидности GH_PAT_TOKEN
+# ═══════════════════════════════════════════════════════════════════
+#
+# Зачем:
+#   GH_PAT_TOKEN — единственный секрет, смерть которого рвёт 24/7 контур
+#   (checkout + push БД + self-dispatch). PAT имеет срок жизни (max 1 год,
+#   дефолт 90 дней), и его надо периодически ротатировать вручную.
+#
+#   Этот workflow — страховка: если PAT протух/отозван, вы узнаёте об этом
+#   через Telegram-алерт в течение 6 часов, а не через пару дней по тишине
+#   в канале.
+#
+# Как работает:
+#   - НЕ зависит от PAT для собственного выполнения (использует дефолтный
+#     GITHUB_TOKEN, чекаута репо нет вообще — только curl-проверка).
+#   - Дёргает GET /repos/{repo} с PAT. 200 = жив, 401/403 = мёртв.
+#   - Если мёртв → шлёт сообщение в Telegram через BOT_TOKEN (он от PAT
+#     не зависит) + exit 1 (красный крестик в Actions UI).
+#
+# Schedule (UTC, Moscow = UTC+3):
+#   Каждые 6 часов: 00:00, 06:00, 12:00, 18:00 UTC = 03/09/15/21 Moscow
+#
+# Ротация PAT (когда придёт алерт):
+#   1. GitHub → Settings → Developer settings → Fine-grained PAT → Generate
+#      Права: Administration: W, Actions: W, Contents: W, Metadata: R
+#      Срок: 1 year (max)
+#   2. Обновить секрет (одна команда, через gh CLI):
+#        gh secret set GH_PAT_TOKEN -R sochiautoparts/masha-bot
+#      (вставить новый PAT, Enter)
+#   3. Готово. Следующий cron-запуск bot.yml подхватит.
+# ═══════════════════════════════════════════════════════════════════
+
+name: PAT Health Check
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # каждые 6ч UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Своя concurrency-группа — не мешает основному боту.
+concurrency:
+  group: pat-health
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check GH_PAT_TOKEN validity
+        env:
+          GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: |
+          set +e
+          echo "=== PAT Health Check ==="
+          echo "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          if [ -z "$GH_PAT_TOKEN" ]; then
+            echo "GH_PAT_TOKEN secret is EMPTY"
+            STATE="empty"
+            HTTP="N/A"
+          else
+            # Live-test: GET /repos/{repo} требует Administration: read.
+            # 200 = PAT живёт и имеет админ-доступ. 401/403 = протух/отозван.
+            HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+              -H "Authorization: token $GH_PAT_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/sochiautoparts/masha-bot")
+            echo "API check: HTTP $HTTP"
+            if [ "$HTTP" = "200" ]; then
+              STATE="ok"
+              echo "PAT is alive ✅"
+            else
+              STATE="dead"
+              echo "PAT is DEAD ❌"
+              echo "Response body:"
+              head -c 500 /tmp/resp.json
+              echo ""
+            fi
+          fi
+
+          echo ""
+          echo "Final state: $STATE"
+
+          # ── Alert on failure ──
+          if [ "$STATE" != "ok" ]; then
+            MSG="🚨 Masha Bot: GH_PAT_TOKEN $STATE (HTTP $HTTP).
+
+24/7 контур сломан: self-dispatch и push БД не работают.
+
+Как починить:
+1. GitHub → Settings → Developer settings → Fine-grained PAT → Generate new token
+   Права: Administration: W, Actions: W, Contents: W, Metadata: R
+   Срок: 1 year (max)
+2. Обнови секрет (нужен установленный gh CLI, авторизация через gh auth login):
+   gh secret set GH_PAT_TOKEN -R sochiautoparts/masha-bot
+   (вставь новый PAT, нажми Enter)
+3. Готово — следующий cron-запуск bot.yml подхватит автоматически."
+
+            echo ""
+            echo "=== Sending Telegram alert ==="
+            if [ -n "$BOT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
+              ALERT_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -d chat_id="$OWNER_ID" \
+                --data-urlencode "text=$MSG")
+              echo "Telegram alert: HTTP $ALERT_HTTP"
+            else
+              echo "BOT_TOKEN or OWNER_ID not set — cannot alert via Telegram"
+            fi
+
+            exit 1
+          fi
+
+          echo "=== Health check passed ==="

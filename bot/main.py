@@ -224,23 +224,26 @@ class MashaBot:
 
                 # 4. Build post text — match old format: AI text + footer
                 post_text = ai_commentary.strip()[:3000]
-                if not post_text.endswith("@bmw_mpower_club"):
-                    post_text += "\n\n🏎️ @bmw_mpower_club"
+                # Footer matches old @bmw_mpower_club format exactly:
+                # Автор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club
+                if not post_text.endswith("#bmw_mpower_club"):
+                    post_text += "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
 
                 # 5. Download image and post with photo
                 posted = False
                 if image_url:
                     try:
-                        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as img_client:
-                            img_resp = await img_client.get(image_url, headers={"User-Agent": "Mozilla/5.0 (compatible; MashaBot/1.0)"})
-                        if img_resp.status_code == 200 and len(img_resp.content) > 1000:
-                            from io import BytesIO
-                            photo = BytesIO(img_resp.content)
-                            photo.name = "news.jpg"
-                            caption = post_text[:1000]
-                            await self.bot.send_photo(channel_id, photo, caption=caption)
+                        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as img_client:
+                            img_resp = await img_client.get(image_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                        if img_resp.status_code == 200 and len(img_resp.content) > 2000:
+                            from aiogram.types import BufferedInputFile
+                            photo_file = BufferedInputFile(img_resp.content, filename="news.jpg")
+                            caption = post_text[:1024]
+                            await self.bot.send_photo(channel_id, photo_file, caption=caption)
                             posted = True
                             logger.info(f"Channel: posted BMW NEWS+photo ({len(post_text)} chars) — {title[:40]}")
+                        else:
+                            logger.warning(f"Image download bad: HTTP {img_resp.status_code}, {len(img_resp.content)} bytes")
                     except Exception as e:
                         logger.warning(f"Image download failed: {e}")
 

@@ -1,61 +1,14 @@
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
 *.egg-info/
-*.egg
-dist/
-build/
-.eggs/
-
-# Virtual environments
-venv/
 .venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Environment
-.env
-.env.local
-.env.production
-
-# Database
+data/*.db
 *.db
-*.sqlite3
-masha_bot.db
-
-# Logs
-*.log
+*.db-journal
+*.db-wal
+.openclaw-state/
 logs/
-
-# OS
+.env
+*.secret
 .DS_Store
 Thumbs.db
-
-# Bot data (runtime)
-bot/data/*.db
-
-# Lock files
-/tmp/
-*.lock
-
-# Cache
-.cache/
-.pytest_cache/
-.mypy_cache/
-
-# Image cache (downloaded original photos)
-data/image_cache/
-
-# Partner data cache (downloaded fresh from sochiautoparts.ru at runtime)
-data/partners.json
-
-# Local model files (too large for git)
-models/*.gguf

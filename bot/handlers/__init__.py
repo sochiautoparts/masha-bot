@@ -1,1 +1,1 @@
-"""Bot handlers"""
+"""Handlers package."""

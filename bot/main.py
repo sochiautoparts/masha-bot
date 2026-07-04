@@ -1,511 +1,209 @@
-"""
-masha-bot entry point — BMW-focused Telegram bot for @bmw_mpower_club.
-
-Based on asya-bot architecture, reworked for BMW content.
-Uses Pollinations AI, SQLite with aiosqlite, and GitHub Actions for scheduling.
-
-Features:
-- aiogram 3.x Telegram Bot framework
-- Pollinations AI as primary provider (dual-key failover)
-- SQLite with aiosqlite for persistence
-- Background tasks: news fetching, channel posting
-- Singleton lock to prevent duplicate instances
-- Two modes: interactive (long polling) and single (one-shot for Actions)
-"""
-
-import asyncio
-import faulthandler
-import logging
-import os
-import random
-import signal
-import sys
-import time
-import fcntl
+"""Маша Main — starts OpenClaw gateway + aiogram bot + BMW channel scheduler."""
+import asyncio, logging, os, signal, subprocess, sys, time, random
 from pathlib import Path
-
-# Enable faulthandler for C-level crash diagnostics (segfaults in llama-cpp)
-faulthandler.enable()
-
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-
-from bot.core.config import config, persona
-from bot.database import init_db, cleanup_old_fingerprints, add_chat_message, load_topic_registry
+from bot.config import config
+from bot import database as db
+from bot.mood import mood_loop, current_mood_descriptor
 from bot.partners import partner_manager
-from ai.router import get_ai_router
-from news import run_news_cycle
-from channel import channel_manager
+from ai import client as ai_client
 
-# ── Logging setup ──────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("masha.main")
+for noisy in ["aiogram.event", "httpx", "httpcore", "aiosqlite"]: logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# Reduce noisy loggers
-for noisy in ["aiogram.event", "httpx", "httpcore", "aiosqlite"]:
-    logging.getLogger(noisy).setLevel(logging.WARNING)
+from bot.handlers.chat import chat_router
+from bot.handlers.groups import group_router
+from bot.handlers.channels import channel_router
+from bot.handlers.admin import admin_router
+from bot.handlers.inline import inline_router
 
+OPENCLAW_STATE_DIR = os.getenv("OPENCLAW_STATE_DIR", str(Path.cwd() / ".openclaw-state"))
+_openclaw_proc = None
 
-# ── Singleton Lock ─────────────────────────────────────────────────────────────
+def _generate_openclaw_config():
+    state_dir = OPENCLAW_STATE_DIR
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    out = str(Path(state_dir) / "openclaw.json")
+    gen = str(Path(__file__).resolve().parent.parent / "scripts" / "gen_openclaw_config.py")
+    env = os.environ.copy(); env["OPENCLAW_STATE_DIR"] = state_dir
+    r = subprocess.run([sys.executable, gen, "--out", out, "--state-dir", state_dir], env=env)
+    if r.returncode != 0: raise RuntimeError(f"OpenClaw config generation failed (code {r.returncode})")
+    return out
 
-class SingletonLock:
-    """File-based lock to prevent multiple bot instances."""
+def _start_openclaw_gateway(config_path):
+    env = os.environ.copy()
+    env["OPENCLAW_STATE_DIR"] = OPENCLAW_STATE_DIR
+    env["OPENCLAW_CONFIG_PATH"] = config_path
+    npm_global = os.path.expanduser("~/.npm-global/bin")
+    env["PATH"] = npm_global + ":" + env.get("PATH", "")
+    cmd = [config.OPENCLAW_BIN, "gateway", "--port", str(config.OPENCLAW_PORT), "--auth", "none", "--bind", "loopback", "--allow-unconfigured"]
+    log_path = str(Path(OPENCLAW_STATE_DIR) / "gateway.log")
+    logger.info(f"Starting OpenClaw Gateway: {' '.join(cmd)}")
+    log_f = open(log_path, "a", buffering=1)
+    return subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
 
-    def __init__(self, lock_file: str):
-        self.lock_file = lock_file
-        self._lock_fd = None
-
-    def acquire(self) -> bool:
-        """Try to acquire the lock. Returns True if successful."""
+async def _wait_for_gateway(timeout=120.0):
+    import httpx
+    url = f"{config.OPENCLAW_URL}/v1/models"
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
         try:
-            os.makedirs(os.path.dirname(self.lock_file) or ".", exist_ok=True)
-            self._lock_fd = open(self.lock_file, "w")
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._lock_fd.write(str(os.getpid()))
-            self._lock_fd.flush()
-            return True
-        except (IOError, OSError):
-            if self._lock_fd:
-                self._lock_fd.close()
-                self._lock_fd = None
-            return False
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url, timeout=5.0)
+                if r.status_code == 200: return True
+        except: pass
+        if _openclaw_proc is not None and _openclaw_proc.poll() is not None: return False
+        await asyncio.sleep(2.0)
+    return False
 
-    def release(self) -> None:
-        """Release the lock."""
-        if self._lock_fd:
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-                self._lock_fd.close()
-                os.unlink(self.lock_file)
-            except (IOError, OSError):
-                pass
-            self._lock_fd = None
-
-
-# ── Background Tasks ───────────────────────────────────────────────────────────
-
-class BackgroundTasks:
-    """Manages background tasks for news and channel posting."""
-
-    def __init__(self, bot: Bot):
-        self.bot = bot
-        self._running = False
-        self._tasks: list = []
-        self._greeting_sent = False
-
-    async def start(self) -> None:
-        """Start all background tasks."""
-        self._running = True
-        self._tasks = [
-            asyncio.create_task(self._morning_greeting(), name="morning_greeting"),
-            asyncio.create_task(self._news_fetcher(), name="news_fetcher"),
-            asyncio.create_task(self._channel_poster(), name="channel_poster"),
-        ]
-        logger.info("Background tasks started")
-
-    async def stop(self) -> None:
-        """Stop all background tasks."""
-        self._running = False
-        for task in self._tasks:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._tasks.clear()
-        logger.info("Background tasks stopped")
-
-    async def _morning_greeting(self) -> None:
-        """Send a natural greeting to the owner — like a living person, not a bot.
-        Only sends ONCE per startup. Short and varied. Has a 4-hour cooldown
-        to prevent spam on frequent restarts."""
-        if self._greeting_sent:
-            return
-
-        await asyncio.sleep(15)  # Wait a bit after startup
-        self._greeting_sent = True
-
-        # Cooldown: don't send if one was sent recently (within 4 hours)
+def _stop_openclaw_gateway():
+    global _openclaw_proc
+    if _openclaw_proc is not None:
         try:
-            cooldown_file = "/tmp/masha_last_greeting"
-            if os.path.exists(cooldown_file):
-                with open(cooldown_file, "r") as f:
-                    last_greeting_time = float(f.read().strip())
-                if time.time() - last_greeting_time < 14400:  # 4 hours
-                    logger.info("Greeting cooldown active — skipping")
-                    return
-        except Exception:
-            pass
+            _openclaw_proc.terminate()
+            try: _openclaw_proc.wait(timeout=10)
+            except: _openclaw_proc.kill()
+        except: pass
+        _openclaw_proc = None
 
-        try:
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-            hour = datetime.now(ZoneInfo("Europe/Moscow")).hour
-
-            if 5 <= hour < 12:
-                greetings = [
-                    "Утро! М5 прогрета ☕",
-                    "Доброе утро! S63 рычит ☀️",
-                    "Проснулась, кофе, BMW-новости ☕",
-                    "Утро! ///M-Power! 🏎️",
-                ]
-            elif 12 <= hour < 18:
-                greetings = [
-                    "Привет! 😊",
-                    "День! Свежие BMW-новости 📰",
-                    "Хей! M-division на связи 🔥",
-                    "На связи! Что нового у баварцев? 🏎️",
-                ]
-            elif 18 <= hour < 23:
-                greetings = [
-                    "Вечер! 🌆",
-                    "Привет! M5 остывает после дня 🌆",
-                    "Вечер! BMW-новости смотрю 📰",
-                ]
-            else:
-                greetings = [
-                    "Ночной режим 🌙",
-                    "Не спится? M5 тоже 🌙",
-                    "Совиный режим — Nürburgring по ночам лучше 🌙",
-                ]
-
-            greeting = random.choice(greetings)
-            if config.OWNER_ID:
-                await self.bot.send_message(config.OWNER_ID, greeting)
-                try:
-                    await add_chat_message(config.OWNER_ID, "assistant", greeting)
-                except Exception as e:
-                    logger.debug(f"Could not save greeting to chat history: {e}")
-                try:
-                    with open("/tmp/masha_last_greeting", "w") as f:
-                        f.write(str(time.time()))
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"Morning greeting error: {e}")
-
-    async def _news_fetcher(self) -> None:
-        """Periodically fetch news from RSS sources and cleanup old data."""
-        await asyncio.sleep(30)
-
-        cycle_count = 0
-        while self._running:
+class MashaBot:
+    def __init__(self):
+        if not config.BOT_TOKEN: raise RuntimeError("BOT_TOKEN not set")
+        self.bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
+        self.dp = Dispatcher(storage=MemoryStorage())
+        self.dp.include_router(admin_router)
+        self.dp.include_router(chat_router)
+        self.dp.include_router(group_router)
+        self.dp.include_router(channel_router)
+        self.dp.include_router(inline_router)
+        from aiogram.types import ErrorEvent
+        @self.dp.error()
+        async def on_error(event: ErrorEvent):
             try:
-                count = await run_news_cycle()
-                if count > 0:
-                    logger.info(f"News fetcher: {count} new items")
+                exc = event.exception
+                from aiogram.exceptions import TelegramRetryAfter
+                if isinstance(exc, TelegramRetryAfter): logger.warning(f"Flood control (RetryAfter {exc.retry_after}s)")
+                else: logger.error(f"Handler error (suppressed): {type(exc).__name__}: {exc}", exc_info=False)
+            except: pass
 
-                # Cleanup old fingerprints every 12 cycles (~6 hours)
-                cycle_count += 1
-                if cycle_count % 12 == 0:
-                    removed = await cleanup_old_fingerprints(max_age_days=7)
-                    if removed > 0:
-                        logger.info(f"Cleaned up {removed} old post fingerprints")
-                    # v16: Also prune posted_urls entries older than 30 days
-                    try:
-                        from bot.database import cleanup_posted_urls
-                        pruned = await cleanup_posted_urls(max_age_days=30)
-                        if pruned > 0:
-                            logger.info(f"Cleaned up {pruned} old posted_urls entries (>30 days)")
-                    except Exception as e:
-                        logger.debug(f"posted_urls cleanup skipped: {e}")
-                    # v18.2: Prune old chat_history (>30 days OR >50 per chat)
-                    # Prevents unbounded DB growth from group/private conversations.
-                    try:
-                        from bot.database import cleanup_old_chat_history
-                        removed_ch = await cleanup_old_chat_history(max_age_days=30, keep_per_chat=50)
-                        if removed_ch > 0:
-                            logger.info(f"Cleaned up {removed_ch} old chat_history rows")
-                    except Exception as e:
-                        logger.debug(f"chat_history cleanup skipped: {e}")
-
-                # Auto-refresh partner data every 6 hours
-                if cycle_count % 12 == 0:
-                    try:
-                        await partner_manager.maybe_refresh()
-                    except Exception as e:
-                        logger.debug(f"Partner data refresh skipped: {e}")
+    async def start(self):
+        logger.info("=== Маша (OpenClaw) стартует ===")
+        try:
+            me = await self.bot.get_me()
+            config.BOT_ID = me.id
+            config.BOT_USERNAME = (me.username or config.BOT_USERNAME or "").lstrip("@")
+            logger.info(f"Bot: @{config.BOT_USERNAME} (id={config.BOT_ID}) «{me.first_name or ''}», owner={config.OWNER_ID}")
+        except Exception as e: logger.warning(f"get_me failed: {e}")
+        await db.init_db()
+        logger.info("DB initialized")
+        try:
+            await partner_manager.load()
+            logger.info(f"Partners loaded: {len(partner_manager.campaigns)} campaigns")
+        except: pass
+        await ai_client.initialize()
+        logger.info(f"AI client ready — {config.providers_status()}")
+        asyncio.create_task(mood_loop(), name="mood_loop")
+        asyncio.create_task(db.run_periodic_cleanup(), name="cleanup_loop")
+        try:
+            from bot.proactive import proactive_loop, summary_loop, set_bot
+            set_bot(self.bot)
+            asyncio.create_task(proactive_loop(), name="proactive_loop")
+            asyncio.create_task(summary_loop(), name="summary_loop")
+            logger.info("Proactive + summary loops enabled")
+        except Exception as e: logger.warning(f"Proactive failed: {e}")
+        # BMW Channel scheduler — Маша posts to @bmw_mpower_club
+        if config.CHANNEL_ID:
+            asyncio.create_task(self._channel_scheduler(), name="channel_scheduler")
+            logger.info(f"Channel scheduler enabled (@{config.CHANNEL_USERNAME})")
+        await self._notify_owner()
+        try: await self.bot.delete_webhook(drop_pending_updates=False)
+        except: pass
+        allowed = ["message", "edited_message", "channel_post", "edited_channel_post", "inline_query", "chosen_inline_result"]
+        logger.info("=== Маша в сети — слушаю сообщения ===")
+        polling_retries = 0
+        while True:
+            try:
+                await self.dp.start_polling(self.bot, allowed_updates=allowed)
+                break
             except Exception as e:
-                logger.error(f"News fetcher error: {e}")
+                polling_retries += 1
+                logger.error(f"Polling error (attempt {polling_retries}): {type(e).__name__}: {e}")
+                if polling_retries > 50: break
+                await asyncio.sleep(5 if polling_retries <= 5 else 10)
+        try: await ai_client.close()
+        except: pass
 
-            # Wait for next cycle
-            interval = config.NEWS_INTERVAL_MINUTES * 60
-            for _ in range(interval):
-                if not self._running:
-                    break
-                await asyncio.sleep(1)
+    async def _channel_scheduler(self):
+        """Background task: periodically post BMW content to @bmw_mpower_club."""
+        from bot.persona import CHANNEL_POST_PROMPT
+        await asyncio.sleep(120)  # wait for startup
+        post_interval = 1200  # 20 min
+        while True:
+            try:
+                channel_id = int(config.CHANNEL_ID)
+                mood = await current_mood_descriptor()
+                # BMW-focused topics for channel posts
+                topics = [
+                    "новый BMW M5 G90 — характеристики и сравнение с F90",
+                    "BMW M3 Competition G80 — обзор",
+                    "история BMW M-division — от M1 до наших дней",
+                    "BMW N55 vs B58 — какой двигатель надёжнее",
+                    "топ-5 проблем BMW F30 и как их избежать",
+                    "BMW на Нюрбургринге — рекорды круга",
+                    "BMW Individual — эксклюзивные цвета и опции",
+                    "сравнение BMW M4 G82 и Mercedes C63 AMG",
+                    "регламент ТО BMW — что и когда менять",
+                    "BMW i4 M50 — электрический M-кар",
+                    "BMW E39 M5 — легенда, которая не стареет",
+                    "BMW M2 G87 — лучший M-кар для трека?",
+                    "тюнинг BMW M-division — что можно и что нельзя",
+                    "BMW carbon parts — стоит ли своих денег",
+                ]
+                topic = random.choice(topics)
+                prompt = f"Напиши пост для канала @bmw_mpower_club на тему: {topic}. Настроение: {mood}. 3-5 предложений, живо, с эмодзи, BMW-экспертиза."
+                post = await ai_client.chat(prompt, system=CHANNEL_POST_PROMPT, fast=True, max_tokens=400, allow_static_fallback=False)
+                if post:
+                    # Add footer with channel recommendation
+                    post = post.strip()
+                    if not post.endswith("@bmw_mpower_club"):
+                        post += "\n\n🏎️ @bmw_mpower_club"
+                    await self.bot.send_message(channel_id, post[:4000])
+                    logger.info(f"Channel: posted BMW content ({len(post)} chars)")
+            except asyncio.CancelledError: break
+            except Exception as e:
+                logger.error(f"Channel scheduler error: {e}")
+            await asyncio.sleep(post_interval)
 
-    async def _channel_poster(self) -> None:
-        """Post to channel — continuous small-batch model (aligned with asya-bot).
-
-        Schedule (aligned with asya-bot):
-        - Every CHANNEL_POST_INTERVAL_MINUTES (default 20 min)
-        - 1-2 news posts per cycle + 1 partner post every 3rd cycle
-        - 3-5 second gap between posts to avoid Telegram rate limits
-        - All posts go through full dedup pipeline
-
-        Why this beats the old "4 posts × 60min" model:
-        - Old: one failed cycle (dedup/AI) wasted a full hour.
-        - New: one failed cycle wastes only 20 min — 3× faster recovery.
-        - Old: 4 posts × 2-4min gap = 8-16 min cycle length, risk of timeout.
-        - New: 2 posts × 3-5s gap = ~10s cycle, no timeout risk.
-        - Old: 4 posts/cycle required 4 fresh articles; pool exhaustion failed 2-3 of 4.
-        - New: 2 posts/cycle = much higher success rate per cycle.
-
-        Throughput: ~6 news + 1 partner per hour = 168/day max (was 120/day).
-        """
-        await asyncio.sleep(30)
-
-        interval_seconds = config.CHANNEL_POST_INTERVAL_MINUTES * 60
-        logger.info(
-            f"Channel poster started — interval {config.CHANNEL_POST_INTERVAL_MINUTES}min, "
-            f"continuous small-batch model (aligned with asya-bot)"
-        )
-
-        consecutive_empty_cycles = 0
-        # 1-2 news posts per cycle (like asya-bot). Capped by CHANNEL_NEWS_PER_HOUR.
-        MAX_NEWS_PER_CYCLE = min(2, getattr(config, "CHANNEL_NEWS_PER_HOUR", 6))
-
-        while self._running:
-            posts_this_cycle = 0
-            tried_titles_this_cycle = []  # Track titles tried this cycle
-            logger.info(
-                f"Channel poster: starting new cycle (consecutive_empty={consecutive_empty_cycles})"
-            )
-
-            # ── Phase 1: 1-2 news posts ──
-            for post_num in range(MAX_NEWS_PER_CYCLE):
-                if not self._running:
-                    break
-                try:
-                    posted = await channel_manager.run_scheduled_post(
-                        exclude_titles=tried_titles_this_cycle
-                    )
-                    if posted:
-                        posts_this_cycle += 1
-                        if isinstance(posted, dict) and posted.get("title"):
-                            tried_titles_this_cycle.append(posted["title"])
-                        logger.info(
-                            f"Channel poster: news post {post_num + 1}/{MAX_NEWS_PER_CYCLE} published"
-                        )
-                        # Gap between posts: 3-5 seconds (aligned with asya-bot)
-                        gap = random.randint(3, 5)
-                        for _ in range(gap):
-                            if not self._running:
-                                break
-                            await asyncio.sleep(1)
-                    else:
-                        logger.info(
-                            f"Channel poster: news post {post_num + 1}/{MAX_NEWS_PER_CYCLE} "
-                            f"returned False (dedup, AI failure, or no fresh content)"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Channel poster error (news post {post_num + 1}): {e}", exc_info=True
-                    )
-                    break  # Don't keep retrying in a broken state
-
-            # ── Phase 2: partner post — every 3rd cycle (1 partner/hour) ──
-            if consecutive_empty_cycles % 3 == 0:
-                try:
-                    partner_posted = await channel_manager.post_partner_content()
-                    if partner_posted:
-                        posts_this_cycle += 1
-                        logger.info("Channel poster: partner post published")
-                        # Brief gap after partner
-                        for _ in range(5):
-                            if not self._running:
-                                break
-                            await asyncio.sleep(1)
-                    else:
-                        logger.info(
-                            "Channel poster: partner post skipped (interval or no content)"
-                        )
-                except Exception as e:
-                    logger.error(f"Channel poster error (partner post): {e}", exc_info=True)
-
-            if posts_this_cycle > 0:
-                logger.info(
-                    f"Channel poster cycle complete: {posts_this_cycle} posts published"
-                )
-                consecutive_empty_cycles = 0
-            else:
-                consecutive_empty_cycles += 1
-                logger.warning(
-                    f"Channel poster: no posts this cycle ({consecutive_empty_cycles} consecutive)"
-                )
-                # Health check: alert owner after 6 consecutive empty cycles (~2h with 20min interval)
-                if consecutive_empty_cycles >= 6 and self.bot:
-                    try:
-                        await self.bot.send_message(
-                            chat_id=config.OWNER_ID,
-                            text=f"⚠️ Маша: {consecutive_empty_cycles} циклов подряд без постов в канал. "
-                                 f"Возможна проблема с контентом или дедупликацией. Проверь логи."
-                        )
-                    except Exception:
-                        pass
-
-            # Wait for next cycle
-            for _ in range(interval_seconds):
-                if not self._running:
-                    break
-                await asyncio.sleep(1)
-
-
-# ── Main Entry Point ──────────────────────────────────────────────────────────
+    async def _notify_owner(self):
+        mood = await current_mood_descriptor()
+        try:
+            await self.bot.send_message(config.OWNER_ID, f"Я на связи 🏎️ Маша, сейчас я {mood}. OpenClaw: {config.OPENCLAW_URL}. Провайдеры: {config.providers_status()}. Канал: @{config.CHANNEL_USERNAME}. Пиши или добавь в группу 💪")
+        except: pass
 
 async def main():
-    """Main entry point for Masha Bot."""
-    # Check bot token
-    if not config.BOT_TOKEN:
-        logger.critical("BOT_TOKEN not set! Exiting.")
+    global _openclaw_proc
+    cfg_path = _generate_openclaw_config()
+    _openclaw_proc = _start_openclaw_gateway(cfg_path)
+    ready = await _wait_for_gateway(120.0)
+    if not ready:
+        logger.error("OpenClaw Gateway did not become ready — exiting")
+        _stop_openclaw_gateway()
         sys.exit(1)
-
-    # Acquire singleton lock
-    lock = SingletonLock(config.LOCK_FILE)
-    if not lock.acquire():
-        logger.warning("Another instance is running, exiting.")
-        sys.exit(0)
-
-    # Check mode from environment
-    mode = os.getenv("MASHA_BOT_MODE", "interactive").lower()
-
-    # Create bot
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    # Delete webhook to ensure polling works
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted, polling mode ready")
-    except Exception as e:
-        logger.warning(f"Could not delete webhook: {e}")
-
-    # Initialize database
-    await init_db()
-    logger.info("Database initialized")
-
-    # Load topic registry from DB
-    try:
-        from bot.content_engine import _topic_registry
-        loaded_registry = await load_topic_registry()
-        if loaded_registry:
-            import bot.content_engine as ce
-            ce._topic_registry = loaded_registry
-            logger.info(f"Topic registry loaded: {len(loaded_registry)} topics from DB")
-        else:
-            logger.info("Topic registry empty — first run or all topics expired")
-    except Exception as e:
-        logger.warning(f"Could not load topic registry from DB: {e}")
-
-    # Initialize AI router
-    await get_ai_router().initialize()
-    logger.info("AI Router initialized")
-
-    # Load partner programs
-    try:
-        partner_count = await partner_manager.load_async()
-        logger.info(f"Partner programs loaded: {partner_count}")
-    except Exception as e:
-        logger.warning(f"Could not load partner programs: {e}")
-
-    # Set bot on channel manager
-    channel_manager.set_bot(bot)
-
-    # Load recently posted titles into semantic dedup
-    try:
-        await channel_manager.load_recent_semantic_data()
-    except Exception as e:
-        logger.warning(f"Could not load semantic dedup data: {e}")
-
-    if mode == "single":
-        # Single-cycle mode for GitHub Actions
-        logger.info("=== Masha Bot Starting (single-cycle mode) ===")
-        try:
-            posted = await channel_manager.run_scheduled_post()
-            logger.info(f"Single cycle result: {'posted' if posted else 'no post'}")
-        except Exception as e:
-            logger.error(f"Single cycle error: {e}")
-        finally:
-            try:
-                await bot.session.close()
-            except Exception:
-                pass
-            lock.release()
-        return
-
-    # Interactive mode — long polling
-    # Set up dispatcher
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
-
-    # Include all handler routers.
-    # IMPORTANT: admin_router MUST be registered BEFORE chat_router.
-    # chat_router has a catch-all `@chat_router.message(F.text)` handler that
-    # matches every text message — including slash commands. If chat_router is
-    # registered first, ALL admin commands (/admin, /status, /post, /switch, ...)
-    # are swallowed by the catch-all and routed to the AI as ordinary text,
-    # silently breaking the entire admin panel. Registering admin_router first
-    # lets its Command(...) handlers take precedence.
-    try:
-        from bot.handlers.admin import admin_router
-        from bot.handlers.chat import chat_router
-        from bot.handlers.inline import inline_router
-        dp.include_router(admin_router)
-        dp.include_router(chat_router)
-        dp.include_router(inline_router)
-        logger.info("Handler routers included successfully (admin -> chat -> inline)")
-    except Exception as e:
-        logger.critical(f"Failed to include handler routers: {e}")
-        raise
-
-    # Start background tasks
-    bg_tasks = BackgroundTasks(bot)
-
-    async def on_startup():
-        """Startup callback — start background tasks."""
-        await bg_tasks.start()
-
-    async def on_shutdown():
-        """Shutdown callback — stop background tasks."""
-        await bg_tasks.stop()
-
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    # Run polling
-    logger.info("=== Masha Bot Starting (v13.0 — LOCAL-FIRST Multi-Provider, BMW News from sochiautoparts/nws) ===")
-    try:
-        await dp.start_polling(bot)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    finally:
-        await bg_tasks.stop()
-        lock.release()
-        try:
-            await bot.session.close()
-        except Exception:
-            pass
-        logger.info("=== Masha Bot Stopped ===")
-
+    bot = MashaBot()
+    def _sig(*_): asyncio.create_task(bot.dp.stop_polling())
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try: asyncio.get_running_loop().add_signal_handler(sig, _sig)
+        except: pass
+    try: await bot.start()
+    finally: _stop_openclaw_gateway()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-    except SystemExit as e:
-        code = e.code if isinstance(e.code, int) else 1
-        sys.exit(code)
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        logger.exception(f"Fatal: {e}")
+        _stop_openclaw_gateway()
         sys.exit(1)

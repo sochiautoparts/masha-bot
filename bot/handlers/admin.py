@@ -1,458 +1,92 @@
-"""
-Admin Handler — Admin-only commands for managing the Masha Bot.
-"""
-
+"""Маша Admin handler — owner commands."""
 import logging
-from typing import Optional
-
-from aiogram import Router, F, types
-from aiogram.filters import Command
+from aiogram import Router, F
 from aiogram.types import Message
-from aiogram.enums import ChatAction
-
+from aiogram.filters import Command
 from bot.config import config
-from bot.database import (
-    is_user_admin, set_user_admin, block_user,
-    get_stats, get_today_post_count, get_today_partner_post_count,
-    get_unposted_news,
-)
-from ai.router import get_ai_router
-from bot.partners import partner_manager
-from bot.web_search import web_search, format_search_results
-from channel import channel_manager
+from bot import database as db
+from ai import client as ai_client
 
-logger = logging.getLogger("masha.handlers.admin")
-
+logger = logging.getLogger("masha.admin")
 admin_router = Router()
 
-
-async def _is_admin(message: Message) -> bool:
-    """Check if the message sender is an admin."""
-    return await is_user_admin(message.from_user.id)
-
-
-@admin_router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    """Show admin panel."""
-    if not await _is_admin(message):
-        await message.answer("У вас нет прав администратора.")
-        return
-
-    stats = await get_stats()
-    today_posts = await get_today_post_count()
-    today_partner = await get_today_partner_post_count()
-
-    text = (
-        f"🛠️ Панель администратора Masha Bot\n\n"
-        f"📊 Статистика:\n"
-        f"  Пользователей: {stats['total_users']}\n"
-        f"  Активных: {stats['active_users']}\n"
-        f"  Новостей в базе: {stats['total_news']}\n"
-        f"  Непостоянных новостей: {stats['unposted_news']}\n"
-        f"  Постов в канале: {stats['total_posts']}\n"
-        f"  Партнёрских постов: {stats['partner_posts']}\n"
-        f"  Сегодня постов: {today_posts}\n"
-        f"  Сегодня партнёрских: {today_partner}\n"
-        f"  Кэшированных запросов: {stats['cached_queries']}\n\n"
-        f"Команды:\n"
-        f"/status — статус бота\n"
-        f"/post — создать пост в канал\n"
-        f"/partner_post — партнёрский пост\n"
-        f"/news — показать непостоянные новости\n"
-        f"/search <запрос> — веб-поиск\n"
-        f"/addadmin <user_id> — добавить админа\n"
-        f"/block <user_id> — заблокировать пользователя\n"
-        f"/unblock <user_id> — разблокировать\n"
-        f"/models — список AI моделей\n"
-        f"/switch <модель> — переключить AI модель\n"
-        f"/reload_partners — перезагрузить партнёров"
-    )
-    await message.answer(text)
-
-
-@admin_router.message(Command("status"))
-async def cmd_status(message: Message):
-    """Show bot status."""
-    if not await _is_admin(message):
-        return
-
-    is_ai = get_ai_router().is_available()
-    partner_count = len(partner_manager.programs)
-    unposted = await get_unposted_news(limit=1)
-
-    from zoneinfo import ZoneInfo
-    from datetime import datetime
-    moscow_time = datetime.now(ZoneInfo("Europe/Moscow"))
-
-    text = (
-        f"✅ Masha Bot работает\n\n"
-        f"🤖 AI провайдер: {'доступен' if is_ai else 'недоступен'}\n"
-        f"📰 Партнёрских программ: {partner_count}\n"
-        f"📝 Непостоянных новостей: {len(unposted)}\n"
-        f"⏰ Москва: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    await message.answer(text)
-
-
-@admin_router.message(Command("post"))
-async def cmd_post(message: Message):
-    """Create a post in the channel."""
-    if not await _is_admin(message):
-        return
-
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    args = message.text.split(maxsplit=1)
-    topic = args[1] if len(args) > 1 else ""
-
-    if not topic:
-        news = await get_unposted_news(limit=5)
-        if not news:
-            await message.answer("Нет непостоянных новостей для поста. Укажите тему: /post <тема>")
-            return
-        import random
-        item = random.choice(news)
-        topic = item["title"]
-        source_url = item["url"]
-        source_summary = item["summary"]
-    else:
-        source_url = ""
-        source_summary = ""
-
-    response = await get_ai_router().generate_channel_post(
-        topic=topic,
-        context=source_summary if source_summary else "",
-    )
-
-    if response.error:
-        await message.answer(f"Ошибка генерации поста: {response.error_message}")
-        return
-
-    preview = f"📝 Предпросмотр поста:\n\n{response.text}\n\nОтправить в канал? /send_post"
-    await message.answer(preview)
-
-    message.bot._pending_post = response.text
-    message.bot._pending_source_url = source_url
-
-
-@admin_router.message(Command("send_post"))
-async def cmd_send_post(message: Message):
-    """Send the pending post to the channel."""
-    if not await _is_admin(message):
-        return
-
-    post_text = getattr(message.bot, "_pending_post", None)
-    source_url = getattr(message.bot, "_pending_source_url", "")
-
-    if not post_text:
-        await message.answer("Нет поста для отправки. Сначала создайте через /post")
-        return
-
-    try:
-        sent = await message.bot.send_message(
-            chat_id=config.CHANNEL_ID,
-            text=post_text,
-        )
-
-        from bot.database import add_channel_post, mark_news_posted
-        await add_channel_post(
-            content=post_text,
-            message_id=sent.message_id,
-            post_type="news",
-            source_url=source_url,
-        )
-
-        if source_url:
-            await mark_news_posted(source_url)
-
-        await message.answer(f"✅ Пост опубликован в {config.CHANNEL_ID}")
-
-        message.bot._pending_post = None
-        message.bot._pending_source_url = ""
-
-    except Exception as e:
-        logger.error(f"Error sending post to channel: {e}")
-        await message.answer(f"❌ Ошибка публикации: {e}")
-
-
-@admin_router.message(Command("partner_post"))
-async def cmd_partner_post(message: Message):
-    """Create a partner post for the channel."""
-    if not await _is_admin(message):
-        return
-
-    args = message.text.split(maxsplit=1)
-    category = args[1] if len(args) > 1 else ""
-
-    program = partner_manager.get_random_program(category=category)
-    if not program:
-        await message.answer("Партнёрские программы не загружены или не найдены для указанной категории.")
-        return
-
-    post_content = await partner_manager.generate_partner_post_content(program)
-
-    await message.answer(f"📝 Предпросмотр партнёрского поста:\n\n{post_content}\n\nОтправить? /send_partner_post")
-    message.bot._pending_partner_post = post_content
-    message.bot._pending_partner_program = program
-
-
-@admin_router.message(Command("send_partner_post"))
-async def cmd_send_partner_post(message: Message):
-    """Send the pending partner post to the channel.
-
-    v17.0: Runs the post through the SAME prepare pipeline as the automatic
-    channel poster (prepare_partner_post_for_publish from channel.py) so the
-    admin-initiated post gets identical cleaning, prompt-leakage guard,
-    validation, and goto_link-preservation enforcement. Previously this command
-    sent the raw AI text directly to the channel — no markdown cleaning, no
-    leakage check, no char-limit enforcement, and the goto_link could be
-    missing or chopped off.
-    """
-    if not await _is_admin(message):
-        return
-
-    post_text = getattr(message.bot, "_pending_partner_post", None)
-    program = getattr(message.bot, "_pending_partner_program", None)
-
-    if not post_text or not program:
-        await message.answer("Нет партнёрского поста для отправки.")
-        return
-
-    # ── v17.0: Run the shared prepare pipeline ──
-    # Admin posts are text-only (no image attachment in this command), so
-    # has_media=False → 4096-char limit. The pipeline cleans markdown, strips
-    # prompt leakage, validates, re-appends the goto_link if missing, and
-    # enforces the char limit preserving the link + footer.
-    try:
-        from channel import prepare_partner_post_for_publish
-        prepared = prepare_partner_post_for_publish(
-            post_text, program, has_media=False
-        )
-    except ImportError:
-        # Fallback: channel.py is at repo root; if import fails, use the text as-is
-        # (legacy behavior) but still log a warning so the admin knows.
-        logger.warning("Could not import prepare_partner_post_for_publish — sending uncleaned post")
-        prepared = post_text
-    except Exception as e:
-        logger.error(f"prepare_partner_post_for_publish error: {e}")
-        prepared = None
-
-    if not prepared:
-        await message.answer(
-            "❌ Пост не прошёл проверку (prompt-leakage или пустой текст). "
-            "Попробуйте /partner_post ещё раз."
-        )
-        message.bot._pending_partner_post = None
-        message.bot._pending_partner_program = None
-        return
-
-    # Final guarantee: the goto_link must be present
-    goto_link = getattr(program, "goto_link", "") or ""
-    if goto_link and goto_link not in prepared:
-        logger.error(f"Admin partner post missing goto_link — aborting: {program.name}")
-        await message.answer("❌ Партнёрская ссылка потеряна при очистке. Попробуйте ещё раз.")
-        message.bot._pending_partner_post = None
-        message.bot._pending_partner_program = None
-        return
-
-    try:
-        sent = await message.bot.send_message(
-            chat_id=config.CHANNEL_ID,
-            text=prepared,
-        )
-
-        from bot.database import add_partner_post
-        await add_partner_post(
-            program_id=program.id,
-            program_name=program.name,
-            category=program.category if program.category else "general",
-            affiliate_url=program.goto_link,
-            post_content=prepared,
-            message_id=sent.message_id,
-        )
-
-        partner_manager.mark_posted(program)
-        await message.answer(
-            f"✅ Партнёрский пост опубликован: {program.name}\n"
-            f"   Длина: {len(prepared)} симв. | Ссылка: {'✅' if goto_link in prepared else '❌'}"
-        )
-
-        message.bot._pending_partner_post = None
-        message.bot._pending_partner_program = None
-
-    except Exception as e:
-        logger.error(f"Error sending partner post: {e}")
-        await message.answer(f"❌ Ошибка публикации: {e}")
-
-
-@admin_router.message(Command("news"))
-async def cmd_news(message: Message):
-    """Show unposted news items."""
-    if not await _is_admin(message):
-        return
-
-    news = await get_unposted_news(limit=10)
-    if not news:
-        await message.answer("Нет непостоянных новостей.")
-        return
-
-    lines = ["📰 Непостоянные новости:\n"]
-    for i, item in enumerate(news[:10], 1):
-        lines.append(f"{i}. {item['title']}")
-        lines.append(f"   {item['url']}")
-        lines.append(f"   Источник: {item['source']} | Категория: {item['category']}\n")
-
-    await message.answer("\n".join(lines))
-
-
-@admin_router.message(Command("search"))
-async def cmd_search(message: Message):
-    """Perform a web search (admin only)."""
-    if not await _is_admin(message):
-        return
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: /search <запрос>")
-        return
-
-    query = args[1]
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    results = await web_search(query, max_results=5)
-    text = format_search_results(results, max_items=5)
-    await message.answer(text)
-
-
-@admin_router.message(Command("addadmin"))
-async def cmd_addadmin(message: Message):
-    """Add a user as admin."""
-    if message.from_user.id != config.OWNER_ID:
-        await message.answer("Только владелец может добавлять админов.")
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Использование: /addadmin <user_id>")
-        return
-
-    try:
-        target_id = int(args[1])
-    except ValueError:
-        await message.answer("Неверный user_id. Должно быть число.")
-        return
-
-    await set_user_admin(target_id, True)
-    await message.answer(f"✅ Пользователь {target_id} теперь админ.")
-
-
-@admin_router.message(Command("block"))
-async def cmd_block(message: Message):
-    """Block a user."""
-    if not await _is_admin(message):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Использование: /block <user_id>")
-        return
-
-    try:
-        target_id = int(args[1])
-    except ValueError:
-        await message.answer("Неверный user_id.")
-        return
-
-    await block_user(target_id, True)
-    await message.answer(f"🚫 Пользователь {target_id} заблокирован.")
-
-
-@admin_router.message(Command("unblock"))
-async def cmd_unblock(message: Message):
-    """Unblock a user."""
-    if not await _is_admin(message):
-        return
-
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("Использование: /unblock <user_id>")
-        return
-
-    try:
-        target_id = int(args[1])
-    except ValueError:
-        await message.answer("Неверный user_id.")
-        return
-
-    await block_user(target_id, False)
-    await message.answer(f"✅ Пользователь {target_id} разблокирован.")
-
+def _is_admin(message):
+    uid = message.from_user.id if message.from_user else 0
+    return uid == config.OWNER_ID or uid in config.ADMIN_IDS
+
+@admin_router.message(Command("stats"))
+async def cmd_stats(message):
+    if not _is_admin(message): return
+    s = ai_client.stats()
+    await message.reply(f"📊 Статистика AI:\nЗапросов: {s.get('requests',0)}\nOpenClaw: {s.get('openclaw_ok',0)}\nPollinations: {s.get('pollinations_backup',0)}\nStatic: {s.get('static_fallback',0)}\nОшибок: {s.get('fail',0)}\nПоследняя: {s.get('last_error','—')[:80]}")
+
+@admin_router.message(Command("providers"))
+async def cmd_providers(message):
+    if not _is_admin(message): return
+    await message.reply(f"🔌 Провайдеры:\n{config.providers_status()}")
 
 @admin_router.message(Command("models"))
-async def cmd_models(message: Message):
-    """Show available AI models grouped by provider."""
-    if not await _is_admin(message):
-        return
+async def cmd_models(message):
+    if not _is_admin(message): return
+    import httpx
+    s = ai_client.stats()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get("https://text.pollinations.ai/models")
+        models = r.json() if r.status_code == 200 else []
+    except: models = []
+    lines = ["🤖 Модели Pollinations:"]
+    for m in models: lines.append(f"  • {m.get('name','?')} — {m.get('description','')[:50]}")
+    lines.append(f"\n📊 AI stats:\n  Запросов: {s.get('requests',0)}\n  OpenClaw: {s.get('openclaw_ok',0)}\n  Pollinations: {s.get('pollinations_backup',0)}\n  Ошибок: {s.get('fail',0)}")
+    await message.reply("\n".join(lines))
 
-    models = get_ai_router().get_available_models()
-    categories = get_ai_router().get_model_categories()
-    categories = {
-        "💬 Чат": categories.get("chat", []),
-        "🧠 Рассуждения": categories.get("reasoning", []),
-        "👁️ Vision": categories.get("vision", []),
-        "📝 Контент": categories.get("content", []),
-        "🔍 Поиск": categories.get("search", []),
-        "🖼️ Изображения": categories.get("image", []),
-    }
+@admin_router.message(Command("diag"))
+async def cmd_diag(message):
+    if not _is_admin(message): return
+    c = message.chat
+    u = message.from_user
+    info = [f"🔧 Диагностика:", f"Бот: @{config.BOT_USERNAME} (id={config.BOT_ID})", f"Чат: id={c.id}, тип={c.type}, title={c.title or '—'}", f"Ты: {u.first_name} (id={u.id})", f"Провайдеры: {config.providers_status()}"]
+    try:
+        recent = await db.get_recent_group_messages(c.id, limit=5)
+        info.append(f"\nЛог сообщений ({len(recent)}):")
+        if not recent: info.append("  (пусто)")
+        else:
+            for m in recent[-5:]:
+                who = m.get("first_name") or "?"
+                if m.get("user_id") == config.BOT_ID: who = "Маша"
+                info.append(f"  {who}: {(m.get('content') or '')[:50]}")
+    except: pass
+    try: await message.reply("\n".join(info))
+    except: pass
 
-    lines = ["🤖 Доступные AI модели:\n"]
-    for cat, cat_models in categories.items():
-        cat_available = [m for m in cat_models if m in models]
-        if cat_available:
-            lines.append(f"{cat}:")
-            for m in cat_available:
-                lines.append(f"  • {m}")
+@admin_router.message(Command("channel_on"))
+async def cmd_channel_on(message):
+    if not _is_admin(message): return
+    parts = (message.text or "").split()
+    if len(parts) < 2: await message.reply("Использование: /channel_on <chat_id>"); return
+    try: chat_id = int(parts[1])
+    except: await message.reply("chat_id должен быть числом"); return
+    await db.set_channel_enabled(chat_id, True)
+    await message.reply(f"✅ Реакции для канала {chat_id} включены")
 
-    lines.append("\n/switch <модель> — переключить модель")
-    await message.answer("\n".join(lines))
+@admin_router.message(Command("channel_off"))
+async def cmd_channel_off(message):
+    if not _is_admin(message): return
+    parts = (message.text or "").split()
+    if len(parts) < 2: await message.reply("Использование: /channel_off <chat_id>"); return
+    try: chat_id = int(parts[1])
+    except: await message.reply("chat_id должен быть числом"); return
+    await db.set_channel_enabled(chat_id, False)
+    await message.reply(f"🚫 Реакции для канала {chat_id} выключены")
 
-
-@admin_router.message(Command("switch"))
-async def cmd_switch_model(message: Message):
-    """Switch the default AI model for chat."""
-    if not await _is_admin(message):
-        return
-
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: /switch <модель>\nПример: /switch mistral-large")
-        return
-
-    model_name = args[1].strip()
-    available = get_ai_router().get_available_models()
-
-    if model_name not in available:
-        await message.answer(f"Модель '{model_name}' не найдена. Используйте /models для списка.")
-        return
-
-    import ai.providers.pollinations_provider as pp
-    # preferred_chat_model is consulted by the chat completion path, so the
-    # admin's choice takes effect on the very next message (no restart needed).
-    pp.preferred_chat_model = model_name
-
-    await message.answer(f"✅ Модель переключена на: {model_name}")
-
-
-@admin_router.message(Command("reload_partners"))
-async def cmd_reload_partners(message: Message):
-    """Reload partner programs — fetches fresh data from sochiautoparts.ru."""
-    if not await _is_admin(message):
-        return
-
-    # Remote-first reload: pulls the latest partners.json from
-    # https://sochiautoparts.ru/partners.json (the single source of truth),
-    # then caches locally. Falls back to local file if remote is unreachable.
-    count = await partner_manager.load_async()
-    await message.answer(
-        f"✅ Загружено {count} партнёрских программ (обновлено из sochiautoparts.ru)."
-    )
+@admin_router.message(Command("broadcast"))
+async def cmd_broadcast(message):
+    if not _is_admin(message): return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3: await message.reply("Использование: /broadcast <chat_id> <текст>"); return
+    try: chat_id = int(parts[1])
+    except: await message.reply("chat_id должен быть числом"); return
+    try:
+        await message.bot.send_message(chat_id, parts[2])
+        await message.reply("✅ Отправлено")
+    except Exception as e: await message.reply(f"❌ Ошибка: {e}")

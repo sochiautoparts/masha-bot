@@ -1,137 +1,36 @@
-# masha-bot 🏎️
+# Маша (@asmasha_bot) — OpenClaw architecture
 
-BMW-focused Telegram bot for [@bmw_mpower_club](https://t.me/bmw_mpower_club) channel.
+BMW M-эксперт, главред канала @bmw_mpower_club. Бывший юрист, владелица M5 F90.
+Активно общается в группах, ведёт BMW-канал, понимает фото и голосовые.
+Работает в среде OpenClaw, развёрнутого в GitHub Actions 24/7.
 
-Маша — владелица BMW M5 F90 Competition (625 л.с., S63), бывший юрист, ставшая автомобильным экспертом и главредом канала.
+## ✨ Возможности
 
-## Features
+| Функция | Описание |
+|---|---|
+| 💬 Текст | Общение с BMW-экспертизой, память диалога |
+| 📷 Фото (Vision) | Определяет BMW модели по фото |
+| 🎤 Голосовые | Транскрипция через Whisper |
+| 🔍 Новости | Развёрнуто дополняет авто-новости из интернета |
+| 📺 Канал @bmw_mpower_club | Автопостинг BMW-контента каждые 20 мин |
+| 🏎️ BMW Knowledge | Модели, двигатели, проблемы, ТО, тюнинг |
+| 🤝 Партнёры | Контекстные ссылки (goto_link из partners.json) |
+| 🗣 Proactive | Сам начинает беседу в группах |
+| 📝 Память | 30-мин суммаризация обсуждений |
+| 🏷 Inline | `@asmasha_bot <вопрос>` в любом чате |
+| 🎀 3 реакции | 3 положительные реакции на каждый пост в каналах |
 
-- **AI-Powered Content**: Uses Pollinations.ai with dual-key failover for text and image generation
-- **BMW Knowledge Base**: Three-level knowledge system (models, technical, culture)
-- **6 Editorial Characters**: Маша (главред), Серёга (механик), Костя (кодер), Лена (дизайнер), Доктор Ван Дамм (кот), Кинг Конг (попугай)
-- **Fact Checking**: BMW-specific validation against known AI hallucinations
-- **Smart Scheduling**: Theme days (M-Monday, Tech Tuesday, etc.) + urgent news priority
-- **Evergreen Buffer**: Pre-made content for when no fresh news is available
-- **Partner Integration**: Admitad partner system (Rossko, Autopiter, AvtoALL)
-- **Semantic Dedup**: Prevents duplicate or very similar posts
+## 🏗 Архитектура
 
-## Architecture
+OpenClaw Gateway (Node.js) → OpenAI API на localhost:18789.
+Python aiogram бот → все AI через OpenClaw.
 
-```
-masha-bot/
-├── ai/                     # AI provider (Pollinations)
-│   ├── router.py           # AI routing and content generation
-│   └── providers/
-│       ├── base.py         # Base AI provider interface
-│       └── pollinations_provider.py  # Pollinations with dual-key failover
-├── bot/
-│   ├── core/               # Core modules
-│   │   ├── config.py       # Environment config
-│   │   ├── pipeline.py     # Content orchestration
-│   │   └── scheduler.py    # Theme days and scheduling
-│   ├── sources/            # Content sources
-│   │   ├── rss_fetcher.py  # BMW RSS + web search
-│   │   ├── evergreen.py    # Pre-made content buffer
-│   │   └── community.py    # Subscriber questions and polls
-│   ├── generation/         # Content generation
-│   │   ├── writer.py       # AI text generation
-│   │   ├── fact_checker.py # BMW fact validation
-│   │   ├── persona.py      # Character/tone/mood management
-│   │   └── image_gen.py    # AI image generation
-│   ├── publishing/         # Channel posting
-│   │   ├── telegram.py     # Telegram API + dedup
-│   │   └── formatter.py    # Character limit handling
-│   ├── analytics/          # Metrics
-│   │   ├── tracker.py      # Post tracking
-│   │   └── reporter.py     # Weekly reports
-│   ├── knowledge/          # BMW knowledge
-│   │   ├── bmw_base.py     # Model range, engines, tech, culture
-│   │   ├── characters.py   # Editorial team
-│   │   └── topics.py       # Topic scheduling
-│   ├── data/               # Static data
-│   │   ├── evergreen_pool.json
-│   │   ├── topic_schedule.json
-│   │   └── persona_state.json
-│   ├── database.py         # SQLite with aiosqlite
-│   ├── partners.py         # Admitad partner integration
-│   └── main.py             # Entry point
-├── news.py                 # BMW RSS fetching
-├── .github/workflows/bot.yml  # GitHub Actions CI/CD
-├── .env.example            # Environment template
-├── requirements.txt        # Python dependencies
-└── README.md
-```
+## 🚀 Запуск
 
-## Setup
+### GitHub Actions (24/7)
+1. Секреты: `BOT_TOKEN`, `OWNER_ID`, `GH_PAT_TOKEN`, `CHANNEL_ID` (обязательные)
+2. AI ключи: `GROQ_API_KEY`, `GEMINI_API_KEY`, `HF_TOKEN`, etc.
+3. Бот работает на Pollinations free без ключей.
 
-1. Clone the repository:
-```bash
-git clone https://github.com/sochiautoparts/masha-bot.git
-cd masha-bot
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-3. Copy `.env.example` to `.env` and fill in your credentials:
-```bash
-cp .env.example .env
-```
-
-4. Run the bot:
-```bash
-# Single cycle (for GitHub Actions)
-MASHA_BOT_MODE=single python -m bot.main
-
-# Interactive mode (for development)
-MASHA_BOT_MODE=interactive python -m bot.main
-```
-
-## Content Types
-
-| Type | Distribution | Description |
-|------|-------------|-------------|
-| news+reaction | 40% | BMW news with Маша's expert opinion |
-| DIY/how-to | 15% | BMW maintenance, coding, VANOS |
-| polls/debates | 15% | M3 vs M4, xDrive vs RWD, etc. |
-| lore/history | 10% | E30 M3, M1 Procar, CSL lineage |
-| garage stories | 10% | Stories from Серёга's shop |
-| partner | 10% | Rossko, Autopiter, AvtoALL |
-
-## Theme Days
-
-| Day | Theme | Focus |
-|-----|-------|-------|
-| Monday | 🔥 M-Monday | M-models, M-division |
-| Tuesday | 🔧 Tech Tuesday | Engines, VANOS, coding |
-| Wednesday | 🔩 Workshop Wednesday | DIY, Серёга's tips |
-| Thursday | ⏪ Throwback Thursday | Classic BMW, history |
-| Friday | 🤪 Freaky Friday | Tuning, Alpina, custom |
-| Saturday | 🔦 Spotlight Saturday | Model deep-dive |
-| Sunday | 🛣️ Sunday Drive | Nürburgring, road trips |
-
-## Characters
-
-| Character | Role | BMW Connection |
-|-----------|------|---------------|
-| Маша | Главред | M5 F90 Competition owner |
-| Серёга | Механик-BMWист | 20 years in BMW service |
-| Костя | Кодер-энджинист | BimmerCode enthusiast |
-| Лена | Дизайнер | Individual colors expert |
-| Доктор Ван Дамм | Кот редакции | Sleeps on M5 hood |
-| Кинг Конг | Попугай | Screams "///M-Power!" |
-
-## GitHub Actions
-
-The bot runs automatically every 30 minutes via GitHub Actions. The workflow:
-1. Checks out the repo
-2. Restores the database cache
-3. Runs one content cycle
-4. Commits any database changes
-5. Self-dispatches the next run
-
-## License
-
-Proprietary — @bmw_mpower_club
+## 📄 Лицензия
+MIT

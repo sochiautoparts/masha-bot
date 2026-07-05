@@ -143,7 +143,7 @@ class MashaBot:
         """
         from bot.persona import CHANNEL_POST_PROMPT
         await asyncio.sleep(120)
-        post_interval = 1200  # 20 min
+        post_interval = 1800  # 30 min (old schedule: POST_INTERVAL_MINUTES=30)
         NEWS_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
 
         while True:

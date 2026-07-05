@@ -114,10 +114,12 @@ class MashaBot:
             asyncio.create_task(summary_loop(), name="summary_loop")
             logger.info("Proactive + summary loops enabled")
         except Exception as e: logger.warning(f"Proactive failed: {e}")
-        # BMW Channel scheduler — Маша posts to @bmw_mpower_club
+        # BMW Channel scheduler — Маша posts 2 news to @bmw_mpower_club every 20 min
         if config.CHANNEL_ID:
             asyncio.create_task(self._channel_scheduler(), name="channel_scheduler")
-            logger.info(f"Channel scheduler enabled (@{config.CHANNEL_USERNAME})")
+            # Partner (affiliate) scheduler — 1 promo post per hour
+            asyncio.create_task(self._partner_scheduler(), name="partner_scheduler")
+            logger.info(f"Channel scheduler enabled (@{config.CHANNEL_USERNAME}) — 2 news/20min + 1 partner/hour")
         await self._notify_owner()
         try: await self.bot.delete_webhook(drop_pending_updates=False)
         except: pass
@@ -137,13 +139,13 @@ class MashaBot:
         except: pass
 
     async def _channel_scheduler(self):
-        """Background task: post BMW news from bmw-news.json to @bmw_mpower_club.
-        Fetches from sochiautoparts/nws repo (self-updating source), extracts photos,
-        generates AI commentary, posts with photo to channel.
+        """Background task: post 2 BMW news to @bmw_mpower_club every 20 min.
+        Editorial voice (от имени редакции). Posts up to 2 unposted items per cycle,
+        with a short gap between them.
         """
         from bot.persona import CHANNEL_POST_PROMPT
         await asyncio.sleep(120)
-        post_interval = 1800  # 30 min (old schedule: POST_INTERVAL_MINUTES=30)
+        post_interval = 1200  # 20 min — 2 posts per cycle
         NEWS_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
 
         while True:
@@ -169,15 +171,16 @@ class MashaBot:
 
                 logger.info(f"Fetched {len(all_items)} BMW news items")
 
-                # 2. Find unposted news item
-                news_item = None
+                # 2. Find up to 2 unposted news items
+                unposted = []
                 for item in all_items:
                     news_id = item.get("id", "")
                     if news_id and not await db.is_news_posted(news_id):
-                        news_item = item
-                        break
+                        unposted.append(item)
+                        if len(unposted) >= 2:
+                            break
 
-                if not news_item:
+                if not unposted:
                     # All items posted — reset
                     logger.info("All BMW news already posted — resetting posted_news")
                     try:
@@ -185,85 +188,18 @@ class MashaBot:
                         await conn.execute("DELETE FROM posted_news")
                         await conn.commit()
                     except: pass
-                    news_item = all_items[0]
+                    unposted = all_items[:2]
 
-                title = news_item.get("title", "")
-                summary = news_item.get("summary", "")
-                url = news_item.get("url", "")
-                image_url = news_item.get("image", "")
-                images_list = news_item.get("images", []) or []
-                # Use up to 10 images (Telegram media group limit)
-                all_images = list(dict.fromkeys([image_url] + images_list))[:10] if image_url else images_list[:10]
-                all_images = [u for u in all_images if u][:10]
-                source = news_item.get("source", "")
-                news_id = news_item.get("id", "")
-
-                logger.info(f"Selected BMW news: {title[:60]} (img: {'yes' if image_url else 'no'})")
-
-                # 3. Generate AI commentary — match old format: 500-1000 chars, BMW expert
-                prompt = (
-                    f"Напиши пост для канала @bmw_mpower_club с комментарием на эту BMW-новость.\n\n"
-                    f"Заголовок новости: {title}\n"
-                    f"Краткое содержание: {summary[:400]}\n\n"
-                    f"СТИЛЬ (как раньше писала Маша):\n"
-                    f"- 900-1100 символов, живой BMW M-экспертный разбор\n"
-                    f"- Маша — владелица M5 F90 (3.0л TwinPower, 510 л.с., 750 Н·м): личный опыт\n"
-                    f"- ///M = религия, Нюрбургринг = дом\n"
-                    f"- Технические детали: модели, двигатели (N55, B58, S63), л.с., Н·м\n"
-                    f"- Эмодзи: \U0001f3ce\U0001f525\U0001f4aa\U0001f60e\U0001f3c1\u2728 естественно\n"
-                    f"- Женский род, по-русски\n"
-                    f"- Настроение: {mood}\n"
-                    f"- НЕ копируй новость — пиши СВОЙ комментарий\n"
-                    f"- НЕ добавляй ссылки, НЕ пиши 'Источник'\n"
-                    f"- НЕ начинай с 'Маша:'"
-                )
-                ai_commentary = await ai_client.chat(
-                    prompt, system=CHANNEL_POST_PROMPT,
-                    max_tokens=800, temperature=0.9, allow_static_fallback=False
-                )
-
-                if not ai_commentary:
-                    logger.warning("AI commentary empty — skipping post")
-                    await asyncio.sleep(post_interval)
-                    continue
-
-                # 4. Build post text — match old format: AI text + footer
-                post_text = ai_commentary.strip()[:3000]
-                # Footer matches old @bmw_mpower_club format exactly:
-                # Автор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club
-                if not post_text.endswith("#bmw_mpower_club"):
-                    post_text += "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
-
-                # 5. Download image and post with photo
-                posted = False
-                if image_url:
+                # 3. Post each item (up to 2 per cycle), with a short gap between
+                for idx, news_item in enumerate(unposted):
                     try:
-                        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as img_client:
-                            img_resp = await img_client.get(image_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-                        if img_resp.status_code == 200 and len(img_resp.content) > 2000:
-                            from aiogram.types import BufferedInputFile
-                            photo_file = BufferedInputFile(img_resp.content, filename="news.jpg")
-                            caption = post_text[:1024]
-                            await self.bot.send_photo(channel_id, photo_file, caption=caption)
-                            posted = True
-                            logger.info(f"Channel: posted BMW NEWS+photo ({len(post_text)} chars) — {title[:40]}")
-                        else:
-                            logger.warning(f"Image download bad: HTTP {img_resp.status_code}, {len(img_resp.content)} bytes")
+                        posted = await self._post_news_item(news_item, mood, channel_id, CHANNEL_POST_PROMPT)
+                        if posted:
+                            logger.info(f"Cycle: posted BMW news {idx+1}/{len(unposted)}")
                     except Exception as e:
-                        logger.warning(f"Image download failed: {e}")
-
-                # 6. Fallback: post text only
-                if not posted:
-                    try:
-                        await self.bot.send_message(channel_id, post_text[:4096])
-                        posted = True
-                        logger.info(f"Channel: posted BMW NEWS text-only ({len(post_text)} chars) — {title[:40]}")
-                    except Exception as e:
-                        logger.error(f"Channel post failed: {e}")
-
-                # 7. Mark news as posted
-                if posted and news_id:
-                    await db.mark_news_posted(news_id, title)
+                        logger.error(f"Post news item error: {e}")
+                    if idx < len(unposted) - 1:
+                        await asyncio.sleep(60)  # small gap between the 2 posts
 
             except asyncio.CancelledError:
                 break
@@ -271,6 +207,142 @@ class MashaBot:
                 logger.error(f"Channel scheduler error: {e}")
 
             await asyncio.sleep(post_interval)
+
+    async def _post_news_item(self, news_item, mood, channel_id, channel_prompt):
+        """Post a single BMW news item to channel with photo (editorial voice). Returns True if posted."""
+        import httpx
+        title = news_item.get("title", "")
+        summary = news_item.get("summary", "")
+        image_url = news_item.get("image", "")
+        images_list = news_item.get("images", []) or []
+        all_images = list(dict.fromkeys([image_url] + images_list))[:10] if image_url else images_list[:10]
+        all_images = [u for u in all_images if u][:10]
+        news_id = news_item.get("id", "")
+
+        logger.info(f"Selected BMW news: {title[:60]} (img: {'yes' if image_url else 'no'})")
+
+        # Generate AI commentary — editorial voice (от имени редакции)
+        prompt = (
+            f"Напиши пост для канала @bmw_mpower_club с комментарием на эту BMW-новость.\n\n"
+            f"Заголовок новости: {title}\n"
+            f"Краткое содержание: {summary[:400]}\n\n"
+            f"СТИЛЬ (ОТ ИМЕНИ РЕДАКЦИИ @bmw_mpower_club):\n"
+            f"- 900-1100 символов, живой BMW M-экспертный разбор ОТ ИМЕНИ РЕДАКЦИИ канала\n"
+            f"- Пиши от лица редакции (коллектив BMW-M экспертов, владелица M5 F90)\n"
+            f"- Не от первого лица лично — а как позиция редакции: 'Редакция считает...', 'Мы разобрались...'\n"
+            f"- ///M = религия, Нюрбургринг = дом\n"
+            f"- Технические детали: модели, двигатели (N55, B58, S63), л.с., Н·м\n"
+            f"- Эмодзи: \U0001f3ce\U0001f525\U0001f4aa\U0001f60e\U0001f3c1\u2728 естественно\n"
+            f"- Женский род (редакция), по-русски\n"
+            f"- Настроение: {mood}\n"
+            f"- НЕ копируй новость — пиши СВОЙ комментарий\n"
+            f"- НЕ добавляй ссылки, НЕ пиши 'Источник'\n"
+            f"- НЕ начинай с 'Маша:' или 'Редакция:'"
+        )
+        ai_commentary = await ai_client.chat(
+            prompt, system=channel_prompt,
+            max_tokens=800, temperature=0.9, allow_static_fallback=False
+        )
+
+        if not ai_commentary:
+            logger.warning("AI commentary empty — skipping post")
+            return False
+
+        # Build post text — AI text + editorial footer
+        post_text = ai_commentary.strip()[:3000]
+        if not post_text.endswith("#bmw_mpower_club"):
+            post_text += "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
+
+        posted = False
+        if image_url:
+            try:
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as img_client:
+                    img_resp = await img_client.get(image_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                if img_resp.status_code == 200 and len(img_resp.content) > 2000:
+                    from aiogram.types import BufferedInputFile
+                    photo_file = BufferedInputFile(img_resp.content, filename="news.jpg")
+                    caption = post_text[:1024]
+                    await self.bot.send_photo(channel_id, photo_file, caption=caption)
+                    posted = True
+                    logger.info(f"Channel: posted BMW NEWS+photo ({len(post_text)} chars) — {title[:40]}")
+                else:
+                    logger.warning(f"Image download bad: HTTP {img_resp.status_code}, {len(img_resp.content)} bytes")
+            except Exception as e:
+                logger.warning(f"Image download failed: {e}")
+
+        # Fallback: post text only
+        if not posted:
+            try:
+                await self.bot.send_message(channel_id, post_text[:4096])
+                posted = True
+                logger.info(f"Channel: posted BMW NEWS text-only ({len(post_text)} chars) — {title[:40]}")
+            except Exception as e:
+                logger.error(f"Channel post failed: {e}")
+
+        if posted and news_id:
+            await db.mark_news_posted(news_id, title)
+        return posted
+
+    async def _partner_scheduler(self):
+        """Background task: post 1 affiliate (партнёрский) post to @bmw_mpower_club every hour."""
+        from bot.persona import CHANNEL_POST_PROMPT
+        await asyncio.sleep(300)  # start 5 min after boot
+        partner_interval = 3600  # 1 hour
+        while True:
+            try:
+                await partner_manager.refresh_if_needed()
+                if not partner_manager.campaigns:
+                    logger.info("No partner campaigns loaded — skip partner post")
+                elif config.CHANNEL_ID:
+                    campaign = random.choice(partner_manager.campaigns)
+                    post_text = await self._generate_partner_post(campaign, CHANNEL_POST_PROMPT)
+                    if post_text:
+                        channel_id = int(config.CHANNEL_ID)
+                        try:
+                            await self.bot.send_message(channel_id, post_text[:4096])
+                            logger.info(f"Partner post sent — {campaign.get('name','')[:40]}")
+                        except Exception as e:
+                            logger.error(f"Partner post failed: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Partner scheduler error: {e}")
+            await asyncio.sleep(partner_interval)
+
+    async def _generate_partner_post(self, campaign, channel_prompt):
+        """Generate an affiliate promotional post for a campaign (от имени редакции)."""
+        name = campaign.get("name", "")
+        goto = campaign.get("goto_link", "")
+        cats = campaign.get("categories", []) or []
+        regions = campaign.get("regions", []) or []
+        mood = await current_mood_descriptor()
+        prompt = (
+            f"Напиши партнёрский пост для канала @bmw_mpower_club ОТ ИМЕНИ РЕДАКЦИИ.\n\n"
+            f"Партнёр: {name}\n"
+            f"Категории: {', '.join(cats[:5])}\n"
+            f"Регионы: {', '.join(regions[:5])}\n"
+            f"Ссылка: {goto}\n\n"
+            f"СТИЛЬ (от имени редакции @bmw_mpower_club):\n"
+            f"- 400-700 символов, рекомендация партнёра от лица редакции\n"
+            f"- Что это, зачем нужно, кому пригодится, почему редакция советует\n"
+            f"- Живо, профессионально, с эмодзи (🏎️💡✅🔗)\n"
+            f"- Обязательно вставь ссылку {goto} прямо в текст\n"
+            f"- Женский род (редакция), по-русски\n"
+            f"- Настроение: {mood}\n"
+            f"- НЕ начинай с 'Маша:' или 'Редакция:'"
+        )
+        text = await ai_client.chat(
+            prompt, system=channel_prompt,
+            max_tokens=500, temperature=0.8, allow_static_fallback=False
+        )
+        if not text:
+            return None
+        text = text.strip()[:3000]
+        if goto and goto not in text:
+            text += f"\n\n🔗 {goto}"
+        if not text.endswith("#bmw_mpower_club"):
+            text += "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
+        return text
 
     async def _notify_owner(self):
         mood = await current_mood_descriptor()

@@ -176,28 +176,32 @@ class MashaBot:
 
                 logger.info(f"Fetched {len(all_items)} BMW news items")
 
-                # 2. Find up to 2 unposted news items
+                # 2. Find up to 2 unposted news items (dedup by news_id AND title fingerprint AND URL)
                 unposted = []
+                seen_titles = set()
                 for item in all_items:
                     news_id = item.get("id", "")
-                    if news_id and not await db.is_news_posted(news_id):
-                        unposted.append(item)
-                        if len(unposted) >= 2:
-                            break
+                    title = item.get("title", "")
+                    item_url = item.get("url", "")
+                    if news_id and await db.is_news_posted(news_id):
+                        continue
+                    if item_url and await db.is_news_posted(url_normalize(item_url)):
+                        continue
+                    tf = title_fingerprint(title)
+                    if tf and await db.is_news_posted(f"tf:{tf}"):
+                        continue
+                    if tf and tf in seen_titles:
+                        continue
+                    seen_titles.add(tf)
+                    unposted.append(item)
+                    if len(unposted) >= 2:
+                        break
 
                 if not unposted:
-                    # All items posted — pick random items (NO destructive reset)
-                    logger.info("All BMW news already posted — picking by URL dedup")
+                    logger.info("All BMW news already posted — picking random for AI uniquification")
                     import random as _rng
-                    for item in all_items:
-                        url = item.get("url", "")
-                        if url and not await db.is_news_posted(url_normalize(url)):
-                            unposted.append(item)
-                            if len(unposted) >= 2:
-                                break
-                    if not unposted:
-                        unposted = _rng.sample(all_items, min(2, len(all_items)))
-                        logger.info(f"URL dedup exhausted — picked {len(unposted)} random items for AI uniquification")
+                    unposted = _rng.sample(all_items, min(2, len(all_items)))
+                    logger.info(f"Picked {len(unposted)} random items for AI uniquification")
 
                 # 3. Post each item (up to 2 per cycle), with a short gap between
                 for idx, news_item in enumerate(unposted):
@@ -249,8 +253,10 @@ class MashaBot:
         translation_note = ""
         if is_english:
             translation_note = (
-                "\nВНИМАНИЕ: новость на АНГЛИЙСКОМ — ПЕРЕВЕДИ на русский и УНИКАЛИЗИРУЙ. "
-                "Не делай дословный перевод — перескажи своими словами от лица редакции.\n"
+                "\nВНИМАНИЕ: новость на АНГЛИЙСКОМ. ПЕРЕВЕДИ на русский ТОЧНО, без выдумок. "
+                "Сохраняй технические факты (модель BMW, двигатель, л.с., Н·м) как в оригинале. "
+                "НЕ придумывай характеристики которых нет в источнике. "
+                "Перескажи своими словами от лица редакции, но факты — только из новости.\n"
             )
 
         prompt = (
@@ -290,7 +296,7 @@ class MashaBot:
 
         # Text fingerprint dedup
         fp = text_fingerprint(ai_text)
-        if await db.is_news_posted(fp):
+        if await db.is_news_posted(f"fp:{fp}"):
             logger.info(f"Text fingerprint already posted — skip: {fp[:16]}")
             return False
 
@@ -341,13 +347,16 @@ class MashaBot:
             except Exception as e:
                 logger.error(f"Channel post failed: {e}")
 
-        # Mark as posted (news_id + URL + text fingerprint)
+        # Mark as posted (news_id + URL + title fingerprint + text fingerprint)
         if posted:
             if news_id:
                 await db.mark_news_posted(news_id, title)
             if url:
                 await db.mark_news_posted(url_normalize(url), title)
-            await db.mark_news_posted(fp, title)
+            tf = title_fingerprint(title)
+            if tf:
+                await db.mark_news_posted(f"tf:{tf}", title)
+            await db.mark_news_posted(f"fp:{fp}", title)
         return posted
 
     async def _build_media_group(self, image_urls, caption_full):

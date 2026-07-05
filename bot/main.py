@@ -190,6 +190,11 @@ class MashaBot:
                     tf = title_fingerprint(title)
                     if tf and await db.is_news_posted(f"tf:{tf}"):
                         continue
+                    # Topic fingerprint dedup (catches different articles about same event)
+                    topic = topic_fingerprint(title, item.get("summary", ""))
+                    if topic and len(topic) > 3 and await db.is_news_posted(f"topic:{topic}"):
+                        logger.info(f"Topic already posted — skip: {topic[:40]}")
+                        continue
                     if tf and tf in seen_titles:
                         continue
                     seen_titles.add(tf)
@@ -229,7 +234,7 @@ class MashaBot:
         import httpx
         from bot.post_utils import (smart_truncate, clean_post_text, validate_post_text,
             needs_translation, validate_image, title_fingerprint, text_fingerprint,
-            url_normalize, date_context, UNIQUIFICATION_RULES)
+            url_normalize, date_context, UNIQUIFICATION_RULES, topic_fingerprint,)
 
         title = news_item.get("title", "")
         summary = news_item.get("summary", "")
@@ -356,6 +361,10 @@ class MashaBot:
             tf = title_fingerprint(title)
             if tf:
                 await db.mark_news_posted(f"tf:{tf}", title)
+            # Mark topic fingerprint
+            topic = topic_fingerprint(title, news_item.get("summary", ""))
+            if topic and len(topic) > 3:
+                await db.mark_news_posted(f"topic:{topic}", title)
             await db.mark_news_posted(f"fp:{fp}", title)
         return posted
 

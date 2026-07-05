@@ -406,6 +406,7 @@ class MashaBot:
     async def _post_partner_campaign(self, campaign, channel_prompt):
         """Generate + post a partner campaign (with logo photo if available)."""
         import httpx
+        from bot.post_utils import clean_post_text, validate_image, smart_truncate
         name = campaign.get("name", "")
         logo = campaign.get("logo", "")
         goto = campaign.get("goto_link", "")
@@ -436,7 +437,7 @@ class MashaBot:
         if not text:
             logger.warning("Partner AI text empty — skip")
             return
-        ai_text = text.strip()
+        ai_text = clean_post_text(text)
         if goto and goto not in ai_text:
             ai_text += f"\n\n🔗 {goto}"
 
@@ -444,8 +445,8 @@ class MashaBot:
         # Try photo with logo (caption ≤1024 incl. footer)
         posted = False
         if logo:
-            caption_limit = 1024 - len(FOOTER) - 5
-            caption_full = ai_text[:caption_limit] + FOOTER
+            caption_body = smart_truncate(ai_text, 1024, len(FOOTER))
+            caption_full = caption_body + FOOTER
             try:
                 async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as img_client:
                     img_resp = await img_client.get(logo, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
@@ -462,8 +463,8 @@ class MashaBot:
 
         # Fallback: text only (≤4096 incl. footer)
         if not posted:
-            text_limit = 4096 - len(FOOTER) - 5
-            text_full = ai_text[:text_limit] + FOOTER
+            text_body = smart_truncate(ai_text, 4096, len(FOOTER))
+            text_full = text_body + FOOTER
             try:
                 await self.bot.send_message(channel_id, text_full[:4096])
                 posted = True

@@ -344,8 +344,10 @@ class MashaBot:
             try:
                 media_group = await self._build_media_group(all_images, caption_full)
                 if media_group:
-                    await self.bot.send_media_group(channel_id, media_group)
+                    msgs = await self.bot.send_media_group(channel_id, media_group)
                     posted = True
+                    if msgs:
+                        await self._react_to_own_post(channel_id, msgs[0].message_id, caption_full[:200])
                     logger.info(f"Channel: posted BMW NEWS media_group ({len(media_group)} photos) — {title[:40]}")
             except Exception as e:
                 logger.warning(f"send_media_group failed: {e}")
@@ -358,8 +360,9 @@ class MashaBot:
                 if img_resp.status_code == 200 and validate_image(img_resp.content):
                     from aiogram.types import BufferedInputFile
                     photo_file = BufferedInputFile(img_resp.content, filename="news.jpg")
-                    await self.bot.send_photo(channel_id, photo_file, caption=caption_full[:1024])
+                    msg = await self.bot.send_photo(channel_id, photo_file, caption=caption_full[:1024])
                     posted = True
+                    await self._react_to_own_post(channel_id, msg.message_id, caption_full[:200])
                     logger.info(f"Channel: posted BMW NEWS+photo (caption {len(caption_full[:1024])}) — {title[:40]}")
                 else:
                     logger.warning(f"Image validation failed: HTTP {img_resp.status_code}, {len(img_resp.content)} bytes")
@@ -369,8 +372,9 @@ class MashaBot:
         # Case C: no image → send_message
         if not posted:
             try:
-                await self.bot.send_message(channel_id, text_full[:4096])
+                msg = await self.bot.send_message(channel_id, text_full[:4096])
                 posted = True
+                await self._react_to_own_post(channel_id, msg.message_id, text_full[:200])
                 logger.info(f"Channel: posted BMW NEWS text-only ({len(text_full[:4096])} chars) — {title[:40]}")
             except Exception as e:
                 logger.error(f"Channel post failed: {e}")
@@ -515,11 +519,24 @@ class MashaBot:
             text_body = smart_truncate(body_without_goto, 4096 - len(goto_line) - len(FOOTER) - 10, 0)
             text_full = text_body + goto_line + FOOTER
             try:
-                await self.bot.send_message(channel_id, text_full[:4096])
+                msg = await self.bot.send_message(channel_id, text_full[:4096])
                 posted = True
+                await self._react_to_own_post(channel_id, msg.message_id, text_full[:200])
                 logger.info(f"Partner post sent text-only ({len(text_full)} chars) — {name[:40]}")
             except Exception as e:
                 logger.error(f"Partner post failed: {e}")
+
+    async def _react_to_own_post(self, channel_id: int, message_id: int, text: str = ""):
+        """Set 3 positive reactions on own channel post."""
+        try:
+            from bot.reactions import maybe_react
+            await maybe_react(
+                self.bot, channel_id, message_id, text,
+                prob=1.0, force=True, count=3,
+            )
+            logger.info(f"Reacted to own post: {channel_id}/{message_id}")
+        except Exception as e:
+            logger.warning(f"React to own post failed: {e}")
 
     async def _notify_owner(self):
         mood = await current_mood_descriptor()

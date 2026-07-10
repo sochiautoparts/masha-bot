@@ -155,7 +155,7 @@ class MashaBot:
         """
         from bot.persona import CHANNEL_POST_PROMPT
         from bot.post_utils import topic_fingerprint
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)  # was 120 — reduced to start posting faster after restart
         post_interval = 1200  # 20 min — 2 posts per cycle
         NEWS_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
 
@@ -423,7 +423,7 @@ class MashaBot:
         Posts WITH partner logo photo when available (caption ≤1024 incl. footer).
         """
         from bot.persona import CHANNEL_POST_PROMPT
-        await asyncio.sleep(1800)  # start 30 min after boot (prevents partner spam on restart)
+        await asyncio.sleep(600)  # 10 min after boot (prevents partner spam on restart)
         partner_interval = 7200  # 2 hours (was 1h — was too frequent with restarts)
         while True:
             try:

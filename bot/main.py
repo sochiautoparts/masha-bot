@@ -204,13 +204,13 @@ class MashaBot:
                         continue
                     seen_titles.add(tf)
                     candidates.append(item)
-                    if len(candidates) >= 8:
+                    if len(candidates) >= 12:  # was 8 — more candidates for BMW (fewer news items)
                         break
 
                 if not candidates:
                     logger.info("All BMW news already posted — picking random for AI uniquification")
                     import random as _rng
-                    candidates = _rng.sample(all_items, min(4, len(all_items)))
+                    candidates = _rng.sample(all_items, min(6, len(all_items)))
 
                 # 3. Try candidates until we post 2 (or exhaust candidates)
                 posted_count = 0

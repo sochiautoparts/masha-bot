@@ -204,13 +204,13 @@ class MashaBot:
                         continue
                     seen_titles.add(tf)
                     candidates.append(item)
-                    if len(candidates) >= 12:  # was 8 — more candidates for BMW (fewer news items)
+                    if len(candidates) >= 8:  # synced with Ася
                         break
 
                 if not candidates:
                     logger.info("All BMW news already posted — picking random for AI uniquification")
                     import random as _rng
-                    candidates = _rng.sample(all_items, min(6, len(all_items)))
+                    candidates = _rng.sample(all_items, min(4, len(all_items)))
 
                 # 3. Try candidates until we post 2 (or exhaust candidates)
                 posted_count = 0
@@ -224,7 +224,7 @@ class MashaBot:
                             posted_count += 1
                             logger.info(f"Cycle: posted BMW news {posted_count}/{target_posts}")
                             if posted_count < target_posts:
-                                await asyncio.sleep(60)
+                                await asyncio.sleep(5)  # gap between posts (synced with Ася)
                         else:
                             logger.info(f"News skipped (AI empty or validation) — trying next candidate")
                     except Exception as e:

@@ -1,8 +1,10 @@
-"""Ася AI Client — routes all AI through OpenClaw Gateway + Pollinations direct."""
+"""Маша AI Client — routes all AI through OpenClaw Gateway + Pollinations direct.
+Local Qwen2.5-0.5B model as last-resort fallback (always available)."""
 import asyncio, logging, os, random, time
 from typing import List, Optional
 import httpx
 from bot.config import config
+from ai.local_model import call_local
 
 logger = logging.getLogger("masha.ai")
 
@@ -189,7 +191,7 @@ async def _call_pollinations_get(prompt, timeout=12.0):
     except: return ""
 
 _STATIC_FALLBACKS = {
-    "greeting": ["Привет! Я Ася 😊", "Привет-привет! ☕", "Хей! Как настроение?"],
+    "greeting": ["Привет! Я Маша 😊", "Привет-привет! ☕", "Хей! Как настроение?"],
     "howareyou": ["Да нормально, спасибо ☕", "Всё ок, а у тебя?", "Живу-здравствую 😊"],
     "default": ["Хм, давай по-другому", "Интересно, расскажи подробнее?", "Поняла тебя. И что дальше?", "Окей, я с тобой. Продолжай."],
 }
@@ -214,7 +216,7 @@ async def chat(prompt, system="", extra_context="", dialog_history=None, max_tok
     if fast:
         use_get = (not extra_context) and (not dialog_history) and len(prompt) < 400
         if use_get:
-            short_persona = "Ты Маша, девушка из Москвы. Женский род всегда. Отвечай живо, кратко (2-4 предложения). По-русски. Без выдуманных фактов. Не начинай с имени."
+            short_persona = "Ты Маша, девушка из Москва. Женский род всегда. Отвечай живо, кратко (2-4 предложения). По-русски. Без выдуманных фактов. Не начинай с имени."
             embedded = f"{short_persona}\n\nВопрос: {prompt}\n\nОтвет:"
             out = await _call_pollinations_get(embedded, 12.0)
             if out:
@@ -270,6 +272,15 @@ async def chat(prompt, system="", extra_context="", dialog_history=None, max_tok
             logger.info(f"AI fallback=cloudflare ({time.time()-t0:.1f}s) len={len(out)}")
             return _strip_name_prefix(out)
 
+    # Tier-3: Local Qwen2.5-0.5B model (ALWAYS available, no network needed)
+    # This ensures posting NEVER stops even when all cloud providers fail
+    out = await call_local(messages, max_tokens, temperature)
+    logger.info(f"AI Local: {len(out) if out else 0} chars ({time.time()-t0:.1f}s)")
+    if out:
+        _stats["success"] += 1
+        logger.info(f"AI fallback=local ({time.time()-t0:.1f}s) len={len(out)}")
+        return _strip_name_prefix(out)
+
     _stats["fail"] += 1
     _stats["last_error"] = "all providers returned empty"
     if allow_static_fallback:
@@ -320,7 +331,7 @@ async def _call_cloudflare(messages, max_tokens, timeout=30.0):
 def _strip_name_prefix(text):
     if not text: return text
     import re
-    stripped = re.sub(r'^\s*Ася\s*[:,\-—]\s*', '', text, flags=re.IGNORECASE)
+    stripped = re.sub(r'^\s*Маша\s*[:,\-—]\s*', '', text, flags=re.IGNORECASE)
     stripped = re.sub(r'^\s*Ответ\s*[:,\-—]\s*', '', stripped, flags=re.IGNORECASE)
     return stripped
 

@@ -273,7 +273,7 @@ class MashaBot:
         from bot.post_quality import (
             POST_STYLE, STRUCTURED_POST_RULES, ANTI_HALLUCINATION_RULES,
             RETRY_CRITIQUE_TMPL, build_hook_avoid, parse_structured_post, quality_gate,
-            smart_hashtags, assemble_html_post, send_channel_post,
+            smart_hashtags, assemble_html_post, send_channel_post, sanitize_text,
         )
 
         style = POST_STYLE
@@ -377,10 +377,10 @@ class MashaBot:
                 await db.mark_news_posted(url_normalize(url), title)
             return False
 
-        # Defensive cleaning (markdown leftovers, name prefixes)
-        body_clean = clean_post_text(parsed["body"], "Маша")
-        headline_clean = clean_post_text(parsed["headline"], "Маша").split("\n")[0][:120]
-        question_clean = clean_post_text(parsed.get("question", ""), "Маша").split("\n")[0][:140] \
+        # Defensive cleaning (markdown leftovers, name prefixes, CJK/alfabet glitches)
+        body_clean = sanitize_text(clean_post_text(parsed["body"], "Маша"))
+        headline_clean = sanitize_text(clean_post_text(parsed["headline"], "Маша")).split("\n")[0][:120]
+        question_clean = sanitize_text(clean_post_text(parsed.get("question", ""), "Маша").split("\n")[0][:140]) \
             or style.default_question
 
         # Content validation (politics/NSFW/auto-relevance) on body

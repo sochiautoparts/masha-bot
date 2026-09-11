@@ -159,104 +159,136 @@ class MashaBot:
         except: pass
 
     async def _channel_scheduler(self):
-        """Background task: post 2 BMW news to @bmw_mpower_club every 20 min.
-        Editorial voice (от имени редакции). Posts up to 2 unposted items per cycle,
-        with a short gap between them.
+        """Background task: постинг в @bmw_mpower_club ПО МЕРЕ ПОСТУПЛЕНИЯ новостей.
+
+        Live-режим (nws обновляет bmw-news.json каждые 10 мин):
+        - источник опрашивается каждые 4 мин днём / 10 мин ночью;
+        - темп ограничен антиспам-гэпом: 15 мин между постами днём,
+          30 мин ночью (env: POST_GAP_DAY_S / POST_GAP_NIGHT_S);
+        - бэклог (после рестарта или шквала новостей) — до 3 постов за цикл
+          (env: POST_MAX_PER_CYCLE);
+        - если свежих новостей долго нет — рецикл 1 старой новости, но не
+          чаще раза в 2 часа (env: POST_RECYCLE_CYCLES / POST_RECYCLE_GAP_S).
         """
         from bot.persona import CHANNEL_POST_PROMPT
         from bot.post_utils import topic_fingerprint
-        from bot.post_quality import freshness_sort, prime_time_interval, notify_owner
+        from bot.post_quality import freshness_sort, notify_owner, _MSK
+        from datetime import datetime as _dt
+
+        def _env_int(name, default):
+            try: return int(os.getenv(name, str(default)))
+            except (TypeError, ValueError): return default
+
         await asyncio.sleep(30)  # start posting fast after restart
-        post_interval = 1200  # 20 min day / 40 min night (prime-time cadence)
         NEWS_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
         failure_streak = 0
+        last_post_ts = await db.get_last_channel_post_ts()
+        cycles_without_new = 0
 
         while True:
+            posted_count = 0
+            all_items: list = []
+            candidates: list = []
             try:
                 channel_id = int(config.CHANNEL_ID)
                 mood = await current_mood_descriptor()
+                night = 1 <= _dt.now(_MSK).hour < 8
+                min_gap = _env_int("POST_GAP_NIGHT_S", 1800) if night else _env_int("POST_GAP_DAY_S", 900)
+                max_per_cycle = max(1, _env_int("POST_MAX_PER_CYCLE", 3))
 
-                # 1. Fetch bmw-news.json
+                # Темп-бюджет: сколько постов «накопилось» с прошлого поста
+                now = time.time()
+                if last_post_ts <= 0:
+                    budget = max_per_cycle  # после старта отдаём бэклог
+                else:
+                    budget = min(int((now - last_post_ts) // min_gap), max_per_cycle)
+
+                # 1. Fetch bmw-news.json (nws tier1 обновляет его каждые 10 мин)
                 import httpx
                 async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                     resp = await client.get(NEWS_URL, headers={"User-Agent": "MashaBot/1.0"})
                 if resp.status_code != 200:
                     logger.warning(f"News fetch failed: HTTP {resp.status_code}")
-                    await asyncio.sleep(post_interval)
-                    continue
+                else:
+                    all_items = (resp.json() or {}).get("items", [])
+                    if not all_items:
+                        logger.warning("No news items in bmw-news.json")
+                    else:
+                        logger.info(f"Fetched {len(all_items)} BMW news items")
 
-                news_data = resp.json()
-                all_items = news_data.get("items", [])
-                if not all_items:
-                    logger.warning("No news items in bmw-news.json")
-                    await asyncio.sleep(post_interval)
-                    continue
+                        # Freshness-first: newest BMW news first, stale (>5 days) last
+                        all_items = freshness_sort(all_items, max_age_days=5.0, min_keep=4)
 
-                logger.info(f"Fetched {len(all_items)} BMW news items")
+                        # Dedup by news_id AND URL AND title/topic fingerprint
+                        seen_titles = set()
+                        for item in all_items:
+                            news_id = item.get("id", "")
+                            title = item.get("title", "")
+                            item_url = item.get("url", "")
+                            if news_id and await db.is_news_posted(news_id):
+                                continue
+                            if item_url and await db.is_news_posted(url_normalize(item_url)):
+                                continue
+                            tf = title_fingerprint(title)
+                            if tf and await db.is_news_posted(f"tf:{tf}"):
+                                continue
+                            topic = topic_fingerprint(title, item.get("summary", ""))
+                            if topic and len(topic.split()) >= 2 and await db.is_news_posted(f"topic:{topic}"):
+                                logger.info(f"Topic already posted — skip: {topic[:40]}")
+                                continue
+                            if tf and tf in seen_titles:
+                                continue
+                            seen_titles.add(tf)
+                            candidates.append(item)
+                            if len(candidates) >= 12:
+                                break
 
-                # 1.5 Freshness-first: newest BMW news first, stale (>5 days) last
-                all_items = freshness_sort(all_items, max_age_days=5.0, min_keep=4)
+                if candidates:
+                    cycles_without_new = 0
+                else:
+                    cycles_without_new += 1
+                    # Рецикл старой новости — только если свежих давно не было
+                    if (cycles_without_new >= _env_int("POST_RECYCLE_CYCLES", 15)
+                            and time.time() - max(last_post_ts, 0) >= _env_int("POST_RECYCLE_GAP_S", 7200)
+                            and all_items):
+                        candidates = random.sample(all_items, min(3, len(all_items)))
+                        budget = 1
+                        logger.info("No fresh news for a while — recycling 1 older story")
 
-                # 2. Find up to 8 candidate news items (retry if AI empty/validation fail)
-                candidates = []
-                seen_titles = set()
-                for item in all_items:
-                    news_id = item.get("id", "")
-                    title = item.get("title", "")
-                    item_url = item.get("url", "")
-                    if news_id and await db.is_news_posted(news_id):
-                        continue
-                    if item_url and await db.is_news_posted(url_normalize(item_url)):
-                        continue
-                    tf = title_fingerprint(title)
-                    if tf and await db.is_news_posted(f"tf:{tf}"):
-                        continue
-                    topic = topic_fingerprint(title, item.get("summary", ""))
-                    if topic and len(topic.split()) >= 2 and await db.is_news_posted(f"topic:{topic}"):
-                        logger.info(f"Topic already posted — skip: {topic[:40]}")
-                        continue
-                    if tf and tf in seen_titles:
-                        continue
-                    seen_titles.add(tf)
-                    candidates.append(item)
-                    if len(candidates) >= 8:  # synced with Ася
-                        break
-
-                if not candidates:
-                    logger.info("All BMW news already posted — picking random for AI uniquification")
-                    import random as _rng
-                    candidates = _rng.sample(all_items, min(4, len(all_items)))
-
-                # 3. Try candidates until we post 2 (or exhaust candidates)
-                posted_count = 0
-                target_posts = 2
-                for news_item in candidates:
-                    if posted_count >= target_posts:
-                        break
-                    try:
-                        posted = await self._post_news_item(news_item, mood, channel_id, CHANNEL_POST_PROMPT)
-                        if posted:
-                            posted_count += 1
-                            logger.info(f"Cycle: posted BMW news {posted_count}/{target_posts}")
-                            if posted_count < target_posts:
-                                await asyncio.sleep(5)  # gap between posts (synced with Ася)
-                        else:
-                            logger.info(f"News skipped (AI empty or validation) — trying next candidate")
-                    except Exception as e:
-                        logger.error(f"Post news item error: {e}")
-                logger.info(f"Cycle complete: posted {posted_count}/{target_posts} from {len(candidates)} candidates")
+                target = min(budget, len(candidates))
+                if target > 0:
+                    for news_item in candidates:
+                        if posted_count >= target:
+                            break
+                        try:
+                            posted = await self._post_news_item(news_item, mood, channel_id, CHANNEL_POST_PROMPT)
+                            if posted:
+                                posted_count += 1
+                                last_post_ts = time.time()
+                                await db.set_last_channel_post_ts(last_post_ts)
+                                if posted_count < target:
+                                    await asyncio.sleep(20)  # gap внутри пачки (synced with Ася)
+                            else:
+                                logger.info("News skipped (AI empty or validation) — trying next candidate")
+                        except Exception as e:
+                            logger.error(f"Post news item error: {e}")
+                    logger.info(f"Cycle complete: posted {posted_count}/{target} "
+                                f"({'recycled' if cycles_without_new >= _env_int('POST_RECYCLE_CYCLES', 15) and len(candidates) <= 3 and budget == 1 else 'fresh'})")
+                elif candidates:
+                    logger.info(f"{len(candidates)} fresh candidates — rate gap not elapsed yet "
+                                f"(next post in ~{int(min_gap - (time.time() - last_post_ts))}s)")
 
                 # Failure streak → alert owner (rate-limited)
-                if posted_count == 0:
+                if posted_count == 0 and candidates and budget > 0:
                     failure_streak += 1
                     if failure_streak >= 3:
                         await notify_owner(
                             self.bot,
-                            f"Маша: 3 цикла подряд без постов в канал @bmw_mpower_club. "
-                            f"Последний цикл: {len(candidates)} кандидатов, 0 опубликовано. "
+                            f"Маша: 3 цикла подряд 0 постов при наличии кандидатов в @bmw_mpower_club. "
+                            f"Последний цикл: {len(candidates)} кандидатов. "
                             f"Проверь логи GitHub Actions.", min_gap_s=7200)
                         failure_streak = 0
-                else:
+                elif posted_count > 0:
                     failure_streak = 0
 
             except asyncio.CancelledError:
@@ -264,9 +296,9 @@ class MashaBot:
             except Exception as e:
                 logger.error(f"Channel scheduler error: {e}")
 
-            # Prime-time cadence: 20 min day / 40 min night (01:00-08:00 MSK)
-            post_interval = prime_time_interval(day_s=1200, night_s=2400)
-            await asyncio.sleep(post_interval)
+            # Live polling: 4 min day / 10 min night (source refreshes every 10 min)
+            night = 1 <= _dt.now(_MSK).hour < 8
+            await asyncio.sleep(_env_int("POST_POLL_NIGHT_S", 600) if night else _env_int("POST_POLL_DAY_S", 240))
 
     async def _post_news_item(self, news_item, mood, channel_id, channel_prompt):
         """Post a single news item to channel (editorial quality pipeline v2).

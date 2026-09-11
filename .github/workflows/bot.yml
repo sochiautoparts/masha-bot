@@ -31,7 +31,7 @@ jobs:
           | python3 -c "import sys,json;current=int(sys.argv[1]);d=json.load(sys.stdin);others=[r for r in d.get('workflow_runs',[]) if r['id']!=current and r['path']=='.github/workflows/bot.yml' and r['status'] in ('in_progress','queued','waiting','pending')];print(len(others))" ${{ github.run_id }});
           if [ "$ACTIVE" -gt 0 ]; then echo "Another bot.yml run is active/queued ($ACTIVE) — skipping."; exit 0; else echo "No other runs — proceeding."; fi
 
-
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python

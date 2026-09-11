@@ -155,9 +155,11 @@ class MashaBot:
         """
         from bot.persona import CHANNEL_POST_PROMPT
         from bot.post_utils import topic_fingerprint
-        await asyncio.sleep(30)  # was 120 — reduced to start posting faster after restart
-        post_interval = 1200  # 20 min — 2 posts per cycle
+        from bot.post_quality import freshness_sort, prime_time_interval, notify_owner
+        await asyncio.sleep(30)  # start posting fast after restart
+        post_interval = 1200  # 20 min day / 40 min night (prime-time cadence)
         NEWS_URL = "https://raw.githubusercontent.com/sochiautoparts/nws/main/data/bmw-news.json"
+        failure_streak = 0
 
         while True:
             try:
@@ -181,6 +183,9 @@ class MashaBot:
                     continue
 
                 logger.info(f"Fetched {len(all_items)} BMW news items")
+
+                # 1.5 Freshness-first: newest BMW news first, stale (>5 days) last
+                all_items = freshness_sort(all_items, max_age_days=5.0, min_keep=4)
 
                 # 2. Find up to 8 candidate news items (retry if AI empty/validation fail)
                 candidates = []
@@ -231,25 +236,49 @@ class MashaBot:
                         logger.error(f"Post news item error: {e}")
                 logger.info(f"Cycle complete: posted {posted_count}/{target_posts} from {len(candidates)} candidates")
 
+                # Failure streak → alert owner (rate-limited)
+                if posted_count == 0:
+                    failure_streak += 1
+                    if failure_streak >= 3:
+                        await notify_owner(
+                            self.bot,
+                            f"Маша: 3 цикла подряд без постов в канал @bmw_mpower_club. "
+                            f"Последний цикл: {len(candidates)} кандидатов, 0 опубликовано. "
+                            f"Проверь логи GitHub Actions.", min_gap_s=7200)
+                        failure_streak = 0
+                else:
+                    failure_streak = 0
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Channel scheduler error: {e}")
 
+            # Prime-time cadence: 20 min day / 40 min night (01:00-08:00 MSK)
+            post_interval = prime_time_interval(day_s=1200, night_s=2400)
             await asyncio.sleep(post_interval)
 
     async def _post_news_item(self, news_item, mood, channel_id, channel_prompt):
-        """Post a single BMW news item to channel with photo (editorial voice). Returns True if posted.
+        """Post a single news item to channel (editorial quality pipeline v2).
 
-        Full pipeline: translate (if EN) → AI generate → clean → validate → smart truncate → post.
+        Pipeline: freshness → structured AI generation (ЗАГОЛОВОК/ТЕКСТ/ВОПРОС/ХЭШТЕГИ)
+        → quality gate (+1 retry with critique) → clean/validate → HTML assembly
+        (bold headline + bold specs + italic question) → send with HTML→plain fallback
+        → dedup marks + hook memory (anti-repetition).
         """
         import httpx
         from bot.post_utils import (smart_truncate, clean_post_text, validate_post_text,
             needs_translation, validate_image, title_fingerprint, text_fingerprint,
-            url_normalize, date_context, UNIQUIFICATION_RULES, topic_fingerprint,)
+            url_normalize, date_context, UNIQUIFICATION_RULES, topic_fingerprint)
+        from bot.post_quality import (
+            POST_STYLE, STRUCTURED_POST_RULES, ANTI_HALLUCINATION_RULES,
+            RETRY_CRITIQUE_TMPL, build_hook_avoid, parse_structured_post, quality_gate,
+            smart_hashtags, assemble_html_post, send_channel_post,
+        )
 
+        style = POST_STYLE
         title = news_item.get("title", "")
-        summary = news_item.get("summary", "")
+        summary = news_item.get("summary", "") or ""
         url = news_item.get("url", "")
         image_url = news_item.get("image", "")
         images_list = news_item.get("images", []) or []
@@ -257,54 +286,107 @@ class MashaBot:
         all_images = [u for u in all_images if u][:10]
         news_id = news_item.get("id", "")
 
-        # URL dedup
+        # URL dedup: skip if this URL was already posted
         if url:
             url_key = url_normalize(url)
             if url_key and await db.is_news_posted(url_key):
                 logger.info(f"URL already posted — skip: {url_key[:50]}")
                 return False
 
-        logger.info(f"Selected BMW news: {title[:60]} (imgs: {len(all_images)}, lang: {'EN' if needs_translation(title, summary) else 'RU'})")
+        logger.info(f"Selected news: {title[:60]} (imgs: {len(all_images)}, lang: {'EN' if needs_translation(title, summary) else 'RU'})")
 
+        # Language handling
         is_english = needs_translation(title, summary)
         translation_note = ""
         if is_english:
             translation_note = "\nНовость на английском — переведи на русский и перескажи от лица редакции.\n"
 
+        # Anti-repetition: forbid recent openings
+        try:
+            hooks = await db.get_recent_hooks(8)
+        except Exception:
+            hooks = []
+        hook_note = build_hook_avoid(hooks)
+
+        # Structured editorial prompt
         prompt = (
-            f"Напиши пост для канала @bmw_mpower_club с комментарием на эту BMW-новость.\n\n"
+            f"Напиши пост для канала {style.channel} с разбором этой авто-новости.\n\n"
             f"Контекст: {date_context()}, настроение: {mood}\n\n"
             f"Заголовок новости: {title}\n"
-            f"Краткое содержание: {summary[:300]}\n"
-            f"{translation_note}"
-            f"ВАЖНО: НИКОГДА не отказывайся писать. Если не знаешь деталей — придумай правдоподобный комментарий. НЕ пиши нет информации. Просто напиши пост.\n"
-            f"\n"
-            f"СТИЛЬ:\n"
-            f"- 600-900 символов, BMW M-разбор\n"
-            f"- Эмодзи: \U0001f3ce\U0001f525\U0001f4aa\U0001f3c1\u2728\n"
-            f"- Технические: двигатели, л.с., Н·м\n"
-            f"- Женский род, по-русски, БЕЗ грамматических ошибок\n"
-            f"- НЕ ссылки, НЕ 'Маша:'"
-        )
-        ai_commentary = await ai_client.chat(
-            prompt, system=channel_prompt,
-            max_tokens=800, temperature=0.9, allow_static_fallback=False, prefer_pollinations=True
+            f"Краткое содержание: {summary[:900]}\n"
+            f"{translation_note}\n"
+            f"{STRUCTURED_POST_RULES}\n\n"
+            f"{ANTI_HALLUCINATION_RULES}\n\n"
+            f"{UNIQUIFICATION_RULES}\n\n"
+            f"{hook_note}\n\n"
+            f"СТИЛЬ (ОТ ИМЕНИ РЕДАКЦИИ {style.channel}): живой экспертный разбор, "
+            f"технические детали (л.с., Н·м, км/ч), эмодзи умеренно, женский род, "
+            f"по-русски, БЕЗ грамматических ошибок. "
+            f"НЕ начинай с 'Маша:' или 'Редакция:'."
         )
 
-        if not ai_commentary:
-            logger.warning("AI commentary empty — will retry this news next cycle")
-            # DON'T mark as posted — allow retry next cycle
-            # The scheduler tries up to 8 candidates, so it moves to next news anyway
+        raw = await ai_client.chat(
+            prompt, system=channel_prompt,
+            max_tokens=900, temperature=0.75, allow_static_fallback=False, prefer_pollinations=True
+        )
+        parsed = parse_structured_post(raw)
+        if parsed:
+            ok, reason = quality_gate(parsed)
+        else:
+            ok, reason = False, "unparseable"
+
+        # One retry with critique if quality gate failed
+        if not ok and raw:
+            logger.info(f"Quality gate FAILED ({reason}) — retry with critique: {title[:40]}")
+            retry_prompt = (
+                RETRY_CRITIQUE_TMPL.format(reason=reason, prev=raw[:1200])
+                + "\n\nИсходное задание:\n" + prompt
+            )
+            raw2 = await ai_client.chat(
+                retry_prompt, system=channel_prompt,
+                max_tokens=900, temperature=0.7, allow_static_fallback=False, prefer_pollinations=True
+            )
+            parsed2 = parse_structured_post(raw2)
+            if parsed2:
+                ok2, reason2 = quality_gate(parsed2)
+                if ok2:
+                    parsed, ok, reason = parsed2, True, "ok"
+
+        if parsed and not ok:
+            logger.info(f"Gate failed ({reason}) — trying minimal fixes")
+            # Мягкие фиксы: дефолтный вопрос/авто-хештеги уже подставятся ниже
+            if reason == "no_question":
+                parsed["question"] = ""
+                ok, reason = True, "fixed_no_question"
+        if not parsed and raw:
+            # Fallback: модель проигнорировала формат — используем текст как body (legacy path)
+            import re as _re
+            fallback_body = clean_post_text(raw, "Маша")
+            fallback_body = fallback_body.split("ХЭШТЕГИ")[0].strip()
+            if len(fallback_body) >= 280:
+                first_sent = _re.split(r"(?<=[.!?])" + chr(92) + "s+", fallback_body)[0][:110].strip()
+                parsed = {"headline": first_sent or title[:90], "body": fallback_body,
+                          "question": "", "hashtags": []}
+                ok, reason = True, "fallback_plain"
+        if not parsed or not ok:
+            logger.warning(f"Quality pipeline failed ({reason}) — skip news: {title[:40]}")
+            # Mark as posted so scheduler moves to next news (no infinite loop)
+            if news_id:
+                await db.mark_news_posted(news_id, title)
+            if url:
+                await db.mark_news_posted(url_normalize(url), title)
             return False
 
-        # Clean AI output
-        ai_text = clean_post_text(ai_commentary, "Маша")
+        # Defensive cleaning (markdown leftovers, name prefixes)
+        body_clean = clean_post_text(parsed["body"], "Маша")
+        headline_clean = clean_post_text(parsed["headline"], "Маша").split("\n")[0][:120]
+        question_clean = clean_post_text(parsed.get("question", ""), "Маша").split("\n")[0][:140] \
+            or style.default_question
 
-        # Validate (politics/NSFW/BMW-relevance)
-        is_valid, reason = validate_post_text(ai_text)
+        # Content validation (politics/NSFW/auto-relevance) on body
+        is_valid, vreason = validate_post_text(f"{headline_clean}\n{body_clean}")
         if not is_valid:
-            logger.warning(f"Post validation FAILED ({reason}) — marking as skipped: {title[:40]}")
-            # Mark as posted so scheduler moves to next news
+            logger.warning(f"Post validation FAILED ({vreason}) — skip: {title[:40]}")
             if news_id:
                 await db.mark_news_posted(news_id, title)
             if url:
@@ -312,64 +394,32 @@ class MashaBot:
             return False
 
         # Text fingerprint dedup
-        fp = text_fingerprint(ai_text)
+        fp = text_fingerprint(body_clean)
         if await db.is_news_posted(f"fp:{fp}"):
             logger.info(f"Text fingerprint already posted — skip: {fp[:16]}")
             return False
 
-        # Footer
-        FOOTER = "\n\nАвтор @asmasha_bot\n@bmw_mpower_club\n#bmw_mpower_club"
+        # Hashtags: AI-proposed or auto-picked + channel tag
+        hashtags = parsed.get("hashtags") or smart_hashtags(
+            f"{title} {summary}", style.hashtag_map, style.default_hashtags)
+        channel_tag = "#bmw_mpower_club"
+        if channel_tag not in hashtags:
+            hashtags = (hashtags + [channel_tag])[:4]
 
-        # Smart truncate
-        caption_body = smart_truncate(ai_text, 1024, len(FOOTER))
-        text_body = smart_truncate(ai_text, 4096, len(FOOTER))
-        caption_full = caption_body + FOOTER
-        text_full = text_body + FOOTER
+        # Assemble HTML post (bold headline/specs, italic question)
+        html_post, plain_post = assemble_html_post(
+            headline_clean, body_clean, question_clean, hashtags,
+            footer=style.footer, headline_emoji=style.headline_emoji)
 
-        posted = False
+        # Send (media group / photo / text, HTML→plain fallback inside)
+        sent_msg = await send_channel_post(self.bot, channel_id, html_post, plain_post,
+                                           all_images, log=logger)
+        posted = bool(sent_msg)
 
-        # Case A: 2+ images → send_media_group
-        if len(all_images) >= 2:
-            try:
-                media_group = await self._build_media_group(all_images, caption_full)
-                if media_group:
-                    msgs = await self.bot.send_media_group(channel_id, media_group)
-                    posted = True
-                    if msgs:
-                        await self._react_to_own_post(channel_id, msgs[0].message_id, caption_full[:200])
-                    logger.info(f"Channel: posted BMW NEWS media_group ({len(media_group)} photos) — {title[:40]}")
-            except Exception as e:
-                logger.warning(f"send_media_group failed: {e}")
-
-        # Case B: exactly 1 image → send_photo
-        if not posted and len(all_images) == 1:
-            try:
-                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as img_client:
-                    img_resp = await img_client.get(all_images[0], headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-                if img_resp.status_code == 200 and validate_image(img_resp.content):
-                    from aiogram.types import BufferedInputFile
-                    photo_file = BufferedInputFile(img_resp.content, filename="news.jpg")
-                    msg = await self.bot.send_photo(channel_id, photo_file, caption=caption_full[:1024])
-                    posted = True
-                    await self._react_to_own_post(channel_id, msg.message_id, caption_full[:200])
-                    logger.info(f"Channel: posted BMW NEWS+photo (caption {len(caption_full[:1024])}) — {title[:40]}")
-                else:
-                    logger.warning(f"Image validation failed: HTTP {img_resp.status_code}, {len(img_resp.content)} bytes")
-            except Exception as e:
-                logger.warning(f"Image download failed: {e}")
-
-        # Case C: no image → send_message
-        if not posted:
-            try:
-                msg = await self.bot.send_message(channel_id, text_full[:4096])
-                posted = True
-                await self._react_to_own_post(channel_id, msg.message_id, text_full[:200])
-                logger.info(f"Channel: posted BMW NEWS text-only ({len(text_full[:4096])} chars) — {title[:40]}")
-            except Exception as e:
-                logger.error(f"Channel post failed: {e}")
-
-        # Mark as posted (news_id + URL + title fingerprint + text fingerprint)
         if posted:
+            logger.info(f"Channel: posted QUALITY post ({len(plain_post)} chars, "
+                        f"tags={','.join(hashtags)}) — {title[:40]}")
+            # Mark as posted (news_id + URL + title fingerprint + topic + text fingerprint)
             if news_id:
                 await db.mark_news_posted(news_id, title)
             if url:
@@ -377,11 +427,19 @@ class MashaBot:
             tf = title_fingerprint(title)
             if tf:
                 await db.mark_news_posted(f"tf:{tf}", title)
-            # Mark topic fingerprint
-            topic = topic_fingerprint(title, news_item.get("summary", ""))
+            topic = topic_fingerprint(title, summary)
             if topic and len(topic.split()) >= 2:
                 await db.mark_news_posted(f"topic:{topic}", title)
             await db.mark_news_posted(f"fp:{fp}", title)
+            # Reactions on own post (best-effort)
+            try:
+                first_msg = sent_msg[0] if isinstance(sent_msg, list) else sent_msg
+                if first_msg and getattr(first_msg, "message_id", None):
+                    await self._react_to_own_post(channel_id, first_msg.message_id, plain_post[:200])
+            except Exception as e:
+                logger.debug(f"react_to_own_post failed: {e}")
+            # Hook memory for anti-repetition
+            await db.save_hook(plain_post[:70])
         return posted
 
     async def _build_media_group(self, image_urls, caption_full):

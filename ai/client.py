@@ -336,7 +336,7 @@ async def chat(prompt, system="", extra_context="", dialog_history=None, max_tok
         # Fast mode: Pollinations first (quick), then cloud, then local last resort
         use_get = (not extra_context) and (not dialog_history) and len(prompt) < 400
         if use_get:
-            short_persona = "Ты Маша, девушка из Москва. Женский род всегда. Отвечай живо, кратко (2-4 предложения). По-русски. Без выдуманных фактов. Не начинай с имени."
+            short_persona = "Ты Маша, девушка из Москвы. Женский род всегда. Отвечай живо, кратко (2-4 предложения). По-русски. Без выдуманных фактов. Не начинай с имени."
             embedded = f"{short_persona}\n\nВопрос: {prompt}\n\nОтвет:"
             out = await _call_pollinations_get(embedded, 12.0)
             if out:

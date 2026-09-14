@@ -145,6 +145,8 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          BOT_USERNAME: ${{ secrets.BOT_USERNAME }}
           GH_PAT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           OPENCLAW_PORT: "18789"

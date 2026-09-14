@@ -196,7 +196,7 @@ _BMW_KEYWORDS = [
     "e30", "e36", "e46", "e39", "e60", "f10", "g30",
     "дрифт", "трек", "кольцо", "гоночн",
     "л.с.", "км/ч", "н·м", "ньютон", "турбо",
-    "запчаст", "сервис", "то", "масл",
+    "запчаст", "сервис", "масл",
     "bimmer", "bimmercode", "m division", "m-division",
     "carbon", "карбон", "akrapovic", "akrapovič",
     "xdrive", "rear-wheel", "задний привод",
@@ -342,8 +342,6 @@ _TOPIC_ENTITIES = [
     "alpina", "b58", "s63", "n55",
     # Events
     "norisring", "dtm", "нюрбургринг", "nurburgring",
-    # Furniture brands (Даша)
-    "kerama", "marazzi", "ikea", "misladen",
 ]
 
 

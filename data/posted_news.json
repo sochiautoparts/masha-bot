@@ -1,16 +1,4 @@
 {
-  "b1": {
-    "title": "G-Power BMW M5 Touring mit 900 PS",
-    "ts": 1789126177
-  },
-  "example.com/gpower-m5": {
-    "title": "G-Power BMW M5 Touring mit 900 PS",
-    "ts": 1789126177
-  },
-  "tf:gpower bmw touring mit 900": {
-    "title": "G-Power BMW M5 Touring mit 900 PS",
-    "ts": 1789126177
-  },
   "fp:3277b3171f05accbf6494e7f1b5bb746": {
     "title": "G-Power BMW M5 Touring mit 900 PS",
     "ts": 1789126177
@@ -1571,10 +1559,6 @@
     "title": "BMW Takes iX5 Hydrogen One Step Closer to Production",
     "ts": 1789593294
   },
-  "topic:ix5 x5": {
-    "title": "2027 BMW iX5 In Frozen Tanzanite Blue Spotted In Tennessee",
-    "ts": 1790143093
-  },
   "fp:fee35b763ecd96ebafe767738ce7fa9e": {
     "title": "BMW Takes iX5 Hydrogen One Step Closer to Production",
     "ts": 1789593294
@@ -2879,6 +2863,10 @@
     "title": "Only Two BMW X5s Ever Got a Six-Speed Manual",
     "ts": 1790128140
   },
+  "topic:ix5 x5": {
+    "title": "2027 BMW iX5 In Frozen Tanzanite Blue Spotted In Tennessee",
+    "ts": 1790143093
+  },
   "25cd55dcaa62dae4": {
     "title": "2027 BMW iX5 In Frozen Tanzanite Blue Spotted In Tennessee",
     "ts": 1790143093
@@ -3070,10 +3058,6 @@
   "autoexpress.co.uk/bmw/370507/new-bmw-100-jahre-nurburgring-range-could-include-manual-m3-and-m4": {
     "title": "New BMW 100 Jahre Nurburgring range could include a manual M3 and M4",
     "ts": 1790192214
-  },
-  "tf:new bmw 100 jahre nurburgring": {
-    "title": "New BMW 100 Jahre Nurburgring range - pictures",
-    "ts": 1790260455
   },
   "topic:m3 m4 nurburgring": {
     "title": "New BMW 100 Jahre Nurburgring range could include a manual M3 and M4",
@@ -3374,6 +3358,10 @@
   "bmwblog.com/2026/09/24/bmw-m3-electric-throws-tail-new-spy-video": {
     "title": "BMW M3 Electric Loves To Throw Its Tail Out In New Spy Video",
     "ts": 1790253959
+  },
+  "tf:new bmw 100 jahre nurburgring": {
+    "title": "New BMW 100 Jahre Nurburgring range - pictures",
+    "ts": 1790260455
   },
   "cfdadb15ef13dbc0": {
     "title": "New BMW 100 Jahre Nurburgring range - pictures",
@@ -3986,5 +3974,29 @@
   "topspeed.com/forgotten-lexus-changed-luxury-sedan-game": {
     "title": "The Forgotten Lexus That Changed The Luxury-Sedan Game",
     "ts": 1790432045
+  },
+  "fdb65690ac0223db": {
+    "title": "BMW’s Award-Winning V8 Became a Used-Car Trap. Here’s Why",
+    "ts": 1790440088
+  },
+  "bmwblog.com/2026/09/26/bmw-n62-v8-engine-reliability-problems-tuning-guide": {
+    "title": "BMW’s Award-Winning V8 Became a Used-Car Trap. Here’s Why",
+    "ts": 1790440088
+  },
+  "c150f5b27d9e536b": {
+    "title": "Audi Wants To Be A Tech Innovator, But BMW And Mercedes Are Dominating",
+    "ts": 1790444535
+  },
+  "carbuzz.com/audi-tech-patent-scorecard": {
+    "title": "Audi Wants To Be A Tech Innovator, But BMW And Mercedes Are Dominating",
+    "ts": 1790444535
+  },
+  "tf:audi wants tech innovator but": {
+    "title": "Audi Wants To Be A Tech Innovator, But BMW And Mercedes Are Dominating",
+    "ts": 1790444535
+  },
+  "fp:9ee02b574548f93a6ca8c3ad65d65c9f": {
+    "title": "Audi Wants To Be A Tech Innovator, But BMW And Mercedes Are Dominating",
+    "ts": 1790444535
   }
 }

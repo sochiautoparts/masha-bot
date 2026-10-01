@@ -352,6 +352,12 @@ class MashaBot:
         hook_note = build_hook_avoid(hooks)
 
         # Structured editorial prompt
+        # Telegram: подпись к фото ≤1024 симв. С картинками просим компактный текст,
+        # чтобы вопрос/хештеги/подпись гарантированно поместились без обрезки.
+        length_hint = (
+            "ТЕКСТ: 400-650 символов — пост пойдёт с фото, длинный текст не поместится."
+            if all_images else "ТЕКСТ: 500-900 символов."
+        )
         prompt = (
             f"Напиши пост для канала {style.channel} с разбором этой авто-новости.\n\n"
             f"Контекст: {date_context()}, настроение: {mood}\n\n"
@@ -365,6 +371,7 @@ class MashaBot:
             f"СТИЛЬ (ОТ ИМЕНИ РЕДАКЦИИ {style.channel}): живой экспертный разбор, "
             f"технические детали (л.с., Н·м, км/ч), эмодзи умеренно, женский род, "
             f"по-русски, БЕЗ грамматических ошибок. "
+            f"{length_hint}"
             f"ЗАГОЛОВОК пиши ТОЛЬКО по-русски — никогда не копируй исходный заголовок "
             f"дословно, если он не на русском. "
             f"НЕ начинай с 'Маша:' или 'Редакция:'."
@@ -484,10 +491,13 @@ class MashaBot:
         if channel_tag not in hashtags:
             hashtags = (hashtags + [channel_tag])[:4]
 
-        # Assemble HTML post (bold headline/specs, italic question)
+        # Assemble HTML post (bold headline/specs, italic question).
+        # С изображениями пост пойдёт КАПЦИЕЙ (лимит Telegram 1024) — ужмём body
+        # ЗАРАНЕЕ по границе предложения, сохранив вопрос/хештеги/подпись целиком.
         html_post, plain_post = assemble_html_post(
             headline_clean, body_clean, question_clean, hashtags,
-            footer=style.footer, headline_emoji=style.headline_emoji)
+            footer=style.footer, headline_emoji=style.headline_emoji,
+            caption_limit=1024 if all_images else 0)
 
         # Send (media group / photo / text, HTML→plain fallback inside)
         sent_msg = await send_channel_post(self.bot, channel_id, html_post, plain_post,

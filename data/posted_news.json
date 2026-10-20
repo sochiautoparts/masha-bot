@@ -1,44 +1,4 @@
 {
-  "tf:black trim big wheels more": {
-    "title": "Black Trim, Big Wheels, More Power: New BMW X3 Scares Audi Q5 Into Submission",
-    "ts": 1791238587
-  },
-  "fp:b69f5c0ab3273671e4edf49b2db7468a": {
-    "title": "Black Trim, Big Wheels, More Power: New BMW X3 Scares Audi Q5 Into Submission",
-    "ts": 1791238587
-  },
-  "c9bffb06bfa01b1b": {
-    "title": "Alemana, de marca premium, buena, bonita y barata, así es la jugada maestra de BMW en los tiempos del aluvión de las motos chinas",
-    "ts": 1791239050
-  },
-  "diariomotor.com/noticia/bmw-f-450-r-buena-bonita-barata": {
-    "title": "Alemana, de marca premium, buena, bonita y barata, así es la jugada maestra de BMW en los tiempos del aluvión de las motos chinas",
-    "ts": 1791239050
-  },
-  "tf:alemana marca premium buena bonita": {
-    "title": "Alemana, de marca premium, buena, bonita y barata, así es la jugada maestra de BMW en los tiempos del aluvión de las motos chinas",
-    "ts": 1791239050
-  },
-  "fp:f0ee5a8983885413a0ec4351f119bbb4": {
-    "title": "Alemana, de marca premium, buena, bonita y barata, así es la jugada maestra de BMW en los tiempos del aluvión de las motos chinas",
-    "ts": 1791239050
-  },
-  "376f27b433a6e261": {
-    "title": "BMW Opens New €1 Billion Battery Plant in Germany to Supply New BMW i3",
-    "ts": 1791239250
-  },
-  "electriccarsreport.com/2026/10/bmw-opens-new-e1-billion-battery-plant-in-germany-to-supply-new-bmw-i3": {
-    "title": "BMW Opens New €1 Billion Battery Plant in Germany to Supply New BMW i3",
-    "ts": 1791239250
-  },
-  "tf:bmw opens new billion battery": {
-    "title": "BMW Opens New €1 Billion Battery Plant in Germany to Supply New BMW i3",
-    "ts": 1791239250
-  },
-  "fp:b56662627d6f908c2009427cde9e0ec7": {
-    "title": "BMW Opens New €1 Billion Battery Plant in Germany to Supply New BMW i3",
-    "ts": 1791239250
-  },
   "ec34815dedde2dea": {
     "title": "Neue Klasse ganz in Schwarz: BMW i3 M Sport NA0 kommt im Handel an",
     "ts": 1791241452
@@ -3731,10 +3691,6 @@
     "title": "Someone Just Paid $477,000 For This Insane Volkswagen-Powered BMW M5",
     "ts": 1792346288
   },
-  "topic:ix5 x5": {
-    "title": "The BMW iX5 Gets A Range Boost Ahead Of U.S. Launch",
-    "ts": 1792354161
-  },
   "6bffe2a24ab8ae08": {
     "title": "The BMW iX5 Gets A Range Boost Ahead Of U.S. Launch",
     "ts": 1792354161
@@ -3998,5 +3954,49 @@
   "jalopnik.com/2290630/cross-section-of-108000-dollar-cars-vast-and-strange": {
     "title": "The Cross-Section Of $108,000 Cars Is Vast And Strange",
     "ts": 1792441538
+  },
+  "topic:ix5 x5": {
+    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
+    "ts": 1792447102
+  },
+  "278b2a719f8b0bde": {
+    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
+    "ts": 1792447102
+  },
+  "bmwblog.com/2026/10/17/bmw-ix5-range-estimate-jumps-to-450-miles": {
+    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
+    "ts": 1792447102
+  },
+  "tf:bmw ix5 range estimate jumps": {
+    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
+    "ts": 1792447102
+  },
+  "fp:15257e079401df4b5b9bca7c25122f71": {
+    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
+    "ts": 1792447102
+  },
+  "3e14bb39bb658cf3": {
+    "title": "Nine Million Cars Since The E30: BMW’s Regensburg Plant Turns 40 And Is Heading For Another Production Record",
+    "ts": 1792457805
+  },
+  "bmwblog.com/2026/10/19/bmw-regensburg-plant-40-years": {
+    "title": "Nine Million Cars Since The E30: BMW’s Regensburg Plant Turns 40 And Is Heading For Another Production Record",
+    "ts": 1792457805
+  },
+  "tf:nine million cars since the": {
+    "title": "Nine Million Cars Since The E30: BMW’s Regensburg Plant Turns 40 And Is Heading For Another Production Record",
+    "ts": 1792457805
+  },
+  "fp:6d7d2f520093cefb378b1683ed6d487f": {
+    "title": "Nine Million Cars Since The E30: BMW’s Regensburg Plant Turns 40 And Is Heading For Another Production Record",
+    "ts": 1792457805
+  },
+  "f1802679f99f014f": {
+    "title": "I Drove the 2027 BMW 740 xDrive. It’s the 7 Series I’d Buy",
+    "ts": 1792462811
+  },
+  "bmwblog.com/2026/10/19/2027-bmw-740-xdrive-review": {
+    "title": "I Drove the 2027 BMW 740 xDrive. It’s the 7 Series I’d Buy",
+    "ts": 1792462811
   }
 }

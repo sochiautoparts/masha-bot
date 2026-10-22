@@ -1,40 +1,4 @@
 {
-  "fp:45bb097c581f65f96451417d84f6cb4b": {
-    "title": "2027 BMW iX3 M60 Has 100 More Horsepower Than The Old X3 M Competition",
-    "ts": 1791485185
-  },
-  "d1dc404d54dfe12f": {
-    "title": "The New iX3 M60 All But Confirms The i3 M60’s 603 hp. Here’s What Else We Know About The Sedan",
-    "ts": 1791486408
-  },
-  "bmwblog.com/2026/10/08/bmw-i3-m60-horsepower-ix3-m60": {
-    "title": "The New iX3 M60 All But Confirms The i3 M60’s 603 hp. Here’s What Else We Know About The Sedan",
-    "ts": 1791486408
-  },
-  "tf:the new ix3 m60 all": {
-    "title": "The New iX3 M60 All But Confirms The i3 M60’s 603 hp. Here’s What Else We Know About The Sedan",
-    "ts": 1791486408
-  },
-  "fp:b60f0ccac60b9f095bc6a082a132e850": {
-    "title": "The New iX3 M60 All But Confirms The i3 M60’s 603 hp. Here’s What Else We Know About The Sedan",
-    "ts": 1791486408
-  },
-  "e6715531109c4f1a": {
-    "title": "This 10-Year-Old 567-HP Luxury SUV Is Now A Used Bargain",
-    "ts": 1791490023
-  },
-  "topspeed.com/567-hp-luxury-suv-delivers-more-than-rivals-costing-twice-as-much": {
-    "title": "This 10-Year-Old 567-HP Luxury SUV Is Now A Used Bargain",
-    "ts": 1791490023
-  },
-  "tf:this 10yearold 567hp luxury suv": {
-    "title": "This 10-Year-Old 567-HP Luxury SUV Is Now A Used Bargain",
-    "ts": 1791490023
-  },
-  "fp:6ec359bffbddb69fcbd6884b4570e281": {
-    "title": "This 10-Year-Old 567-HP Luxury SUV Is Now A Used Bargain",
-    "ts": 1791490023
-  },
   "feb2fdeb5fc65ee1": {
     "title": "V12, 640-HP, 186 MPH: The First BMW M8 Shared An Engine With The McLaren F1",
     "ts": 1791513930
@@ -3019,10 +2983,6 @@
     "title": "The Cross-Section Of $108,000 Cars Is Vast And Strange",
     "ts": 1792441538
   },
-  "topic:ix5 x5": {
-    "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
-    "ts": 1792447102
-  },
   "278b2a719f8b0bde": {
     "title": "BMW iX5 Range Estimate Jumps To 450 Miles Ahead Of Launch",
     "ts": 1792447102
@@ -3998,5 +3958,45 @@
   "fp:84e7ca6ccadf9fe77ec1f4a386aa8035": {
     "title": "M Performance-Tuning: Fotos zeigen BMW X5 G65 auf 23 Zoll-Felgen",
     "ts": 1792630580
+  },
+  "715712f0a3727989": {
+    "title": "BMW X7 M60 & iX7: Erlkönig-Fotos zeigen V8- und Elektro-G67 am Ring",
+    "ts": 1792654572
+  },
+  "bimmertoday.de/2026/10/21/bmw-x7-m60-ix7-erlkonig-fotos-zeigen-v8-und-elektro-g67-am-ring": {
+    "title": "BMW X7 M60 & iX7: Erlkönig-Fotos zeigen V8- und Elektro-G67 am Ring",
+    "ts": 1792654572
+  },
+  "tf:bmw m60 ix7 erlkönigfotos zeigen": {
+    "title": "BMW X7 M60 & iX7: Erlkönig-Fotos zeigen V8- und Elektro-G67 am Ring",
+    "ts": 1792654572
+  },
+  "topic:ix7 x7": {
+    "title": "BMW X7 M60 & iX7: Erlkönig-Fotos zeigen V8- und Elektro-G67 am Ring",
+    "ts": 1792654572
+  },
+  "fp:d83725fa0b2de38d497acb4816ed5b49": {
+    "title": "BMW X7 M60 & iX7: Erlkönig-Fotos zeigen V8- und Elektro-G67 am Ring",
+    "ts": 1792654572
+  },
+  "topic:ix5 x5": {
+    "title": "BMW’s New iX5 Can Charge at a Blistering 460 kW",
+    "ts": 1792667055
+  },
+  "02283e4fca4d9d0f": {
+    "title": "BMW’s New iX5 Can Charge at a Blistering 460 kW",
+    "ts": 1792667055
+  },
+  "autoweek.com/news/a74197647/bmw-ix5-can-charge-at-460-kw": {
+    "title": "BMW’s New iX5 Can Charge at a Blistering 460 kW",
+    "ts": 1792667055
+  },
+  "tf:bmws new ix5 can charge": {
+    "title": "BMW’s New iX5 Can Charge at a Blistering 460 kW",
+    "ts": 1792667055
+  },
+  "fp:2ba8a56b76c5f7591b28a3edac21b029": {
+    "title": "BMW’s New iX5 Can Charge at a Blistering 460 kW",
+    "ts": 1792667055
   }
 }

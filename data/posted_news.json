@@ -1,32 +1,4 @@
 {
-  "tf:bmws europe sales growth cant": {
-    "title": "BMW’s Europe, US Q3 Sales Growth Can’t Offset China Collapse",
-    "ts": 1791893143
-  },
-  "fp:1bae3fb94117d41b4f9d7101d65dbe3b": {
-    "title": "BMW’s Europe, US Q3 Sales Growth Can’t Offset China Collapse",
-    "ts": 1791893143
-  },
-  "824a817c701b17e0": {
-    "title": "Exclusive Photos Show New BMW X5 With M Performance Parts",
-    "ts": 1791895492
-  },
-  "bmwblog.com/2026/10/13/2027-bmw-x5-m-performance-parts": {
-    "title": "Exclusive Photos Show New BMW X5 With M Performance Parts",
-    "ts": 1791895492
-  },
-  "tf:exclusive photos show new bmw": {
-    "title": "Exclusive Photos Show New BMW X5 With M Performance Parts",
-    "ts": 1791895492
-  },
-  "fp:64fd444991c0adfc9ce61cfab66f204c": {
-    "title": "Exclusive Photos Show New BMW X5 With M Performance Parts",
-    "ts": 1791895492
-  },
-  "3b551db53270935a": {
-    "title": "BMW’s Electric M3 Concept Leads The ICE Pack For China Debut",
-    "ts": 1791899035
-  },
   "bmwblog.com/2026/10/13/bmw-electric-m3-concept-makes-china-debut": {
     "title": "BMW’s Electric M3 Concept Leads The ICE Pack For China Debut",
     "ts": 1791899035
@@ -3963,10 +3935,6 @@
     "title": "Alleged BMW Factory Worker Spills The Beans About The New X7",
     "ts": 1792917543
   },
-  "topic:ix5 x5": {
-    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
-    "ts": 1792924982
-  },
   "df78653f4db6564d": {
     "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
     "ts": 1792924982
@@ -3991,12 +3959,44 @@
     "title": "View Exterior Photos of the 2027 BMW 7-Series",
     "ts": 1792932860
   },
-  "tf:view exterior photos the 2027": {
-    "title": "View Exterior Photos of the 2027 BMW 7-Series",
-    "ts": 1792932860
-  },
   "fp:e71446028583cc2f08a80384a9cfd98e": {
     "title": "View Exterior Photos of the 2027 BMW 7-Series",
     "ts": 1792932860
+  },
+  "tf:view exterior photos the 2027": {
+    "title": "View Exterior Photos of the 2027 BMW iX3",
+    "ts": 1792944656
+  },
+  "8614e3ed2cba7095": {
+    "title": "View Exterior Photos of the 2027 BMW iX3",
+    "ts": 1792944656
+  },
+  "caranddriver.com/photos/a74081553/2027-bmw-ix3-test-exterior-gallery": {
+    "title": "View Exterior Photos of the 2027 BMW iX3",
+    "ts": 1792944656
+  },
+  "fp:44340e6cc40e70da9f729afaa827f88e": {
+    "title": "View Exterior Photos of the 2027 BMW iX3",
+    "ts": 1792944656
+  },
+  "topic:ix5 x5": {
+    "title": "BMW iX5 Demonstrates 460 kW Charging, Targets 170 Miles in 10 Minutes",
+    "ts": 1792956110
+  },
+  "0d7f628e186427c1": {
+    "title": "BMW iX5 Demonstrates 460 kW Charging, Targets 170 Miles in 10 Minutes",
+    "ts": 1792956110
+  },
+  "electriccarsreport.com/2026/10/bmw-ix5-demonstrates-460-kw-charging-targets-170-miles-in-10-minutes": {
+    "title": "BMW iX5 Demonstrates 460 kW Charging, Targets 170 Miles in 10 Minutes",
+    "ts": 1792956110
+  },
+  "tf:bmw ix5 demonstrates 460 charging": {
+    "title": "BMW iX5 Demonstrates 460 kW Charging, Targets 170 Miles in 10 Minutes",
+    "ts": 1792956110
+  },
+  "fp:aa750650d5e8aa73d5c3622dd048414f": {
+    "title": "BMW iX5 Demonstrates 460 kW Charging, Targets 170 Miles in 10 Minutes",
+    "ts": 1792956110
   }
 }

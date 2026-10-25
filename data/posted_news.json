@@ -1,36 +1,4 @@
 {
-  "tf:bmw reclaims the b58 engine": {
-    "title": "BMW Reclaims The B58 Engine Output Crown After Letting Toyota Borrow The Bragging Rights",
-    "ts": 1791861450
-  },
-  "fp:01a610a870a4b9f7db53b3a788f3e4db": {
-    "title": "BMW Reclaims The B58 Engine Output Crown After Letting Toyota Borrow The Bragging Rights",
-    "ts": 1791861450
-  },
-  "b645e89a5dce3aa6": {
-    "title": "The Genesis GV80 Trim Making A Loaded X5 Feel Overpriced",
-    "ts": 1791879407
-  },
-  "topspeed.com/genesis-gv80-trim-making-loaded-x5-feel-overpriced": {
-    "title": "The Genesis GV80 Trim Making A Loaded X5 Feel Overpriced",
-    "ts": 1791879407
-  },
-  "tf:the genesis gv80 trim making": {
-    "title": "The Genesis GV80 Trim Making A Loaded X5 Feel Overpriced",
-    "ts": 1791879407
-  },
-  "fp:69e7997432b05d7f3924090867d40bb5": {
-    "title": "The Genesis GV80 Trim Making A Loaded X5 Feel Overpriced",
-    "ts": 1791879407
-  },
-  "414d822b2b9c1566": {
-    "title": "BMW’s Europe, US Q3 Sales Growth Can’t Offset China Collapse",
-    "ts": 1791893143
-  },
-  "bmwblog.com/2026/10/13/bmw-global-sales-q3-2026": {
-    "title": "BMW’s Europe, US Q3 Sales Growth Can’t Offset China Collapse",
-    "ts": 1791893143
-  },
   "tf:bmws europe sales growth cant": {
     "title": "BMW’s Europe, US Q3 Sales Growth Can’t Offset China Collapse",
     "ts": 1791893143
@@ -3939,10 +3907,6 @@
     "title": "BMW Puts The iX5’s 460-kW Charging To The Test In America",
     "ts": 1792897056
   },
-  "topic:ix5 x5": {
-    "title": "The Luxury SUV A Decade In The Making - 2027 BMW iX5 First Drive",
-    "ts": 1792906312
-  },
   "1b2fb9ae12a68da0": {
     "title": "The Luxury SUV A Decade In The Making - 2027 BMW iX5 First Drive",
     "ts": 1792906312
@@ -3998,5 +3962,41 @@
   "fp:b23153ec7287c6a4f94ff1d06fbc19aa": {
     "title": "Alleged BMW Factory Worker Spills The Beans About The New X7",
     "ts": 1792917543
+  },
+  "topic:ix5 x5": {
+    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
+    "ts": 1792924982
+  },
+  "df78653f4db6564d": {
+    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
+    "ts": 1792924982
+  },
+  "bmwblog.com/2026/10/23/2027-bmw-ix5-discount": {
+    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
+    "ts": 1792924982
+  },
+  "tf:the 2027 bmw ix5 gets": {
+    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
+    "ts": 1792924982
+  },
+  "fp:e5726e6d3426f9b35eefda5674f64801": {
+    "title": "The 2027 BMW iX5 Gets A Discount Before Deliveries Even Begin",
+    "ts": 1792924982
+  },
+  "07a830fecdcd74b9": {
+    "title": "View Exterior Photos of the 2027 BMW 7-Series",
+    "ts": 1792932860
+  },
+  "caranddriver.com/photos/a74196211/2027-bmw-7-series-drive-exterior-gallery": {
+    "title": "View Exterior Photos of the 2027 BMW 7-Series",
+    "ts": 1792932860
+  },
+  "tf:view exterior photos the 2027": {
+    "title": "View Exterior Photos of the 2027 BMW 7-Series",
+    "ts": 1792932860
+  },
+  "fp:e71446028583cc2f08a80384a9cfd98e": {
+    "title": "View Exterior Photos of the 2027 BMW 7-Series",
+    "ts": 1792932860
   }
 }

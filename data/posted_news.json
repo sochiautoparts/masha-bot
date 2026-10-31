@@ -1,60 +1,4 @@
 {
-  "motorious.com/articles/auction/2013-bmw-m3-lime-rock-park-edition-bring-a-trailer": {
-    "title": "Fire Orange 2013 BMW M3 Lime Rock Park Edition, One of 200, Is Bidding at $53,500 on Bring a Trailer",
-    "ts": 1792330030
-  },
-  "tf:fire orange 2013 bmw lime": {
-    "title": "Fire Orange 2013 BMW M3 Lime Rock Park Edition, One of 200, Is Bidding at $53,500 on Bring a Trailer",
-    "ts": 1792330030
-  },
-  "fp:e627b61be95f2b31b0e71bca73fd46d8": {
-    "title": "Fire Orange 2013 BMW M3 Lime Rock Park Edition, One of 200, Is Bidding at $53,500 on Bring a Trailer",
-    "ts": 1792330030
-  },
-  "d41bf612c59c607a": {
-    "title": "Немцы сделали большой тест зимних шин 2026-2027 годов: ADAC сравнил 32 модели и выбрал лучших из худших",
-    "ts": 1792331616
-  },
-  "5koleso.ru/articles/tires/nemczy-sdelali-bolshoj-test-zimnih-shin-2026-2027-godov-adac-sravnil-32-modeli-i-vybral-luchshih-iz-hudshih": {
-    "title": "Немцы сделали большой тест зимних шин 2026-2027 годов: ADAC сравнил 32 модели и выбрал лучших из худших",
-    "ts": 1792331616
-  },
-  "tf:немцы сделали большой тест зимних": {
-    "title": "Немцы сделали большой тест зимних шин 2026-2027 годов: ADAC сравнил 32 модели и выбрал лучших из худших",
-    "ts": 1792331616
-  },
-  "fp:6c5113383c5211abbdc85202e2c1ee6c": {
-    "title": "Немцы сделали большой тест зимних шин 2026-2027 годов: ADAC сравнил 32 модели и выбрал лучших из худших",
-    "ts": 1792331616
-  },
-  "084170af2ba49a8f": {
-    "title": "BMW’s new i3 just drove 753 miles on a single charge",
-    "ts": 1792332978
-  },
-  "electrek.co/2026/10/15/bmws-new-i3-drove-753-miles-single-charge": {
-    "title": "BMW’s new i3 just drove 753 miles on a single charge",
-    "ts": 1792332978
-  },
-  "tf:bmws new just drove 753": {
-    "title": "BMW’s new i3 just drove 753 miles on a single charge",
-    "ts": 1792332978
-  },
-  "fp:3031eb16e719212d60a8d2e3ec0d310e": {
-    "title": "BMW’s new i3 just drove 753 miles on a single charge",
-    "ts": 1792332978
-  },
-  "8b800050e989e398": {
-    "title": "BMW Starts Gen6 Battery Production in China for Neue Klasse EVs",
-    "ts": 1792334125
-  },
-  "electriccarsreport.com/2026/10/bmw-gen6-battery-production-china-neue-klasse": {
-    "title": "BMW Starts Gen6 Battery Production in China for Neue Klasse EVs",
-    "ts": 1792334125
-  },
-  "tf:bmw starts gen6 battery production": {
-    "title": "BMW Starts Gen6 Battery Production in China for Neue Klasse EVs",
-    "ts": 1792334125
-  },
   "fp:3649bcf860a5e524e9de51cafbf88559": {
     "title": "BMW Starts Gen6 Battery Production in China for Neue Klasse EVs",
     "ts": 1792334125
@@ -3998,5 +3942,61 @@
   "fp:6796158c87726b58af8916c3156601ca": {
     "title": "BMW i3 Goes Back To Its Roots In A Drive Against The Original 3 Series",
     "ts": 1793438158
+  },
+  "b9daf81ed90001d3": {
+    "title": "Sebastian Vettel Explains Why BMW Didn’t Give Him A Full-Time F1 Seat",
+    "ts": 1793440065
+  },
+  "bmwblog.com/2026/10/31/sebastian-vettel-explains-why-bmw-let-him-go": {
+    "title": "Sebastian Vettel Explains Why BMW Didn’t Give Him A Full-Time F1 Seat",
+    "ts": 1793440065
+  },
+  "tf:sebastian vettel explains why bmw": {
+    "title": "Sebastian Vettel Explains Why BMW Didn’t Give Him A Full-Time F1 Seat",
+    "ts": 1793440065
+  },
+  "fp:7453472dd1df7e05e2aa4fad14e3e65f": {
+    "title": "Sebastian Vettel Explains Why BMW Didn’t Give Him A Full-Time F1 Seat",
+    "ts": 1793440065
+  },
+  "2820913ea70cf9c8": {
+    "title": "Outruns V8s, Sips Diesel, Easy To Tune: The Twin-Turbo BMW 335d Is The Ultimate Highway Cruiser",
+    "ts": 1793441860
+  },
+  "carbuzz.com/bmw-40-mpg-turbodiesel-inline-6-that-beats-v8s": {
+    "title": "Outruns V8s, Sips Diesel, Easy To Tune: The Twin-Turbo BMW 335d Is The Ultimate Highway Cruiser",
+    "ts": 1793441860
+  },
+  "tf:outruns v8s sips diesel easy": {
+    "title": "Outruns V8s, Sips Diesel, Easy To Tune: The Twin-Turbo BMW 335d Is The Ultimate Highway Cruiser",
+    "ts": 1793441860
+  },
+  "fp:d3a55c2ef6b528dc7973cf0c33cce052": {
+    "title": "Outruns V8s, Sips Diesel, Easy To Tune: The Twin-Turbo BMW 335d Is The Ultimate Highway Cruiser",
+    "ts": 1793441860
+  },
+  "d3e1e30d3816602a": {
+    "title": "I’ve Owned A BMW i4 For Years. The New BMW i3 50 xDrive Beats It At Everything Except Buttons",
+    "ts": 1793449320
+  },
+  "bmwblog.com/2026/10/31/2027-bmw-i3-50-xdrive-review": {
+    "title": "I’ve Owned A BMW i4 For Years. The New BMW i3 50 xDrive Beats It At Everything Except Buttons",
+    "ts": 1793449320
+  },
+  "c79df86fcaf4acdf": {
+    "title": "Gallery: 2027 BMW X5 Interior Is High-Tech And Dominated By Screens",
+    "ts": 1793455974
+  },
+  "carbuzz.com/gallery-interior-photos-of-the-2027-bmw-x5": {
+    "title": "Gallery: 2027 BMW X5 Interior Is High-Tech And Dominated By Screens",
+    "ts": 1793455974
+  },
+  "tf:gallery 2027 bmw interior hightech": {
+    "title": "Gallery: 2027 BMW X5 Interior Is High-Tech And Dominated By Screens",
+    "ts": 1793455974
+  },
+  "fp:61afb70b729a2dcd08c7826c2678613f": {
+    "title": "Gallery: 2027 BMW X5 Interior Is High-Tech And Dominated By Screens",
+    "ts": 1793455974
   }
 }
